@@ -524,10 +524,23 @@ def module_metadata(module: Path) -> tuple[bytes | None, bytes | None]:
     return snapshots[0], snapshots[1]
 
 
+def _refuse_repaired_metadata(
+    module: Path,
+    before: tuple[bytes | None, bytes | None],
+    cause: PortabilityError | None = None,
+) -> None:
+    """Refuse go.mod or go.sum changes written by go mod download."""
+    if module_metadata(module) != before:
+        raise PortabilityError(
+            f"{module}: go mod download changed go.mod or go.sum; run go mod tidy and commit the result"
+        ) from cause
+
+
 def _download_with_retries(
     module: Path,
     runner: ProcessRunner,
     environment: dict[str, str],
+    before: tuple[bytes | None, bytes | None],
 ) -> int:
     """Retry transient proxy failures during module download; return the succeeding attempt."""
     last_error: PortabilityError | None = None
@@ -539,8 +552,8 @@ def _download_with_retries(
                 environment=environment,
                 timeout=DOWNLOAD_TIMEOUT_SECONDS,
             )
-            return attempt
         except PortabilityError as error:
+            _refuse_repaired_metadata(module, before, cause=error)
             last_error = error
             if attempt < DOWNLOAD_ATTEMPTS:
                 print(
@@ -548,6 +561,9 @@ def _download_with_retries(
                     flush=True,
                 )
                 time.sleep(DOWNLOAD_RETRY_SECONDS)
+        else:
+            _refuse_repaired_metadata(module, before)
+            return attempt
     raise PortabilityError(
         f"{module}: go mod download failed after {DOWNLOAD_ATTEMPTS} attempts: {last_error}"
     ) from last_error
@@ -559,13 +575,7 @@ def download_modules(
     environment: dict[str, str],
 ) -> int:
     """Retry transient download failures and refuse metadata the download repaired."""
-    before = module_metadata(module)
-    attempt = _download_with_retries(module, runner, environment)
-    if module_metadata(module) != before:
-        raise PortabilityError(
-            f"{module}: go mod download changed go.mod or go.sum; run go mod tidy and commit the result"
-        )
-    return attempt
+    return _download_with_retries(module, runner, environment, module_metadata(module))
 
 
 def list_packages(

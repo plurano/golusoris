@@ -176,6 +176,7 @@ class FakeRunner:
         created_after_build: tuple[str, ...] = (),
         download_failures: int = 0,
         download_writes: str = "",
+        download_failure_writes: str = "",
     ) -> None:
         self.manifests = manifests
         self.deleted_manifests = deleted_manifests
@@ -184,6 +185,7 @@ class FakeRunner:
         self.created_after_build = created_after_build
         self.download_failures = download_failures
         self.download_writes = download_writes
+        self.download_failure_writes = download_failure_writes
         self.download_calls = 0
         self.commands: list[tuple[Path, tuple[str, ...]]] = []
 
@@ -191,6 +193,9 @@ class FakeRunner:
         should_fail = self.download_calls < self.download_failures
         self.download_calls += 1
         if should_fail:
+            if self.download_failure_writes:
+                with (cwd / "go.sum").open("a", encoding="utf-8") as handle:
+                    handle.write(self.download_failure_writes)
             raise portability.PortabilityError("injected download failure")
         if self.download_writes:
             with (cwd / "go.sum").open("a", encoding="utf-8") as handle:
@@ -623,6 +628,28 @@ class PortabilityDriverTest(TestCase):
             with self.assertRaisesRegex(portability.PortabilityError, "changed go.mod or go.sum"):
                 portability.download_modules(module, runner, {"GOFLAGS": "-mod=readonly"})
         self.assertEqual(runner.commands, [(module, ("go", "mod", "download"))])
+
+    def test_download_modules_rejects_metadata_written_by_failed_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            module = Path(directory)
+            create_repository(module, ("go.mod",))
+            (module / "go.sum").write_text("example.test/dep v1.0.0 h1:existing=\n", encoding="utf-8")
+            runner = FakeRunner(
+                ("go.mod",),
+                download_failures=portability.DOWNLOAD_ATTEMPTS,
+                download_failure_writes="example.test/dep v1.0.0/go.mod h1:x=\n",
+            )
+            with (
+                mock.patch.object(portability.time, "sleep") as sleep,
+                self.assertRaisesRegex(
+                    portability.PortabilityError, "changed go.mod or go.sum"
+                ) as failure,
+            ):
+                portability.download_modules(module, runner, {"GOFLAGS": "-mod=readonly"})
+        self.assertEqual(runner.download_calls, 1)
+        sleep.assert_not_called()
+        self.assertIsInstance(failure.exception.__cause__, portability.PortabilityError)
+        self.assertIn("injected download failure", str(failure.exception.__cause__))
 
     def test_verify_repository_stops_before_build_when_download_repairs_metadata(self) -> None:
         manifests = ("go.mod", "nested/go.mod")
