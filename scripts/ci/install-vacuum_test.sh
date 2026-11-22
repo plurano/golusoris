@@ -392,7 +392,8 @@ set -o pipefail
 "$REAL_JQ" "$@" | awk '{ sub(/\r$/, ""); printf "%s\r\n", $0 }'
 CRLF
 chmod +x "$crlf_bin/jq"
-if ! printf '{}' | REAL_JQ="$real_jq" "$crlf_bin/jq" -r '"x"' | od -An -c | grep -q '\\r'; then
+printf '{}' | REAL_JQ="$real_jq" "$crlf_bin/jq" -r '"x"' | od -An -c >"$suite_root/v9-stub.od"
+if ! grep -q '\\r' "$suite_root/v9-stub.od"; then
 	printf 'V9: CRLF jq stub does not emit a carriage return\n' >&2
 	exit 1
 fi
