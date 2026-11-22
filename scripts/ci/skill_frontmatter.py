@@ -17,6 +17,7 @@ and top-level mapping keys at column 0. `name` and `description` accept only sin
 scalars, single-quoted scalars without inner `'`, or double-quoted scalars without `"` or `\\`;
 multi-line values and plain scalars that YAML 1.1 or 1.2 resolves as non-strings (null, bool,
 int, float, timestamp, merge, value) are rejected.
+Plain scalars reject `:` + space/tab and space/tab + `#`; column-0 list items need a sequence key.
 
 Symlinks and non-regular index entries are rejected without following or reading them, and files
 over SIZE_MAX_BYTES (128 KiB) fail before reading past the cap. Default (pre-commit) mode reads
@@ -26,6 +27,7 @@ non-ignored files from the working tree.
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 from pathlib import Path, PurePosixPath
@@ -53,6 +55,7 @@ _KEY_LINE = re.compile(r"^(name|description):(?:[ \t]+(.*))?$")
 _ANY_KEY_LINE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*:(?:[ \t]|$)")
 _XML_TAG = re.compile(r"<\s*/?\s*[A-Za-z][^<>]*>")
 _PLAIN_FORBIDDEN_START = frozenset("-?:,[]{}#&*!|>%@'\"`")
+_PLAIN_BREAK = re.compile(r":[ \t]|[ \t]#")
 
 
 def _parse_quoted(value: str) -> str | None:
@@ -70,7 +73,7 @@ def _parse_plain(value: str) -> str | None:
     """Return value when it is an allowed single-line plain scalar, or None."""
     if value[0] in _PLAIN_FORBIDDEN_START or value.endswith(":"):
         return None
-    return None if (": " in value or " #" in value) else value
+    return None if _PLAIN_BREAK.search(value) is not None else value
 
 
 def _parse_scalar(raw: str | None, *, indented: bool) -> tuple[str, bool] | None:
@@ -98,19 +101,43 @@ def _frontmatter_lines(path: str, text: str) -> tuple[list[str] | None, list[str
     return None, [f"{path}: unterminated frontmatter"]
 
 
+def _is_list_item(line: str) -> bool:
+    """Return whether line is a column-0 YAML sequence item (`-` or `- ` prefix)."""
+    return line == "-" or line.startswith("- ")
+
+
 def _has_continuation(frontmatter: list[str], start: int) -> bool:
-    """Return whether the next non-blank, non-column-0-comment line starts with space or tab."""
+    """Return whether the next non-blank, non-column-0-comment line is indented or a list item."""
     for index in range(start, len(frontmatter)):
         line = frontmatter[index]
         if line.strip(" \t") == "" or line.startswith("#"):
             continue
-        return line.startswith((" ", "\t"))
+        return line.startswith((" ", "\t")) or _is_list_item(line)
     return False
 
 
-def _is_non_key_line(line: str) -> bool:
-    """Return whether a frontmatter line is indented, blank, a comment or a list item."""
-    return line == "" or line == "-" or line.startswith((" ", "\t", "#", "- "))
+def _opens_sequence(line: str) -> bool:
+    """Return whether a matched key line has no inline value after its first colon."""
+    stripped = line.partition(":")[2].lstrip(" \t")
+    return stripped == "" or stripped.startswith("#")
+
+
+def _check_line_structure(
+    path: str, line_no: int, line: str, *, in_sequence: bool
+) -> tuple[bool, bool, str | None]:
+    """Validate one frontmatter line's structure and return (is_key, in_sequence, finding)."""
+    if line == "" or line.startswith((" ", "\t", "#")):
+        return False, in_sequence, None
+    if _is_list_item(line):
+        finding = (
+            None
+            if in_sequence
+            else f"{path}: frontmatter line {line_no} is a list item outside a sequence value"
+        )
+        return False, in_sequence, finding
+    if _ANY_KEY_LINE.match(line) is None:
+        return False, False, f"{path}: frontmatter line {line_no} is not a key, comment or list item"
+    return True, _opens_sequence(line), None
 
 
 def _record_field(
@@ -188,16 +215,18 @@ def problems(path: str, text: str) -> list[str]:
     duplicates: set[str] = set()
     values: dict[str, str] = {}
     findings: list[str] = []
+    in_sequence = False
     for index, line in enumerate(frontmatter):
-        if _is_non_key_line(line):
+        is_key, in_sequence, finding = _check_line_structure(
+            path, index + 2, line, in_sequence=in_sequence
+        )
+        if finding is not None:
+            findings.append(finding)
             continue
-        if _ANY_KEY_LINE.match(line) is None:
-            findings.append(f"{path}: frontmatter line {index + 2} is not a key, comment or list item")
-            continue
-        match = _KEY_LINE.match(line)
+        match = _KEY_LINE.match(line) if is_key else None
         if match is None:
             continue
-        finding = _record_field(
+        field_finding = _record_field(
             path,
             match.group(1),
             match.group(2),
@@ -206,8 +235,8 @@ def problems(path: str, text: str) -> list[str]:
             duplicates=duplicates,
             values=values,
         )
-        if finding is not None:
-            findings.append(finding)
+        if field_finding is not None:
+            findings.append(field_finding)
     return findings + _check_fields(path, seen, values)
 
 
@@ -225,15 +254,23 @@ def _check_disk_file(root: Path, rel: str) -> list[str]:
     return problems(rel, raw.decode("utf-8").replace("\r\n", "\n"))
 
 
+def _non_regular_mode_finding(path: str, mode: str) -> str | None:
+    """Return a finding when a git index mode is a symlink or non-regular entry."""
+    if mode == "120000":
+        return f"{path}: {NAME} must be a regular file, not a symlink"
+    if mode not in ("100644", "100755"):
+        return f"{path}: {NAME} must be a regular file"
+    return None
+
+
 def _staged_skill_findings(root: Path) -> dict[str, list[str]]:
     """Check staged SKILL.md index entries using mode and blob size before blob reads."""
     by_path: dict[str, list[str]] = {}
     regular: list[tuple[str, str]] = []
     for path, (mode, oid) in sorted(repo_git.staged_entries(root, NAME).items()):
-        if mode == "120000":
-            by_path[path] = [f"{path}: {NAME} must be a regular file, not a symlink"]
-        elif mode not in ("100644", "100755"):
-            by_path[path] = [f"{path}: {NAME} must be a regular file"]
+        mode_finding = _non_regular_mode_finding(path, mode)
+        if mode_finding is not None:
+            by_path[path] = [mode_finding]
         else:
             regular.append((path, oid))
     sizes = repo_git.blob_sizes(root, [oid for _, oid in regular])
@@ -249,15 +286,23 @@ def _staged_skill_findings(root: Path) -> dict[str, list[str]]:
     return by_path
 
 
+def _worktree_staged_findings(root: Path) -> dict[str, list[str]]:
+    """Check tracked SKILL.md entries on disk, including FIFOs and non-regular index modes."""
+    by_path: dict[str, list[str]] = {}
+    for path, (mode, _) in sorted(repo_git.staged_entries(root, NAME).items()):
+        if os.path.lexists(root / path):
+            by_path[path] = _check_disk_file(root, path)
+            continue
+        # Gitlinks (160000) materialize no file on disk even in a clean worktree.
+        mode_finding = _non_regular_mode_finding(path, mode)
+        if mode_finding is not None and mode != "120000":
+            by_path[path] = [mode_finding]
+    return by_path
+
+
 def skill_findings(root: Path, *, worktree: bool = False) -> list[str]:
     """Return findings for SKILL.md files under root from index+untracked or worktree."""
-    if worktree:
-        findings: list[str] = []
-        for file_path in repo_git.worktree_files(root, NAME):
-            rel = file_path.relative_to(root).as_posix()
-            findings.extend(_check_disk_file(root, rel))
-        return findings
-    by_path = _staged_skill_findings(root)
+    by_path = _worktree_staged_findings(root) if worktree else _staged_skill_findings(root)
     for rel in repo_git.untracked_files(root, NAME):
         by_path[rel] = _check_disk_file(root, rel)
     return [finding for rel in sorted(by_path) for finding in by_path[rel]]

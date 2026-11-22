@@ -437,6 +437,104 @@ class SkillFrontmatterTest(unittest.TestCase):
         self.assertEqual(code, 3)
         self.assertIn("skill-frontmatter: error:", stderr)
 
+    def test_plain_description_with_tab_comment_fails(self) -> None:
+        """A plain description with tab-hash comment separation fails as unsupported."""
+        self.write("alpha/SKILL.md", "---\nname: alpha\ndescription: null\t# comment\n---\n")
+        self.assertEqual(self.check(), ["alpha/SKILL.md: unsupported description form"])
+
+    def test_plain_description_with_colon_tab_fails(self) -> None:
+        """A plain description containing a colon-tab mapping indicator fails as unsupported."""
+        self.write("alpha/SKILL.md", "---\nname: alpha\ndescription: foo:\tbar\n---\n")
+        self.assertEqual(self.check(), ["alpha/SKILL.md: unsupported description form"])
+
+    def test_plain_name_with_tab_comment_fails(self) -> None:
+        """A plain name with tab-hash comment separation fails as unsupported."""
+        self.write("alpha/SKILL.md", "---\nname: alpha\t#x\ndescription: Valid.\n---\n")
+        self.assertEqual(self.check(), ["alpha/SKILL.md: unsupported name form"])
+
+    def test_plain_description_with_adjacent_hash_and_colon_passes(self) -> None:
+        """A plain description holding C# and a:b without separator whitespace passes."""
+        self.write("alpha/SKILL.md", "---\nname: alpha\ndescription: Uses C# and a:b syntax.\n---\n")
+        self.assertEqual(self.check(), [])
+
+    def test_description_followed_by_column_zero_list_item_fails(self) -> None:
+        """A plain description followed by a column-0 list item fails as unsupported."""
+        self.write("alpha/SKILL.md", "---\nname: alpha\ndescription: first\n- second\n---\n")
+        self.assertEqual(
+            self.check(),
+            [
+                "alpha/SKILL.md: unsupported description form",
+                "alpha/SKILL.md: frontmatter line 4 is a list item outside a sequence value",
+            ],
+        )
+
+    def test_empty_name_followed_by_column_zero_list_item_fails(self) -> None:
+        """An empty name key followed by a column-0 list item fails as unsupported."""
+        self.write("alpha/SKILL.md", "---\nname:\n- alpha\ndescription: Valid.\n---\n")
+        self.assertEqual(self.check(), ["alpha/SKILL.md: unsupported name form"])
+
+    def test_sequence_key_with_column_zero_list_items_passes(self) -> None:
+        """An empty top-level key followed by column-0 list items passes as a sequence."""
+        doc = "---\nname: alpha\nallowed-tools:\n- Read\n- Bash\ndescription: Valid.\n---\n"
+        self.write("alpha/SKILL.md", doc)
+        self.assertEqual(self.check(), [])
+
+    def test_scalar_key_followed_by_column_zero_list_item_fails(self) -> None:
+        """A column-0 list item after a key with an inline value fails with its line number."""
+        doc = "---\nname: alpha\nlicense: MIT\n- extra\ndescription: Valid.\n---\n"
+        self.write("alpha/SKILL.md", doc)
+        self.assertEqual(
+            self.check(),
+            ["alpha/SKILL.md: frontmatter line 4 is a list item outside a sequence value"],
+        )
+
+    def test_list_item_right_after_opening_fence_fails(self) -> None:
+        """A column-0 list item right after the opening fence fails with line number 2."""
+        doc = "---\n- orphan\nname: alpha\ndescription: Valid.\n---\n"
+        self.write("alpha/SKILL.md", doc)
+        self.assertEqual(
+            self.check(),
+            ["alpha/SKILL.md: frontmatter line 2 is a list item outside a sequence value"],
+        )
+
+    def test_staged_gitlink_fails_in_both_modes(self) -> None:
+        """A staged gitlink (mode 160000) at SKILL.md fails as non-regular in both modes."""
+        self.git(
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "init",
+        )
+        head = repo_git.run_git(["rev-parse", "HEAD"], self.root).strip()
+        self.git("update-index", "--add", "--cacheinfo", f"160000,{head},skills/alpha/SKILL.md")
+        expected = ["skills/alpha/SKILL.md: SKILL.md must be a regular file"]
+        self.assertEqual(skill_frontmatter.skill_findings(self.root), expected)
+        self.assertEqual(skill_frontmatter.skill_findings(self.root, worktree=True), expected)
+
+    def test_fifo_at_staged_skill_fails_in_worktree_mode_only(self) -> None:
+        """A FIFO replacing a staged valid SKILL.md fails in worktree mode and passes from the index."""
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("os.mkfifo unavailable on this platform")
+        self.write("skills/alpha/SKILL.md", "---\nname: alpha\ndescription: Valid.\n---\n")
+        fifo = self.root / "skills" / "alpha" / "SKILL.md"
+        fifo.unlink()
+        try:
+            os.mkfifo(fifo)
+        except OSError as err:
+            self.skipTest(f"mkfifo unsupported: {err}")
+        self.assertEqual(
+            skill_frontmatter.skill_findings(self.root, worktree=True),
+            ["skills/alpha/SKILL.md: SKILL.md must be a regular file"],
+        )
+        self.assertEqual(skill_frontmatter.skill_findings(self.root), [])
+
 
 if __name__ == "__main__":
     unittest.main()
