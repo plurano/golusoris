@@ -36,12 +36,12 @@ class SkillFrontmatterTest(unittest.TestCase):
         self.root = Path(scratch.name)
         self.git("init", "-q")
 
-    def git(self, *args: str) -> None:
+    def git(self, *args: str, env: dict[str, str] | None = None) -> None:
         """Run one git command in the scratch repository."""
         git = shutil.which("git")
         self.assertIsNotNone(git)
         subprocess.run(  # noqa: S603 - fixed git command on runner PATH. # nosec B603
-            [str(git), *args], cwd=self.root, check=True, capture_output=True, timeout=60
+            [str(git), *args], cwd=self.root, env=env, check=True, capture_output=True, timeout=60
         )
 
     def write(self, name: str, text: str, *, stage: bool = True) -> None:
@@ -54,12 +54,7 @@ class SkillFrontmatterTest(unittest.TestCase):
 
     def check(self) -> list[str]:
         """Return frontmatter findings across non-ignored SKILL.md files in self.root."""
-        findings: list[str] = []
-        for path in repo_git.worktree_files(self.root, skill_frontmatter.NAME):
-            rel = path.relative_to(self.root).as_posix()
-            text = path.read_bytes().decode("utf-8").replace("\r\n", "\n")
-            findings.extend(skill_frontmatter.problems(rel, text))
-        return findings
+        return skill_frontmatter.skill_findings(self.root)
 
     def run_main(self, *args: str) -> tuple[int, str]:
         """Run skill_frontmatter.main capturing stderr and return (code, stderr)."""
@@ -217,10 +212,10 @@ class SkillFrontmatterTest(unittest.TestCase):
         self.write("alpha/SKILL.md", "---\nname: alpha\ndescription: Open.\n")
         self.assertEqual(self.check(), ["alpha/SKILL.md: unterminated frontmatter"])
 
-    def test_single_quoted_name_fails(self) -> None:
-        """A single-quoted scalar is rejected as an unsupported name form."""
-        self.write("alpha/SKILL.md", "---\nname: 'alpha'\ndescription: Valid.\n---\n")
-        self.assertEqual(self.check(), ["alpha/SKILL.md: unsupported name form"])
+    def test_single_quoted_name_passes(self) -> None:
+        """A single-quoted scalar without inner single quotes passes."""
+        self.write("alpha/SKILL.md", "---\nname: 'alpha'\ndescription: 'Valid.'\n---\n")
+        self.assertEqual(self.check(), [])
 
     def test_double_quoted_backslash_fails(self) -> None:
         """A double-quoted scalar containing a backslash is rejected as unsupported."""
@@ -255,11 +250,179 @@ class SkillFrontmatterTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(stderr, "skill-frontmatter: alpha/SKILL.md: name 'beta' must equal its directory 'alpha'\n")
 
+    def test_tracked_symlink_to_dev_zero_fails_in_both_modes(self) -> None:
+        """A tracked SKILL.md symlink to /dev/zero fails without reading in both modes."""
+        link = self.root / "skills" / "alpha" / "SKILL.md"
+        link.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.symlink("/dev/zero", link)
+        except OSError as err:
+            self.skipTest(f"symlinks unsupported: {err}")
+        self.git("add", "--", "skills/alpha/SKILL.md")
+        expected = ["skills/alpha/SKILL.md: SKILL.md must be a regular file, not a symlink"]
+        self.assertEqual(skill_frontmatter.skill_findings(self.root), expected)
+        self.assertEqual(skill_frontmatter.skill_findings(self.root, worktree=True), expected)
+
+    def test_untracked_symlink_fails_in_both_modes(self) -> None:
+        """An untracked SKILL.md symlink fails without being followed in both modes."""
+        link = self.root / "skills" / "alpha" / "SKILL.md"
+        link.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.symlink("/dev/zero", link)
+        except OSError as err:
+            self.skipTest(f"symlinks unsupported: {err}")
+        expected = ["skills/alpha/SKILL.md: SKILL.md must be a regular file, not a symlink"]
+        self.assertEqual(skill_frontmatter.skill_findings(self.root), expected)
+        self.assertEqual(skill_frontmatter.skill_findings(self.root, worktree=True), expected)
+
+    def test_file_over_size_cap_fails_in_both_modes(self) -> None:
+        """A SKILL.md of SIZE_MAX_BYTES + 1 bytes fails in both default and worktree modes."""
+        prefix = "---\nname: alpha\ndescription: Valid.\n---\n"
+        body = "x" * (skill_frontmatter.SIZE_MAX_BYTES + 1 - len(prefix))
+        self.write("alpha/SKILL.md", prefix + body)
+        expected = [f"alpha/SKILL.md: SKILL.md is over {skill_frontmatter.SIZE_MAX_BYTES} bytes"]
+        self.assertEqual(skill_frontmatter.skill_findings(self.root), expected)
+        self.assertEqual(skill_frontmatter.skill_findings(self.root, worktree=True), expected)
+
+    def test_file_at_size_cap_passes_in_both_modes(self) -> None:
+        """A SKILL.md of exactly SIZE_MAX_BYTES bytes passes in both modes."""
+        prefix = "---\nname: alpha\ndescription: Valid.\n---\n"
+        body = "x" * (skill_frontmatter.SIZE_MAX_BYTES - len(prefix))
+        self.write("alpha/SKILL.md", prefix + body)
+        self.assertEqual(skill_frontmatter.skill_findings(self.root), [])
+        self.assertEqual(skill_frontmatter.skill_findings(self.root, worktree=True), [])
+
+    def test_three_space_key_separator_passes(self) -> None:
+        """Three spaces after the colon separate key and value without keeping leading spaces."""
+        self.write("alpha/SKILL.md", "---\nname:   alpha\ndescription:   Valid.\n---\n")
+        self.assertEqual(self.check(), [])
+
+    def test_tab_key_separator_passes(self) -> None:
+        """A tab after the colon separates key and value."""
+        self.write("alpha/SKILL.md", "---\nname:\talpha\ndescription:\tValid.\n---\n")
+        self.assertEqual(self.check(), [])
+
+    def test_plain_non_string_yaml_names_fail(self) -> None:
+        """Plain scalars that YAML resolves as non-strings fail with a quote-it finding."""
+        for token in ("true", "null", "123", "0x1f", "1e5", "2026-11-22"):
+            with self.subTest(token=token):
+                self.write(f"{token}/SKILL.md", f"---\nname: {token}\ndescription: Valid.\n---\n")
+                self.assertEqual(
+                    self.check(),
+                    [f"{token}/SKILL.md: name {token!r} is not a YAML string; quote it"],
+                )
+                self.git("rm", "-qf", "--", f"{token}/SKILL.md")
+
+    def test_plain_boolean_description_fails(self) -> None:
+        """A plain YAML 1.1 boolean description fails with a quote-it finding."""
+        self.write("alpha/SKILL.md", "---\nname: alpha\ndescription: yes\n---\n")
+        self.assertEqual(self.check(), ["alpha/SKILL.md: description 'yes' is not a YAML string; quote it"])
+
+    def test_quoted_yaml_keyword_name_passes(self) -> None:
+        """A double-quoted YAML keyword is a string and passes when matching its directory."""
+        self.write("true/SKILL.md", '---\nname: "true"\ndescription: Valid.\n---\n')
+        self.assertEqual(self.check(), [])
+
+    def test_single_quoted_escaped_apostrophe_fails(self) -> None:
+        """A single-quoted name containing doubled single quotes fails as unsupported."""
+        self.write("alpha/SKILL.md", "---\nname: 'al''pha'\ndescription: Valid.\n---\n")
+        self.assertEqual(self.check(), ["alpha/SKILL.md: unsupported name form"])
+
+    def test_description_continued_after_blank_line_fails(self) -> None:
+        """A description continued by an indented line after a blank line fails as unsupported."""
+        self.write("alpha/SKILL.md", "---\nname: alpha\ndescription: first line\n\n  second line\n---\n")
+        self.assertEqual(self.check(), ["alpha/SKILL.md: unsupported description form"])
+
+    def test_column_zero_continuation_line_fails_with_line_number(self) -> None:
+        """A column-0 continuation line fails the structure rule with its 1-based line number."""
+        self.write("alpha/SKILL.md", "---\nname: alpha\ndescription: text\nmore text\n---\n")
+        self.assertEqual(
+            self.check(),
+            ["alpha/SKILL.md: frontmatter line 4 is not a key, comment or list item"],
+        )
+
+    def test_staged_invalid_with_fixed_worktree_fails_by_default_only(self) -> None:
+        """Default mode fails on a staged invalid name even when the working copy was fixed."""
+        self.write("alpha/SKILL.md", "---\nname: beta\ndescription: Staged invalid.\n---\n")
+        (self.root / "alpha" / "SKILL.md").write_text(
+            "---\nname: alpha\ndescription: Unstaged fix.\n---\n", encoding="utf-8"
+        )
+        code, stderr = self.run_main(str(self.root))
+        self.assertEqual(code, 1)
+        self.assertEqual(stderr, "skill-frontmatter: alpha/SKILL.md: name 'beta' must equal its directory 'alpha'\n")
+        wt_code, wt_stderr = self.run_main("--worktree", str(self.root))
+        self.assertEqual(wt_code, 0, wt_stderr)
+
+    def test_staged_valid_with_invalid_worktree_fails_in_worktree_mode(self) -> None:
+        """Default mode passes a valid staged file while --worktree catches an unstaged error."""
+        self.write("alpha/SKILL.md", "---\nname: alpha\ndescription: Staged valid.\n---\n")
+        (self.root / "alpha" / "SKILL.md").write_text(
+            "---\nname: beta\ndescription: Unstaged invalid.\n---\n", encoding="utf-8"
+        )
+        code, stderr = self.run_main(str(self.root))
+        self.assertEqual(code, 0, stderr)
+        wt_code, wt_stderr = self.run_main("--worktree", str(self.root))
+        self.assertEqual(wt_code, 1)
+        self.assertEqual(wt_stderr, "skill-frontmatter: alpha/SKILL.md: name 'beta' must equal its directory 'alpha'\n")
+
+    def test_alternate_git_index_file_is_checked(self) -> None:
+        """Default mode reads the index named by GIT_INDEX_FILE when set in os.environ."""
+        self.write("alpha/SKILL.md", "---\nname: alpha\ndescription: Valid.\n---\n")
+        alt_index = (self.root / ".git" / "alt-index").resolve()
+        (self.root / "alpha" / "SKILL.md").write_text(
+            "---\nname: beta\ndescription: Invalid alternate index.\n---\n", encoding="utf-8"
+        )
+        self.git("add", "--", "alpha/SKILL.md", env={**os.environ, "GIT_INDEX_FILE": str(alt_index)})
+        (self.root / "alpha" / "SKILL.md").write_text(
+            "---\nname: alpha\ndescription: Valid.\n---\n", encoding="utf-8"
+        )
+        code, stderr = self.run_main(str(self.root))
+        self.assertEqual(code, 0, stderr)
+        with unittest.mock.patch.dict(os.environ, {"GIT_INDEX_FILE": str(alt_index)}):
+            alt_code, alt_stderr = self.run_main(str(self.root))
+        self.assertEqual(alt_code, 1)
+        self.assertEqual(alt_stderr, "skill-frontmatter: alpha/SKILL.md: name 'beta' must equal its directory 'alpha'\n")
+
+    def test_untracked_planted_invalid_skill_fails_in_both_modes(self) -> None:
+        """An untracked planted invalid SKILL.md fails in both default and worktree modes."""
+        self.write("planted--name/SKILL.md", "---\nname: planted--name\ndescription: Planted.\n---\n", stage=False)
+        expected = (
+            "skill-frontmatter: planted--name/SKILL.md: name 'planted--name' must be "
+            + "1-64 chars of a-z, 0-9 and single hyphens, no leading or trailing hyphen\n"
+        )
+        code, stderr = self.run_main(str(self.root))
+        self.assertEqual(code, 1)
+        self.assertEqual(stderr, expected)
+        wt_code, wt_stderr = self.run_main("--worktree", str(self.root))
+        self.assertEqual(wt_code, 1)
+        self.assertEqual(wt_stderr, expected)
+
+    def test_reserved_word_claude_in_name_fails(self) -> None:
+        """A name containing the reserved word claude fails even when matching its directory."""
+        self.write("claude-helper/SKILL.md", "---\nname: claude-helper\ndescription: Valid.\n---\n")
+        self.assertEqual(
+            self.check(),
+            ["claude-helper/SKILL.md: name 'claude-helper' must not contain the reserved word 'claude'"],
+        )
+
+    def test_reserved_word_anthropic_in_name_fails(self) -> None:
+        """A name containing the reserved word anthropic fails even when matching its directory."""
+        self.write("my-anthropic-tool/SKILL.md", "---\nname: my-anthropic-tool\ndescription: Valid.\n---\n")
+        self.assertEqual(
+            self.check(),
+            ["my-anthropic-tool/SKILL.md: name 'my-anthropic-tool' must not contain the reserved word 'anthropic'"],
+        )
+
+    def test_description_with_xml_tags_fails(self) -> None:
+        """A description containing XML tags fails."""
+        self.write("alpha/SKILL.md", "---\nname: alpha\ndescription: use <b>bold</b>\n---\n")
+        self.assertEqual(self.check(), ["alpha/SKILL.md: description must not contain XML tags"])
+
     def test_extra_argument_exits_with_status_3(self) -> None:
         """More than one positional argument prints usage and exits 3."""
         code, stderr = self.run_main(str(self.root), str(self.root))
         self.assertEqual(code, 3)
-        self.assertEqual(stderr, "skill-frontmatter: error: usage: skill_frontmatter.py [root]\n")
+        self.assertEqual(stderr, "skill-frontmatter: error: usage: skill_frontmatter.py [--worktree] [root]\n")
 
     def test_missing_root_exits_with_status_3(self) -> None:
         """A non-existent root directory prints an error and exits 3."""

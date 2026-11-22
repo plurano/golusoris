@@ -268,7 +268,7 @@ context-size: ## fail when an AGENTS.md file or AGENTS.md path chain reaches 95%
 
 .PHONY: skill-frontmatter
 skill-frontmatter: ## fail when a SKILL.md name or description breaks the Agent Skills specification
-	@python3 -B scripts/ci/skill_frontmatter.py .
+	@python3 -B scripts/ci/skill_frontmatter.py --worktree .
 
 .PHONY: text-register-policy
 text-register-policy: ## verify required register skills and plugin projections
