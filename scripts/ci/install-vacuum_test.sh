@@ -381,4 +381,29 @@ if ! diff -u "$suite_root/v8-expected.txt" "$suite_root/v8-actual.txt" >&2; then
 	exit 1
 fi
 
+# V9 CRLF jq: a carriage return after the module sum still matches the pin.
+real_jq="$(command -v jq)"
+crlf_bin="$suite_root/crlf-bin"
+mkdir -p "$crlf_bin"
+cat >"$crlf_bin/jq" <<'CRLF'
+#!/usr/bin/env bash
+# native jq.exe without -b: every output line ends in CRLF
+set -o pipefail
+"$REAL_JQ" "$@" | awk '{ sub(/\r$/, ""); printf "%s\r\n", $0 }'
+CRLF
+chmod +x "$crlf_bin/jq"
+if ! printf '{}' | REAL_JQ="$real_jq" "$crlf_bin/jq" -r '"x"' | od -An -c | grep -q '\\r'; then
+	printf 'V9: CRLF jq stub does not emit a carriage return\n' >&2
+	exit 1
+fi
+write_pins "$version" "$good_sum"
+REAL_JQ="$real_jq" PATH="$crlf_bin:$PATH" run_installer "$good_sum" "$version" "$suite_root/install-v9" >/dev/null || {
+	printf 'V9: CRLF jq output broke the module sum check\n' >&2
+	exit 1
+}
+[[ "$("$suite_root/install-v9/vacuum")" == "$version" ]] || {
+	printf 'V9: installed vacuum does not report %s\n' "$version" >&2
+	exit 1
+}
+
 printf 'vacuum installer policy tests passed\n'
