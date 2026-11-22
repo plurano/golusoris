@@ -294,13 +294,20 @@ class FixtureRepositoryTest(unittest.TestCase):
             self.assertEqual(os.environ["GIT_CEILING_DIRECTORIES"], "/sentinel/ceiling")
             self.assertEqual(os.environ["GOLUSORIS_FIXTURE_SENTINEL"], "sentinel-value")
             self.assertFalse(enclosing.exists())
-            with self.assertRaisesRegex(RuntimeError, "boom"), repo_git.fixture_repository() as err_root:
-                err_enclosing = err_root.parent
-                os.environ["GOLUSORIS_FIXTURE_SENTINEL"] = "changed-on-error"
-                raise RuntimeError("boom")
+            entered: list[Path] = []
+
+            def raise_inside_fixture() -> None:
+                """Enter fixture_repository, mutate the sentinel variable, and raise."""
+                with repo_git.fixture_repository() as err_root:
+                    entered.append(err_root.parent)
+                    os.environ["GOLUSORIS_FIXTURE_SENTINEL"] = "changed-on-error"
+                    raise RuntimeError("boom")
+
+            self.assertRaisesRegex(RuntimeError, "boom", raise_inside_fixture)
+            self.assertEqual(len(entered), 1)
             self.assertEqual(os.environ["GIT_CEILING_DIRECTORIES"], "/sentinel/ceiling")
             self.assertEqual(os.environ["GOLUSORIS_FIXTURE_SENTINEL"], "sentinel-value")
-            self.assertFalse(err_enclosing.exists())
+            self.assertFalse(entered[0].exists())
 
 
 if __name__ == "__main__":
