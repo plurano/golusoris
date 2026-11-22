@@ -297,10 +297,18 @@ class SkillFrontmatterTest(unittest.TestCase):
         self.write("alpha/SKILL.md", "---\nname:   alpha\ndescription:   Valid.\n---\n")
         self.assertEqual(self.check(), [])
 
-    def test_tab_key_separator_passes(self) -> None:
-        """A tab after the colon separates key and value."""
+    def test_tab_key_separator_fails(self) -> None:
+        """PyYAML rejects a tab separator."""
         self.write("alpha/SKILL.md", "---\nname:\talpha\ndescription:\tValid.\n---\n")
-        self.assertEqual(self.check(), [])
+        self.assertEqual(
+            self.check(),
+            [
+                "alpha/SKILL.md: frontmatter line 2 holds U+0009; "
+                + "SKILL.md frontmatter allows printable characters without tabs",
+                "alpha/SKILL.md: frontmatter line 3 holds U+0009; "
+                + "SKILL.md frontmatter allows printable characters without tabs",
+            ],
+        )
 
     def test_plain_non_string_yaml_names_fail(self) -> None:
         """Plain scalars that YAML resolves as non-strings fail with a quote-it finding."""
@@ -440,17 +448,38 @@ class SkillFrontmatterTest(unittest.TestCase):
     def test_plain_description_with_tab_comment_fails(self) -> None:
         """A plain description with tab-hash comment separation fails as unsupported."""
         self.write("alpha/SKILL.md", "---\nname: alpha\ndescription: null\t# comment\n---\n")
-        self.assertEqual(self.check(), ["alpha/SKILL.md: unsupported description form"])
+        self.assertEqual(
+            self.check(),
+            [
+                "alpha/SKILL.md: frontmatter line 3 holds U+0009; "
+                + "SKILL.md frontmatter allows printable characters without tabs",
+                "alpha/SKILL.md: unsupported description form",
+            ],
+        )
 
     def test_plain_description_with_colon_tab_fails(self) -> None:
         """A plain description containing a colon-tab mapping indicator fails as unsupported."""
         self.write("alpha/SKILL.md", "---\nname: alpha\ndescription: foo:\tbar\n---\n")
-        self.assertEqual(self.check(), ["alpha/SKILL.md: unsupported description form"])
+        self.assertEqual(
+            self.check(),
+            [
+                "alpha/SKILL.md: frontmatter line 3 holds U+0009; "
+                + "SKILL.md frontmatter allows printable characters without tabs",
+                "alpha/SKILL.md: unsupported description form",
+            ],
+        )
 
     def test_plain_name_with_tab_comment_fails(self) -> None:
         """A plain name with tab-hash comment separation fails as unsupported."""
         self.write("alpha/SKILL.md", "---\nname: alpha\t#x\ndescription: Valid.\n---\n")
-        self.assertEqual(self.check(), ["alpha/SKILL.md: unsupported name form"])
+        self.assertEqual(
+            self.check(),
+            [
+                "alpha/SKILL.md: frontmatter line 2 holds U+0009; "
+                + "SKILL.md frontmatter allows printable characters without tabs",
+                "alpha/SKILL.md: unsupported name form",
+            ],
+        )
 
     def test_plain_description_with_adjacent_hash_and_colon_passes(self) -> None:
         """A plain description holding C# and a:b without separator whitespace passes."""
@@ -596,7 +625,14 @@ class SkillFrontmatterTest(unittest.TestCase):
         """A tab-indented line inside metadata fails naming its 1-based line."""
         doc = "---\nname: alpha\nmetadata:\n\tauthor: x\ndescription: Valid.\n---\n"
         self.write("alpha/SKILL.md", doc)
-        self.assertEqual(self.check(), ["alpha/SKILL.md: frontmatter line 4 is an unsupported nested value"])
+        self.assertEqual(
+            self.check(),
+            [
+                "alpha/SKILL.md: frontmatter line 4 holds U+0009; "
+                + "SKILL.md frontmatter allows printable characters without tabs",
+                "alpha/SKILL.md: frontmatter line 4 is an unsupported nested value",
+            ],
+        )
 
     def test_nested_metadata_mixed_mapping_and_list_fails(self) -> None:
         """Mixing a list item into a nested mapping block fails on the list item line."""
@@ -633,6 +669,154 @@ class SkillFrontmatterTest(unittest.TestCase):
         doc = "---\n  a: x\nname: alpha\ndescription: Valid.\n---\n"
         self.write("alpha/SKILL.md", doc)
         self.assertEqual(self.check(), ["alpha/SKILL.md: frontmatter line 2 is an unsupported nested value"])
+
+    def test_tab_indented_comment_after_description_fails(self) -> None:
+        """A tab-indented comment after description fails the character allow-list."""
+        self.write("alpha/SKILL.md", "---\nname: alpha\ndescription: Valid.\n\t# c\n---\n")
+        self.assertEqual(
+            self.check(),
+            [
+                "alpha/SKILL.md: frontmatter line 4 holds U+0009; "
+                + "SKILL.md frontmatter allows printable characters without tabs"
+            ],
+        )
+
+    def test_tab_only_blank_line_fails(self) -> None:
+        """A tab-only blank line fails the character allow-list."""
+        self.write("alpha/SKILL.md", "---\nname: alpha\n\t\ndescription: Valid.\n---\n")
+        self.assertEqual(
+            self.check(),
+            [
+                "alpha/SKILL.md: frontmatter line 3 holds U+0009; "
+                + "SKILL.md frontmatter allows printable characters without tabs"
+            ],
+        )
+
+    def test_spaces_then_tab_comment_line_fails(self) -> None:
+        """Leading spaces followed by a tab before a comment fail the character allow-list."""
+        self.write("alpha/SKILL.md", "---\nname: alpha\n  \t# c\ndescription: Valid.\n---\n")
+        self.assertEqual(
+            self.check(),
+            [
+                "alpha/SKILL.md: frontmatter line 3 holds U+0009; "
+                + "SKILL.md frontmatter allows printable characters without tabs"
+            ],
+        )
+
+    def test_trailing_tab_after_license_fails(self) -> None:
+        """A trailing tab after license: MIT fails the character allow-list."""
+        self.write("alpha/SKILL.md", "---\nname: alpha\nlicense: MIT\t\ndescription: Valid.\n---\n")
+        self.assertEqual(
+            self.check(),
+            [
+                "alpha/SKILL.md: frontmatter line 3 holds U+0009; "
+                + "SKILL.md frontmatter allows printable characters without tabs"
+            ],
+        )
+
+    def test_tab_inside_plain_other_key_value_fails(self) -> None:
+        """A tab inside a plain other-key value fails the character allow-list."""
+        self.write("alpha/SKILL.md", "---\nname: alpha\nlicense: a\tb\ndescription: Valid.\n---\n")
+        self.assertEqual(
+            self.check(),
+            [
+                "alpha/SKILL.md: frontmatter line 3 holds U+0009; "
+                + "SKILL.md frontmatter allows printable characters without tabs"
+            ],
+        )
+
+    def test_nul_in_description_fails(self) -> None:
+        """A NUL byte in description fails the character allow-list."""
+        self.write("alpha/SKILL.md", "---\nname: alpha\ndescription: a\x00b\n---\n")
+        self.assertEqual(
+            self.check(),
+            [
+                "alpha/SKILL.md: frontmatter line 3 holds U+0000; "
+                + "SKILL.md frontmatter allows printable characters without tabs"
+            ],
+        )
+
+    def test_bel_in_other_key_value_fails(self) -> None:
+        """U+0007 in an other-key value fails the character allow-list."""
+        self.write("alpha/SKILL.md", "---\nname: alpha\nlicense: a\x07b\ndescription: Valid.\n---\n")
+        self.assertEqual(
+            self.check(),
+            [
+                "alpha/SKILL.md: frontmatter line 3 holds U+0007; "
+                + "SKILL.md frontmatter allows printable characters without tabs"
+            ],
+        )
+
+    def test_bare_cr_in_description_fails(self) -> None:
+        """A bare CR inside a description value with LF line ends fails the character allow-list."""
+        self.write("alpha/SKILL.md", "---\nname: alpha\ndescription: a\rb\n---\n")
+        self.assertEqual(
+            self.check(),
+            [
+                "alpha/SKILL.md: frontmatter line 3 holds U+000D; "
+                + "SKILL.md frontmatter allows printable characters without tabs"
+            ],
+        )
+
+    def test_nel_in_description_fails(self) -> None:
+        """U+0085 NEL in description fails the character allow-list."""
+        self.write("alpha/SKILL.md", "---\nname: alpha\ndescription: a\x85b\n---\n")
+        self.assertEqual(
+            self.check(),
+            [
+                "alpha/SKILL.md: frontmatter line 3 holds U+0085; "
+                + "SKILL.md frontmatter allows printable characters without tabs"
+            ],
+        )
+
+    def test_line_separator_u2028_in_other_key_value_fails(self) -> None:
+        """U+2028 line separator in an other-key value fails the character allow-list."""
+        self.write("alpha/SKILL.md", "---\nname: alpha\nlicense: a\u2028b\ndescription: Valid.\n---\n")
+        self.assertEqual(
+            self.check(),
+            [
+                "alpha/SKILL.md: frontmatter line 3 holds U+2028; "
+                + "SKILL.md frontmatter allows printable characters without tabs"
+            ],
+        )
+
+    def test_bom_ufeff_in_value_fails(self) -> None:
+        """U+FEFF inside a value fails the character allow-list."""
+        self.write("alpha/SKILL.md", "---\nname: alpha\ndescription: a\ufeffb\n---\n")
+        self.assertEqual(
+            self.check(),
+            [
+                "alpha/SKILL.md: frontmatter line 3 holds U+FEFF; "
+                + "SKILL.md frontmatter allows printable characters without tabs"
+            ],
+        )
+
+    def test_noncharacter_ufffe_in_value_fails(self) -> None:
+        """U+FFFE in a value fails the character allow-list."""
+        self.write("alpha/SKILL.md", "---\nname: alpha\ndescription: a\ufffeb\n---\n")
+        self.assertEqual(
+            self.check(),
+            [
+                "alpha/SKILL.md: frontmatter line 3 holds U+FFFE; "
+                + "SKILL.md frontmatter allows printable characters without tabs"
+            ],
+        )
+
+    def test_del_u007f_in_value_fails(self) -> None:
+        """DEL U+007F in a value fails the character allow-list."""
+        self.write("alpha/SKILL.md", "---\nname: alpha\ndescription: a\x7fb\n---\n")
+        self.assertEqual(
+            self.check(),
+            [
+                "alpha/SKILL.md: frontmatter line 3 holds U+007F; "
+                + "SKILL.md frontmatter allows printable characters without tabs"
+            ],
+        )
+
+    def test_printable_unicode_description_passes(self) -> None:
+        """Printable non-ASCII characters U+00E9 and U+1F600 in description pass."""
+        self.write("alpha/SKILL.md", "---\nname: alpha\ndescription: Caf\u00e9 \U0001f600\n---\n")
+        self.assertEqual(self.check(), [])
 
 
 if __name__ == "__main__":

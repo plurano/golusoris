@@ -21,6 +21,7 @@ Plain scalars reject `:` + space/tab and space/tab + `#`; column-0 list items ne
 Other keys take a single-line plain or escape-free quoted scalar, or one nested level of
 same-indented `key: scalar` or `- scalar` lines; flow collections, block scalars, anchors,
 aliases and tags are rejected.
+Frontmatter lines allow only YAML printable characters without tabs, BOM, CR, NEL, LS or PS.
 
 Symlinks and non-regular index entries are rejected without following or reading them, and files
 over SIZE_MAX_BYTES (128 KiB) fail before reading past the cap. Default (pre-commit) mode reads
@@ -59,6 +60,9 @@ _ANY_KEY_LINE = re.compile(r"^([A-Za-z0-9_][A-Za-z0-9_.-]*):(?:[ \t]+(.*))?$")
 _XML_TAG = re.compile(r"<\s*/?\s*[A-Za-z][^<>]*>")
 _PLAIN_FORBIDDEN_START = frozenset("-?:,[]{}#&*!|>%@'\"`")
 _PLAIN_BREAK = re.compile(r":[ \t]|[ \t]#")
+_DISALLOWED_CHAR = re.compile(
+    r"[^\x20-\x7e\xa0-\u2027\u202a-\ud7ff\ue000-\ufefe\uff00-\ufffd\U00010000-\U0010ffff]"
+)
 
 
 @dataclass
@@ -322,18 +326,31 @@ def _scan_line(path: str, index: int, frontmatter: list[str], state: _ScanState)
     )
 
 
+def _check_chars(path: str, frontmatter: list[str]) -> list[str]:
+    """Return one finding per frontmatter line holding a disallowed character."""
+    rule = "SKILL.md frontmatter allows printable characters without tabs"
+    findings: list[str] = []
+    for index, line in enumerate(frontmatter):
+        match = _DISALLOWED_CHAR.search(line)
+        if match is not None:
+            cp = ord(match.group(0))
+            findings.append(f"{path}: frontmatter line {index + 2} holds U+{cp:04X}; {rule}")
+    return findings
+
+
 def problems(path: str, text: str) -> list[str]:
     """Return one message per Agent Skills frontmatter finding in text."""
     frontmatter, errors = _frontmatter_lines(path, text)
     if frontmatter is None:
         return errors
+    char_findings = _check_chars(path, frontmatter)
     state = _ScanState(seen=set(), duplicates=set(), values={})
     findings: list[str] = []
     for index in range(len(frontmatter)):
         finding = _scan_line(path, index, frontmatter, state)
         if finding is not None:
             findings.append(finding)
-    return findings + _check_fields(path, state.seen, state.values)
+    return char_findings + findings + _check_fields(path, state.seen, state.values)
 
 
 def _check_disk_file(root: Path, rel: str) -> list[str]:
