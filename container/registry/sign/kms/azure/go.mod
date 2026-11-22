@@ -3,7 +3,7 @@ module github.com/golusoris/golusoris/container/registry/sign/kms/azure
 go 1.27.4
 
 require (
-	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.23.3
+	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.24.0
 	github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.15.0
 	github.com/Azure/azure-sdk-for-go/sdk/security/keyvault/azkeys v1.5.0
 	github.com/golusoris/golusoris/container/registry/sign v0.0.0-20261030052321-26a731438cab
