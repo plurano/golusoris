@@ -2,7 +2,7 @@
 name: test-fixing
 description: Run tests and systematically fix all failing tests using smart error grouping. Use when user asks to fix failing tests, mentions test failures, runs test suite and failures occur, or requests to make tests pass.
 ---
-<!-- Modified by golusoris: wording edited in 511c84df for caveman-context lint (articles dropped, nested list indentation flattened, check mark replaced by [ok]); see ../README.md. -->
+> Modified by golusoris: wording edited in 511c84df for caveman-context lint (articles dropped, nested list indentation flattened, check mark replaced by [ok]); see ../README.md.
 
 # Test Fixing
 
