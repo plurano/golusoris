@@ -174,13 +174,33 @@ class FakeRunner:
         packages: bytes = b"example.test/package\n",
         fail_phase: str = "",
         created_after_build: tuple[str, ...] = (),
+        download_failures: int = 0,
+        download_writes: str = "",
+        download_failure_writes: str = "",
     ) -> None:
         self.manifests = manifests
         self.deleted_manifests = deleted_manifests
         self.packages = packages
         self.fail_phase = fail_phase
         self.created_after_build = created_after_build
+        self.download_failures = download_failures
+        self.download_writes = download_writes
+        self.download_failure_writes = download_failure_writes
+        self.download_calls = 0
         self.commands: list[tuple[Path, tuple[str, ...]]] = []
+
+    def _download(self, cwd: Path) -> bytes:
+        should_fail = self.download_calls < self.download_failures
+        self.download_calls += 1
+        if should_fail:
+            if self.download_failure_writes:
+                with (cwd / "go.sum").open("a", encoding="utf-8") as handle:
+                    handle.write(self.download_failure_writes)
+            raise portability.PortabilityError("injected download failure")
+        if self.download_writes:
+            with (cwd / "go.sum").open("a", encoding="utf-8") as handle:
+                handle.write(self.download_writes)
+        return b""
 
     def output(
         self,
@@ -199,6 +219,8 @@ class FakeRunner:
             ):
                 manifests += self.created_after_build
             return b"\0".join(path.encode() for path in manifests) + b"\0"
+        if argv == ("go", "mod", "download"):
+            return self._download(cwd)
         if argv == ("go", "list", "./..."):
             return self.packages
         raise AssertionError(f"unexpected output command: {argv!r}")
@@ -213,6 +235,8 @@ class FakeRunner:
     ) -> None:
         del environment, timeout
         self.commands.append((cwd, argv))
+        if argv == ("go", "mod", "download"):
+            raise AssertionError(f"download must use the tree-killing output path: {argv!r}")
         if self.fail_phase and argv[1] == self.fail_phase:
             raise portability.PortabilityError(f"injected {self.fail_phase} failure")
 
@@ -388,8 +412,19 @@ class PortabilityDriverTest(TestCase):
             runner = FakeRunner(manifests)
             summary = verify_quiet(root, runner)
         self.assertEqual(summary, portability.Summary(modules=2, packages=2, phases=6))
-        phase_commands = [argv for _, argv in runner.commands if argv[0] == "go" and argv[1] != "list"]
-        self.assertEqual(phase_commands, [argv for _ in manifests for _, argv in portability.PHASES])
+        phase_commands = [argv for _, argv in runner.commands if argv[0] == "go"]
+        self.assertEqual(
+            phase_commands,
+            [
+                argv
+                for _ in manifests
+                for argv in (
+                    ("go", "mod", "download"),
+                    ("go", "list", "./..."),
+                    *(phase_argv for _, phase_argv in portability.PHASES),
+                )
+            ],
+        )
 
     def test_positive_untracked_snapshots_surround_module_phases(self) -> None:
         manifests = ("go.mod", "nested/go.mod")
@@ -402,11 +437,22 @@ class PortabilityDriverTest(TestCase):
             summary = verify_quiet(root, runner)
         self.assertEqual(summary.modules, 2)
         snapshot = (resolved, ("git", "-C", str(resolved), "ls-files", "-z", "--others", "--exclude-standard"))
-        trace = [entry for entry in runner.commands if entry == snapshot or entry[1][:2] in PHASE_HEADS]
+        trace = [
+            entry
+            for entry in runner.commands
+            if entry == snapshot or entry[1][:2] in PHASE_HEADS | {("go", "mod"), ("go", "list")}
+        ]
         modules = [resolved.joinpath(*manifest.split("/")[:-1]) for manifest in manifests]
         # Each snapshot follows its own module's phases, so a later module cannot hide earlier output.
         expected = [snapshot] + [
-            step for module in modules for step in [*((module, argv) for _, argv in portability.PHASES), snapshot]
+            step
+            for module in modules
+            for step in [
+                (module, ("go", "mod", "download")),
+                (module, ("go", "list", "./...")),
+                *((module, argv) for _, argv in portability.PHASES),
+                snapshot,
+            ]
         ]
         self.assertEqual(trace, expected)
 
@@ -486,8 +532,141 @@ class PortabilityDriverTest(TestCase):
             runner = FakeRunner(manifests, packages=b"")
             with self.assertRaisesRegex(portability.PortabilityError, "expected 1..512"):
                 verify_quiet(root, runner)
-        phase_commands = [argv for _, argv in runner.commands if argv[0] == "go" and argv[1] != "list"]
-        self.assertEqual(phase_commands, [])
+        phase_commands = [argv for _, argv in runner.commands if argv[0] == "go"]
+        self.assertEqual(phase_commands, [("go", "mod", "download"), ("go", "list", "./...")])
+
+    def test_download_modules_succeeds_first_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            module = Path(directory)
+            runner = FakeRunner(("go.mod",), download_failures=0)
+            with mock.patch.object(portability.time, "sleep") as sleep:
+                attempt = portability.download_modules(module, runner, {"GOFLAGS": "-mod=readonly"})
+        self.assertEqual(attempt, 1)
+        self.assertEqual(runner.commands, [(module, ("go", "mod", "download"))])
+        sleep.assert_not_called()
+
+    def test_download_modules_recovers_on_last_attempt(self) -> None:
+        failures = portability.DOWNLOAD_ATTEMPTS - 1
+        with tempfile.TemporaryDirectory() as directory:
+            module = Path(directory)
+            runner = FakeRunner(("go.mod",), download_failures=failures)
+            try:
+                with (
+                    mock.patch.object(portability.time, "sleep") as sleep,
+                    contextlib.redirect_stdout(io.StringIO()),
+                ):
+                    attempt = portability.download_modules(
+                        module, runner, {"GOFLAGS": "-mod=readonly"}
+                    )
+            except portability.PortabilityError as error:
+                self.fail(f"download_modules did not recover on final attempt: {error}")
+        self.assertEqual(attempt, portability.DOWNLOAD_ATTEMPTS)
+        self.assertEqual(
+            runner.commands,
+            [(module, ("go", "mod", "download"))] * portability.DOWNLOAD_ATTEMPTS,
+        )
+        self.assertEqual(
+            sleep.call_args_list,
+            [mock.call(portability.DOWNLOAD_RETRY_SECONDS)] * failures,
+        )
+
+    def test_download_modules_fails_after_all_attempts(self) -> None:
+        attempts = portability.DOWNLOAD_ATTEMPTS
+        with tempfile.TemporaryDirectory() as directory:
+            module = Path(directory)
+            runner = FakeRunner(("go.mod",), download_failures=attempts)
+            with (
+                mock.patch.object(portability.time, "sleep") as sleep,
+                contextlib.redirect_stdout(io.StringIO()),
+                self.assertRaisesRegex(
+                    portability.PortabilityError,
+                    f"failed after {attempts} attempts",
+                ),
+            ):
+                portability.download_modules(module, runner, {"GOFLAGS": "-mod=readonly"})
+        download_commands = [
+            argv for _, argv in runner.commands if argv == ("go", "mod", "download")
+        ]
+        self.assertEqual(len(download_commands), attempts)
+        self.assertEqual(
+            sleep.call_args_list,
+            [mock.call(portability.DOWNLOAD_RETRY_SECONDS)] * (attempts - 1),
+        )
+
+    def test_verify_repository_stops_before_build_when_download_fails(self) -> None:
+        manifests = ("go.mod", "nested/go.mod")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            create_repository(root, manifests)
+            runner = FakeRunner(manifests, download_failures=portability.DOWNLOAD_ATTEMPTS)
+            with (
+                mock.patch.object(portability.time, "sleep"),
+                self.assertRaisesRegex(
+                    portability.PortabilityError,
+                    f"failed after {portability.DOWNLOAD_ATTEMPTS} attempts",
+                ),
+            ):
+                verify_quiet(root, runner)
+        build_commands = [argv for _, argv in runner.commands if argv == ("go", "build", "./...")]
+        self.assertEqual(build_commands, [])
+
+    def test_download_modules_rejects_repaired_go_sum(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            module = Path(directory)
+            create_repository(module, ("go.mod",))
+            (module / "go.sum").write_text("example.test/dep v1.0.0 h1:existing=\n", encoding="utf-8")
+            runner = FakeRunner(("go.mod",), download_writes="example.test/dep v1.0.0/go.mod h1:x=\n")
+            with self.assertRaisesRegex(portability.PortabilityError, "changed go.mod or go.sum"):
+                portability.download_modules(module, runner, {"GOFLAGS": "-mod=readonly"})
+        self.assertEqual(runner.commands, [(module, ("go", "mod", "download"))])
+
+    def test_download_modules_rejects_created_go_sum(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            module = Path(directory)
+            create_repository(module, ("go.mod",))
+            runner = FakeRunner(("go.mod",), download_writes="example.test/dep v1.0.0/go.mod h1:x=\n")
+            with self.assertRaisesRegex(portability.PortabilityError, "changed go.mod or go.sum"):
+                portability.download_modules(module, runner, {"GOFLAGS": "-mod=readonly"})
+        self.assertEqual(runner.commands, [(module, ("go", "mod", "download"))])
+
+    def test_download_modules_rejects_metadata_written_by_failed_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            module = Path(directory)
+            create_repository(module, ("go.mod",))
+            (module / "go.sum").write_text("example.test/dep v1.0.0 h1:existing=\n", encoding="utf-8")
+            runner = FakeRunner(
+                ("go.mod",),
+                download_failures=portability.DOWNLOAD_ATTEMPTS,
+                download_failure_writes="example.test/dep v1.0.0/go.mod h1:x=\n",
+            )
+            with (
+                mock.patch.object(portability.time, "sleep") as sleep,
+                self.assertRaisesRegex(
+                    portability.PortabilityError, "changed go.mod or go.sum"
+                ) as failure,
+            ):
+                portability.download_modules(module, runner, {"GOFLAGS": "-mod=readonly"})
+        self.assertEqual(runner.download_calls, 1)
+        sleep.assert_not_called()
+        self.assertIsInstance(failure.exception.__cause__, portability.PortabilityError)
+        self.assertIn("injected download failure", str(failure.exception.__cause__))
+
+    def test_verify_repository_stops_before_build_when_download_repairs_metadata(self) -> None:
+        manifests = ("go.mod", "nested/go.mod")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            create_repository(root, manifests)
+            runner = FakeRunner(
+                manifests,
+                download_writes="example.test/dep v1.0.0/go.mod h1:x=\n",
+            )
+            with self.assertRaisesRegex(
+                portability.PortabilityError,
+                "changed go.mod or go.sum",
+            ):
+                verify_quiet(root, runner)
+        build_commands = [argv for _, argv in runner.commands if argv == ("go", "build", "./...")]
+        self.assertEqual(build_commands, [])
 
     def test_negative_phase_failure_is_not_hidden(self) -> None:
         manifests = ("go.mod",)
