@@ -5,7 +5,11 @@
 
 from __future__ import annotations
 
-import subprocess  # Only for SubprocessError in the mocked git failures below. # nosec B404
+import contextlib
+import io
+import os
+import subprocess  # Fixture git commands and SubprocessError in mocked git failures. # nosec B404
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -274,6 +278,166 @@ class ShellFlakePolicyTest(unittest.TestCase):
         findings = shell_flake_policy.scan_repository(self.temp_root, set())
         self.assert_has_rule(findings, "early-exit-reader")
         self.assertEqual(findings[0].path, "scripts/ci/root_probe.sh")
+
+
+class ShellFlakePolicyPushedTest(unittest.TestCase):
+    """Exercise pre-push --pushed path selection, divergence, and hook wiring."""
+
+    def setUp(self) -> None:
+        """Create a temporary git repository with isolated Git configuration."""
+        self._temp_dir = tempfile.TemporaryDirectory(prefix="golusoris-flake-pushed-")
+        self.repo_root = Path(self._temp_dir.name)
+        self.addCleanup(self._temp_dir.cleanup)
+        self._git("init", "-q")
+
+    def _git(self, *args: str) -> None:
+        """Run one fixture git command without inherited Git variables."""
+        env = {key: val for key, val in os.environ.items() if not key.startswith("GIT_")}
+        env["GIT_CONFIG_GLOBAL"] = "/dev/null"
+        env["GIT_CONFIG_NOSYSTEM"] = "1"
+        subprocess.run(  # noqa: S603 - fixed git argv in fixture, no shell. # nosec B603
+            ["git", *args],  # noqa: S607 - git executable on runner PATH. # nosec B607
+            cwd=self.repo_root,
+            env=env,
+            check=True,
+            timeout=60,
+        )
+
+    def _commit(self, message: str) -> None:
+        """Create one unsigned fixture commit with a fixed identity."""
+        identity = ("-c", "user.name=policy", "-c", "user.email=policy@example.invalid")
+        self._git(*identity, "-c", "commit.gpgsign=false", "commit", "-qm", message)
+
+    def _commit_paths(self, mapping: dict[str, str]) -> None:
+        """Write relative paths and create one commit."""
+        for rel, content in mapping.items():
+            target = self.repo_root / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+            self._git("add", rel)
+        self._commit("fixture")
+
+    def test_p1_planted_early_exit_reader(self) -> None:
+        """P1: in-scope pushed shell script with early-exit reader is flagged."""
+        self._commit_paths({"scripts/ci/planted.sh": "echo x | head -1\n"})
+        findings = shell_flake_policy.scan_pushed(
+            self.repo_root, ["scripts/ci/planted.sh"]
+        )
+        self.assertTrue(any(f.rule == "early-exit-reader" for f in findings))
+
+    def test_p2_planted_bare_module_download(self) -> None:
+        """P2: pushed Makefile with bare go install is flagged."""
+        self._commit_paths({"Makefile": "install:\n\tgo install example.com/x@v1\n"})
+        findings = shell_flake_policy.scan_pushed(self.repo_root, ["Makefile"])
+        self.assertTrue(any(f.rule == "bare-module-download" for f in findings))
+
+    def test_c1_clean_pattern_passes(self) -> None:
+        """C1: approved reader pattern on pushed path yields no findings."""
+        body = 'out="$(producer)"; grep -q PAT <<<"$out"\n'
+        self._commit_paths({"scripts/ci/clean.sh": body})
+        findings = shell_flake_policy.scan_pushed(
+            self.repo_root, ["scripts/ci/clean.sh"]
+        )
+        self.assertEqual(findings, [])
+
+    def test_b1_out_of_scope_filtered(self) -> None:
+        """B1: out-of-scope paths are not scanned."""
+        self._commit_paths({"internal/x.txt": "echo x | head -1\n"})
+        findings = shell_flake_policy.scan_pushed(
+            self.repo_root, ["internal/x.txt"]
+        )
+        self.assertEqual(findings, [])
+
+    @patch.object(shell_flake_policy, "scan_repository")
+    def test_b2_empty_path_list_skips_full_scan(self, mock_scan: MagicMock) -> None:
+        """B2: empty pushed path list does not fall back to full repository scan."""
+        findings = shell_flake_policy.scan_pushed(self.repo_root, [])
+        self.assertEqual(findings, [])
+        mock_scan.assert_not_called()
+
+    def test_b3_windows_path_normalized(self) -> None:
+        """B3: backslash path separators are normalized before scan."""
+        self._commit_paths({"scripts/ci/planted.sh": "echo x | head -1\n"})
+        findings = shell_flake_policy.scan_pushed(
+            self.repo_root, [r"scripts\ci\planted.sh"]
+        )
+        self.assertTrue(any(f.rule == "early-exit-reader" for f in findings))
+
+    def test_n1_uncommitted_change_blocks_scan(self) -> None:
+        """N1: worktree drift against HEAD returns uncommitted-change without scan."""
+        self._commit_paths({"scripts/ci/clean.sh": "# clean\n"})
+        (self.repo_root / "scripts/ci/clean.sh").write_text(
+            "echo x | head -1\n", encoding="utf-8"
+        )
+        findings = shell_flake_policy.scan_pushed(
+            self.repo_root, ["scripts/ci/clean.sh"]
+        )
+        self.assertTrue(any(f.rule == "uncommitted-change" for f in findings))
+        self.assertFalse(any(f.rule == "early-exit-reader" for f in findings))
+
+    def test_n2_deleted_committed_path_skips(self) -> None:
+        """N2: deleted committed path produces no findings."""
+        self._commit_paths({"scripts/ci/planted.sh": "echo x | head -1\n"})
+        self._git("rm", "-q", "scripts/ci/planted.sh")
+        self._commit("remove")
+        findings = shell_flake_policy.scan_pushed(
+            self.repo_root, ["scripts/ci/planted.sh"]
+        )
+        self.assertEqual(findings, [])
+
+    @patch.object(shell_flake_policy, "MAX_SCAN_FILES", 1)
+    @patch.object(shell_flake_policy, "scan_repository", return_value=[])
+    def test_n3_path_bound_falls_back_to_full_scan(self, mock_scan: MagicMock) -> None:
+        """N3: exceeding MAX_SCAN_FILES triggers bounded full-repository scan."""
+        self._commit_paths(
+            {
+                "scripts/ci/a.sh": "echo ok\n",
+                "scripts/ci/b.sh": "echo ok\n",
+            }
+        )
+        shell_flake_policy.scan_pushed(
+            self.repo_root, ["scripts/ci/a.sh", "scripts/ci/b.sh"]
+        )
+        mock_scan.assert_called_once()
+
+    def test_w1_lefthook_prepush_wiring(self) -> None:
+        """W1: lefthook pre-push runs shell_flake_policy.py --pushed on push_files."""
+        lefthook = Path(__file__).resolve().parents[2] / "lefthook.yml"
+        text = lefthook.read_text(encoding="utf-8")
+        lines = text.splitlines()
+        start = next(i for i, line in enumerate(lines) if line.startswith("pre-push:"))
+        block: list[str] = []
+        for line in lines[start + 1 :]:
+            if line and not line[0].isspace():
+                break
+            block.append(line)
+        section = "\n".join(block)
+        self.assertIn("    shell-flake-policy:", section)
+        expected = (
+            "      run: sh .config/lefthook/python.sh -B scripts/ci/shell_flake_policy.py "
+            "--pushed {push_files}"
+        )
+        self.assertIn(expected, section)
+
+    @patch.object(shell_flake_policy, "scan_repository")
+    def test_m1_main_dispatches_pushed_mode(self, mock_scan: MagicMock) -> None:
+        """M1: main() routes --pushed through scan_pushed and maps findings to exit code."""
+        finding = shell_flake_policy.Finding("a.sh", 1, "early-exit-reader", "x")
+        repo = Path(__file__).resolve().parents[2]
+        argv = ["shell_flake_policy.py", "--pushed", "a.sh"]
+        out = io.StringIO()
+        with (
+            patch.object(shell_flake_policy, "scan_pushed") as mock_pushed,
+            patch.object(sys, "argv", argv),
+            contextlib.redirect_stdout(out),
+        ):
+            mock_pushed.return_value = [finding]
+            self.assertEqual(shell_flake_policy.main(), 1)
+            mock_pushed.assert_called_with(repo, ["a.sh"])
+            mock_pushed.return_value = []
+            self.assertEqual(shell_flake_policy.main(), 0)
+        mock_scan.assert_not_called()
+        self.assertEqual(out.getvalue(), "a.sh:1: early-exit-reader: x\n")
 
 
 if __name__ == "__main__":

@@ -407,10 +407,76 @@ def scan_repository(repo_root: Path, praetor_files: set[str]) -> list[Finding]:
     return findings
 
 
+def normalize_pushed_paths(paths: list[str]) -> list[str]:
+    """Normalize path separators for pushed file arguments."""
+    return [path.replace("\\", "/") for path in paths[:MAX_SCAN_FILES]]
+
+
+def filter_pushed_in_scope(paths: list[str], praetor: set[str]) -> list[str]:
+    """Keep pushed paths that fall in reader or download scan scope."""
+    selected: list[str] = []
+    for rel in paths[:MAX_SCAN_FILES]:
+        in_reader = is_in_repo_scope(rel, praetor)
+        in_dl = is_in_download_scope(rel, praetor)
+        if in_reader or in_dl:
+            selected.append(rel)
+    return selected
+
+
+def check_pushed_worktree_divergence(
+    repo_root: Path, selected: list[str]
+) -> list[Finding]:
+    """Detect uncommitted changes in pushed paths relative to HEAD."""
+    bounded = selected[:MAX_SCAN_FILES]
+    if not bounded:
+        return []
+    cmd = ["git", "-C", str(repo_root), "diff", "--quiet", "HEAD", "--", *bounded]
+    try:
+        res = subprocess.run(  # noqa: S603 - fixed git command without shell. # nosec B603
+            cmd,
+            timeout=60,
+        )
+    except (subprocess.SubprocessError, OSError) as err:
+        return [Finding(".", 0, "git-error", str(err))]
+    if res.returncode == 1:
+        msg = "pushed file has uncommitted changes; commit or stash them"
+        return [Finding(".", 0, "uncommitted-change", msg)]
+    if res.returncode != 0:
+        return [Finding(".", 0, "git-error", f"git diff exited {res.returncode}")]
+    return []
+
+
+def scan_pushed(repo_root: Path, paths: list[str]) -> list[Finding]:
+    """Scan pushed hook paths that fall within CI flake policy scope."""
+    if len(paths) > MAX_SCAN_FILES:
+        note = (
+            f"shell-flake-policy: path count exceeds bound ({len(paths)} > {MAX_SCAN_FILES}); "
+            "scanning all in-scope repository files"
+        )
+        print(note, file=sys.stderr)
+        return scan_repository(repo_root, get_praetor_files(repo_root))
+    normalized = normalize_pushed_paths(paths)
+    praetor = get_praetor_files(repo_root)
+    selected = filter_pushed_in_scope(normalized, praetor)
+    if not selected:
+        print("shell-flake-policy: no pushed in-scope files, skipping", file=sys.stderr)
+        return []
+    divergence = check_pushed_worktree_divergence(repo_root, selected)
+    if divergence:
+        return divergence
+    findings: list[Finding] = []
+    for rel in selected[:MAX_SCAN_FILES]:
+        check_dl = is_in_download_scope(rel, praetor)
+        findings.extend(scan_file(rel, check_dl, repo_root))
+    return findings
+
+
 def main() -> int:
     """Run flake policy checks on specified paths or repository files."""
     repo_root = Path(__file__).resolve().parent.parent.parent
-    if len(sys.argv) > 1:
+    if len(sys.argv) > 1 and sys.argv[1] == "--pushed":
+        findings = scan_pushed(repo_root, sys.argv[2:])
+    elif len(sys.argv) > 1:
         findings = scan_arguments(sys.argv[1:])
     else:
         findings = scan_repository(repo_root, get_praetor_files(repo_root))
