@@ -27,7 +27,7 @@ regenerator.
 | Package | Pinned version | Authority | Snapshot |
 | --- | --- | --- | --- |
 | `go.uber.org/fx` | `v1.24.0` | root + core | [fx/](fx/README.md) |
-| `github.com/jackc/pgx/v5` | `v5.11.0` | root | [pgx/](pgx/README.md) |
+| `github.com/jackc/pgx/v5` | `v5.13.0` | root | [pgx/](pgx/README.md) |
 | `github.com/ogen-go/ogen` | `v1.24.0` | root | [ogen/](ogen/README.md) |
 | `github.com/riverqueue/river` | `v0.49.0` | root | [river/](river/README.md) |
 | `github.com/knadh/koanf/v2` | `v2.3.8` | root + core | [koanf/](koanf/README.md) |

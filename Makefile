@@ -110,7 +110,7 @@ lefthook-validate: ## verify lefthook.yml parses and matches the lefthook schema
 	@lefthook validate
 
 .PHONY: ci-policy-test
-ci-policy-test: lefthook-validate go-apidiff-test tiny-trainer-publish-policy-test tiny-litert-sidecar-publish-policy-test tiny-trainer-locks-policy-test docs-upstream-verify ## verify required-job fail-closed and not-applicable semantics
+ci-policy-test: lefthook-validate go-apidiff-test tiny-trainer-publish-policy-test tiny-litert-sidecar-publish-policy-test tiny-trainer-locks-policy-test docs-upstream-verify skill-frontmatter ## verify required-job fail-closed and not-applicable semantics
 	@bash scripts/ci/check-required-jobs_test.sh
 	@bash scripts/ci/sarif-upload-policy_test.sh
 	@bash scripts/ci/check-dco_test.sh
@@ -266,6 +266,10 @@ caveman-context: ## lint every canonical agent-facing context surface
 context-size: ## fail when an AGENTS.md file or AGENTS.md path chain reaches 95% of a coding client's context cap
 	@python3 -B scripts/ci/context_size.py --worktree .
 
+.PHONY: skill-frontmatter
+skill-frontmatter: ## fail when a SKILL.md name or description breaks the Agent Skills specification
+	@python3 -B scripts/ci/skill_frontmatter.py --worktree .
+
 .PHONY: text-register-policy
 text-register-policy: ## verify required register skills and plugin projections
 	@bash scripts/ci/text-register-policy.sh .
@@ -413,7 +417,7 @@ endif
 endif
 
 .PHONY: verify-all
-verify-all: fmt-check-all gci-hook-test tidy-check-all fix-check-all ci-policy-test release-notes-check release-depth-check go-modules-test portability-test build-all ci-all python-lint python-test python-symlink-tmpdir-test c-quality allocation-budget core-skew fault-recovery trivy-scan capabilities-check caveman-context context-size text-register-policy mkdocs-build semgrep-scan shellcheck actionlint template-workflows terraform-validate kubeconform buf-lint compile-context-verify audit dedupe-scan hiss-fixtures hiss-coverage docs-upstream-verify reuse-lint ## the universal verification gate
+verify-all: fmt-check-all gci-hook-test tidy-check-all fix-check-all ci-policy-test release-notes-check release-depth-check go-modules-test portability-test build-all ci-all python-lint python-test python-symlink-tmpdir-test c-quality allocation-budget core-skew fault-recovery trivy-scan capabilities-check caveman-context context-size skill-frontmatter text-register-policy mkdocs-build semgrep-scan shellcheck actionlint template-workflows terraform-validate kubeconform buf-lint compile-context-verify audit dedupe-scan hiss-fixtures hiss-coverage docs-upstream-verify reuse-lint ## the universal verification gate
 	@echo "All verification gates passed cleanly."
 
 # BEGIN praetor documentation gate
