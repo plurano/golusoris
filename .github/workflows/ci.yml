@@ -605,6 +605,8 @@ jobs:
     needs: build
     runs-on: ubuntu-26.04
     timeout-minutes: 45
+    env:
+      CI_SCOPE_BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || '' }}
     steps:
       - name: Stop on a draft pull request
         uses: plurano/golusoris/.github/actions/stop-on-draft@e601567f4e1acb72525f361f80dac6d89cbad553 # #1212
@@ -613,8 +615,6 @@ jobs:
           fetch-depth: 0
       - name: Decide the CI scope gate
         shell: bash
-        env:
-          CI_SCOPE_BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || '' }}
         run: |
           gated="$(python3 -B scripts/ci/ci_scope.py gate)"
           case "$gated" in run | skip) ;; *) echo "::error::ci-scope gate printed: $gated"; exit 1 ;; esac
