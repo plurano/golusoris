@@ -1,5 +1,5 @@
 ---
-name: finishing--development-branch
+name: finishing-a-development-branch
 description: Use after implementation passes tests to choose and run merge, pull-request, or cleanup workflow
 ---
 
