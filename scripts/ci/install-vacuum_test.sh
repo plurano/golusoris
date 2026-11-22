@@ -305,13 +305,27 @@ FAKE_GOVERSION=go1.27.5 VACUUM_CACHE_DIR="$cache_dir" FAKE_NO_BUILD=1 \
 VACUUM_CACHE_DIR="$cache_dir" run_installer "$good_sum" "$version" "$suite_root/install-v6-fill" >/dev/null
 install -m 0755 "$cache_dir/vacuum" "$suite_root/vacuum-valid"
 rm -f "$cache_dir/vacuum"
-ln -s "$suite_root/vacuum-valid" "$cache_dir/vacuum"
-VACUUM_CACHE_DIR="$cache_dir" FAKE_NO_BUILD=1 \
-	expect_failure 'entry is not a regular file' "$suite_root/install-v6" \
-	run_installer "$good_sum" "$version" "$suite_root/install-v6" || {
-	printf 'V6: symlinked entry was not rejected\n' >&2
-	exit 1
-}
+# Git Bash copies on ln -s unless MSYS asks for a native link; other platforms ignore MSYS.
+if MSYS=winsymlinks:nativestrict ln -s "$suite_root/vacuum-valid" "$cache_dir/vacuum" >/dev/null 2>&1 \
+	&& [[ -L "$cache_dir/vacuum" ]]; then
+	VACUUM_CACHE_DIR="$cache_dir" FAKE_NO_BUILD=1 \
+		expect_failure 'entry is not a regular file' "$suite_root/install-v6" \
+		run_installer "$good_sum" "$version" "$suite_root/install-v6" || {
+		printf 'V6: symlinked entry was not rejected\n' >&2
+		exit 1
+	}
+else
+	rm -f "$cache_dir/vacuum"
+	case "$(uname -s)" in
+	MINGW* | MSYS* | CYGWIN*)
+		printf 'V6 skipped: Git Bash could not create a symbolic link here\n' >&2
+		;;
+	*)
+		printf 'V6: could not create a symbolic link\n' >&2
+		exit 1
+		;;
+	esac
+fi
 
 # V7 cache key: stable, and changed by the Go version and by the module sum pin.
 write_pins "$version" "$good_sum"
