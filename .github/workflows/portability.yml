@@ -82,6 +82,11 @@ jobs:
         env:
           PYTHON: python
         run: bash scripts/ci/release-depth-evidence_test.sh
+      - name: Vacuum installer policy on this platform
+        # The spectral jobs take any runs-on; this leg proves the cache key and install paths on macOS bash 3.2 and Git Bash too.
+        if: env.CI_GATED != 'skip'
+        shell: bash
+        run: bash scripts/ci/install-vacuum_test.sh
       - name: Install cgo system libraries on Linux
         # hw/udev links libudev; media/3d links OpenAL, Vorbis, GL and X11 (go-gl/glfw).
         if: runner.os == 'Linux' && env.CI_GATED != 'skip'

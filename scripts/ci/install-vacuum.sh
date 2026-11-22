@@ -31,22 +31,28 @@ load_and_validate_pins() {
 	fi
 }
 
+# Bash 3.2 (macOS runners): no mapfile, no case-changing expansions.
 # Prints every input that decides the build, one key=value line each, in a fixed order.
 vacuum_input_record() {
 	local -a names=(GOVERSION GOOS GOARCH GOAMD64 GOARM64 CGO_ENABLED GOFLAGS GOEXPERIMENT)
 	local -a values=()
-	local go_env i
+	local go_env i line count=0
+	local max_lines
 	# From a module-free directory, as the build runs, so a caller's go.mod cannot switch toolchains;
 	# the end marker keeps trailing empty values.
+	max_lines=$((${#names[@]} + 2))
 	go_env="$(cd / && go env "${names[@]}" && printf 'end\n')" || return 1
-	mapfile -t values <<<"$go_env"
+	while IFS= read -r line && ((count < max_lines)); do
+		values+=("$line")
+		count=$((count + 1))
+	done <<<"$go_env"
 	if ((${#values[@]} != ${#names[@]} + 1)) || [[ "${values[${#names[@]}]}" != 'end' ]]; then
 		printf 'go env printed %d lines for %d variables\n' "${#values[@]}" "${#names[@]}" >&2
 		return 1
 	fi
 	printf 'module=%s\nversion=%s\nmodule_sum=%s\n' "$module" "$VACUUM_VERSION" "$VACUUM_MODULE_SUM"
 	for i in "${!names[@]}"; do
-		printf 'go_%s=%s\n' "${names[$i],,}" "${values[$i]}"
+		printf 'go_%s=%s\n' "$(printf '%s' "${names[$i]}" | tr '[:upper:]' '[:lower:]')" "${values[$i]}"
 	done
 }
 
