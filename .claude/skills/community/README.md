@@ -1,6 +1,6 @@
 ---
 name: community-skills
-description: Skills cherry-picked from third-party community repos. Permissive licenses only (MIT / Apache-2.0). Each subdir is a self-contained SKILL.md vendored verbatim from upstream.
+description: Skills cherry-picked from third-party community repos. Permissive licenses only (MIT / Apache-2.0). Each subdir is a self-contained SKILL.md copied from upstream, with the local edits listed under Divergence policy.
 ---
 
 # Community skills (vendored, permissive licenses only)
@@ -23,7 +23,7 @@ We plan to move these into a dedicated skills repo once the collection grows —
 ## Why only MIT / Apache-2.0
 
 - **MIT** permits copying + modification with attribution — satisfied by this README + retaining each upstream repo's SKILL.md front-matter.
-- **Apache-2.0** permits the same plus requires NOTICE retention and stating modifications. These files are vendored **verbatim** except `vibesec/SKILL.md`, whose frontmatter `name` changed (see Divergence policy); the per-skill row above is the attribution notice.
+- **Apache-2.0** permits the same plus requires NOTICE retention and stating modifications (section 4(b): modified files carry a prominent notice). None of the upstream repos ships a NOTICE file. The files are **not** verbatim (see Divergence policy), so each Apache-2.0 `SKILL.md` (`git-pushing`, `review-implementing`, `test-fixing`, `vibesec`) carries a `Modified by golusoris` comment right after its frontmatter that names its changes; the per-skill row above is the attribution notice.
 - **CC-BY-SA-4.0** (e.g., trailofbits/skills) requires share-alike relicensing, which would impose a license on golusoris that doesn't match the rest of the repo. Skipped.
 - **Anthropics' proprietary license** (anthropics/skills) explicitly forbids "Reproduce or copy these materials" and "Create derivative works". Skipped entirely — use the skills via claude.ai if needed, don't copy them.
 
@@ -36,4 +36,8 @@ We plan to move these into a dedicated skills repo once the collection grows —
 
 Files here are copies, not submodules. We don't auto-track upstream. When refreshing from upstream, note the commit SHA in the commit message so drift is auditable.
 
-Local changes to reapply after every refresh: `vibesec/SKILL.md` declares `name: vibesec` instead of the upstream name `VibeSec-Skill` (BehiSecc/VibeSec-Skill at `0590993b`), because the Agent Skills specification requires a lowercase name equal to the skill directory; `scripts/ci/skill_frontmatter.py` enforces it.
+Local changes to reapply after every refresh:
+
+- All six `SKILL.md` files carry the wording edits of commit 511c84df: articles and some filler words dropped, some punctuation and list indentation changed. They exist because the `caveman-context` target (`Makefile`) lints `.claude/skills/*.md`, and that pathspec also matches the nested files here. Whether vendored upstream text keeps this rewrite or gets a declared lint exception is open in issue 1578.
+- `vibesec/SKILL.md` declares `name: vibesec` instead of the upstream name `VibeSec-Skill` (BehiSecc/VibeSec-Skill at `0590993b`), because the Agent Skills specification requires a lowercase name equal to the skill directory; `scripts/ci/skill_frontmatter.py` enforces it.
+- Each Apache-2.0 `SKILL.md` keeps its `Modified by golusoris` comment, updated to name every local change it carries.

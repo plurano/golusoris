@@ -2,6 +2,7 @@
 name: review-implementing
 description: Process and implement code review feedback systematically. Use when user provides reviewer comments, PR feedback, code review notes, or asks to implement suggestions from reviews.
 ---
+<!-- Modified by golusoris: wording edited in 511c84df for caveman-context lint (articles dropped, "based on" shortened to "from", list-number punctuation changed); see ../README.md. -->
 
 # Review Feedback Implementation
 

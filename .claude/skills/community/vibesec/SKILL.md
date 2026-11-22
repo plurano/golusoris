@@ -2,7 +2,7 @@
 name: vibesec
 description: This skill helps Claude write secure web applications. Use this when working on any web application or when user requests scan or audit to ensure security best practices are followed.
 ---
-<!-- Modified by golusoris: frontmatter name VibeSec-Skill changed to vibesec (Agent Skills name rule); see ../README.md. -->
+<!-- Modified by golusoris: frontmatter name VibeSec-Skill changed to vibesec (Agent Skills name rule); wording edited in 511c84df for caveman-context lint (articles and filler words dropped, "e.g.," punctuation changed); see ../README.md. -->
 
 # Secure Coding Guide for Web Applications
 
