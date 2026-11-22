@@ -10,9 +10,7 @@ import os
 import shutil
 import subprocess  # Runs only fixed git commands in a scratch repository. # nosec B404
 import sys
-import tempfile
 import unittest
-import unittest.mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -30,12 +28,8 @@ class ContextSizeTest(unittest.TestCase):
     """Positive, negative and boundary cases for both client caps."""
 
     def setUp(self) -> None:
-        """Create a scratch repository with the hook's git variables removed."""
-        self.enterContext(unittest.mock.patch.dict(os.environ, repo_git.fixture_environ(), clear=True))
-        scratch = tempfile.TemporaryDirectory()
-        self.addCleanup(scratch.cleanup)
-        self.root = Path(scratch.name)
-        self.git("init", "-q")
+        """Create an isolated scratch repository bounded against parent git directories."""
+        self.root = self.enterContext(repo_git.fixture_repository())
 
     def git(self, *args: str) -> None:
         """Run one git command in the scratch repository."""

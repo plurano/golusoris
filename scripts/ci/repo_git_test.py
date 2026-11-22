@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess  # Runs only this repository's own policy script. # nosec B404
 import sys
 import tempfile
@@ -100,9 +101,13 @@ class WorktreeFilesTest(RepoGitCase):
         """Negative: a directory outside any repository raises GitError."""
         outside = tempfile.TemporaryDirectory(prefix="golusoris-repo-git-outside-")
         self.addCleanup(outside.cleanup)
-        with unittest.mock.patch.dict(os.environ, {"GIT_CEILING_DIRECTORIES": outside.name}):
+        ceiling = Path(outside.name).resolve()
+        non_repo = ceiling / "outside"
+        non_repo.mkdir()
+        # GIT_CEILING_DIRECTORIES bounds strict subdirectories of the ceiling, not cwd itself.
+        with unittest.mock.patch.dict(os.environ, {"GIT_CEILING_DIRECTORIES": str(ceiling)}):
             with self.assertRaises(repo_git.GitError):
-                repo_git.worktree_files(Path(outside.name), "go.mod")
+                repo_git.worktree_files(non_repo, "go.mod")
 
 
 class StagedAndBlobHelpersTest(RepoGitCase):
@@ -254,6 +259,48 @@ class CallerExitCodeTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 3, proc.stderr)
         self.assertIn("ERROR: git", proc.stderr)
         self.assertNotIn("Traceback", proc.stderr)
+
+
+class FixtureRepositoryTest(unittest.TestCase):
+    """Exercise fixture_repository ceiling isolation, environment restore, and cleanup."""
+
+    def test_yields_fixture_inside_enclosing_repository(self) -> None:
+        """Positive: rev-parse --show-toplevel resolves the fixture and its enclosing parent."""
+        with repo_git.fixture_repository() as root:
+            top = Path(repo_git.run_git(["rev-parse", "--show-toplevel"], root).strip())
+            parent = Path(repo_git.run_git(["rev-parse", "--show-toplevel"], root.parent).strip())
+            self.assertEqual(top, root)
+            self.assertEqual(parent, root.parent)
+
+    def test_removed_fixture_git_dir_does_not_escape_to_enclosing_repository(self) -> None:
+        """Negative: removing the fixture .git makes rev-parse fail instead of finding the parent."""
+        with repo_git.fixture_repository() as root:
+            shutil.rmtree(root / ".git")
+            with self.assertRaises(repo_git.GitError):
+                repo_git.run_git(["rev-parse", "--show-toplevel"], root)
+
+    def test_restores_environment_and_removes_tempdir_on_exit_and_error(self) -> None:
+        """Boundary: sentinel variables are restored and the tempdir is removed on exit and error."""
+        sentinels = {
+            "GIT_CEILING_DIRECTORIES": "/sentinel/ceiling",
+            "GOLUSORIS_FIXTURE_SENTINEL": "sentinel-value",
+        }
+        with unittest.mock.patch.dict(os.environ, sentinels):
+            with repo_git.fixture_repository() as root:
+                enclosing = root.parent
+                self.assertEqual(os.environ["GIT_CEILING_DIRECTORIES"], str(enclosing))
+                self.assertEqual(os.environ["GOLUSORIS_FIXTURE_SENTINEL"], "sentinel-value")
+                os.environ["GOLUSORIS_FIXTURE_SENTINEL"] = "changed-inside"
+            self.assertEqual(os.environ["GIT_CEILING_DIRECTORIES"], "/sentinel/ceiling")
+            self.assertEqual(os.environ["GOLUSORIS_FIXTURE_SENTINEL"], "sentinel-value")
+            self.assertFalse(enclosing.exists())
+            with self.assertRaisesRegex(RuntimeError, "boom"), repo_git.fixture_repository() as err_root:
+                err_enclosing = err_root.parent
+                os.environ["GOLUSORIS_FIXTURE_SENTINEL"] = "changed-on-error"
+                raise RuntimeError("boom")
+            self.assertEqual(os.environ["GIT_CEILING_DIRECTORIES"], "/sentinel/ceiling")
+            self.assertEqual(os.environ["GOLUSORIS_FIXTURE_SENTINEL"], "sentinel-value")
+            self.assertFalse(err_enclosing.exists())
 
 
 if __name__ == "__main__":

@@ -177,6 +177,28 @@ def fixture_environ() -> dict[str, str]:
     return env
 
 
+@contextlib.contextmanager
+def fixture_repository(timeout: int = GIT_TIMEOUT_SECONDS) -> Generator[Path, None, None]:
+    """Create a scratch git repository isolated from hook variables and enclosing checkouts."""
+    saved = os.environ.copy()
+    with tempfile.TemporaryDirectory() as directory:
+        enclosing = Path(directory).resolve()
+        # Git must not walk from the fixture into the enclosing repository.
+        env = {**fixture_environ(), "GIT_CEILING_DIRECTORIES": str(enclosing)}
+        run_git(["init", "-q"], enclosing, timeout, env=env)
+        fixture = enclosing / "fixture"
+        fixture.mkdir()
+        fixture = fixture.resolve()
+        run_git(["init", "-q"], fixture, timeout, env=env)
+        try:
+            os.environ.clear()
+            os.environ.update(env)
+            yield fixture
+        finally:
+            os.environ.clear()
+            os.environ.update(saved)
+
+
 def _linked_decoy(decoy: Path, timeout: int) -> Path:
     """Create a repository with one linked worktree under decoy; return the worktree's git dir."""
     env = fixture_environ()
