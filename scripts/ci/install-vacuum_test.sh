@@ -345,4 +345,26 @@ expect_failure 'invalid VACUUM_VERSION' "$suite_root/key-semver" cache_key || {
 	exit 1
 }
 
+# V8 input record: provenance without digest matches the pinned inputs and fake go env.
+write_pins "$version" "$good_sum"
+VACUUM_CACHE_DIR="$cache_dir" run_installer "$good_sum" "$version" "$suite_root/install-v8" >/dev/null
+printf '%s\n' \
+	'module=github.com/daveshanley/vacuum' \
+	"version=${version}" \
+	"module_sum=${good_sum}" \
+	'go_goversion=go1.27.4' \
+	'go_goos=linux' \
+	'go_goarch=amd64' \
+	'go_goamd64=' \
+	'go_goarm64=' \
+	'go_cgo_enabled=' \
+	'go_goflags=' \
+	'go_goexperiment=' \
+	>"$suite_root/v8-expected.txt"
+sed '$d' "$cache_dir/vacuum.provenance" >"$suite_root/v8-actual.txt"
+if ! diff -u "$suite_root/v8-expected.txt" "$suite_root/v8-actual.txt" >&2; then
+	printf 'V8: input record changed\n' >&2
+	exit 1
+fi
+
 printf 'vacuum installer policy tests passed\n'
