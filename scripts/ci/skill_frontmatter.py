@@ -18,6 +18,9 @@ scalars, single-quoted scalars without inner `'`, or double-quoted scalars witho
 multi-line values and plain scalars that YAML 1.1 or 1.2 resolves as non-strings (null, bool,
 int, float, timestamp, merge, value) are rejected.
 Plain scalars reject `:` + space/tab and space/tab + `#`; column-0 list items need a sequence key.
+Other keys take a single-line plain or escape-free quoted scalar, or one nested level of
+same-indented `key: scalar` or `- scalar` lines; flow collections, block scalars, anchors,
+aliases and tags are rejected.
 
 Symlinks and non-regular index entries are rejected without following or reading them, and files
 over SIZE_MAX_BYTES (128 KiB) fail before reading past the cap. Default (pre-commit) mode reads
@@ -30,6 +33,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -51,11 +55,23 @@ YAML_NON_STRING = re.compile(
     r"|<<|="
 )
 
-_KEY_LINE = re.compile(r"^(name|description):(?:[ \t]+(.*))?$")
-_ANY_KEY_LINE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*:(?:[ \t]|$)")
+_ANY_KEY_LINE = re.compile(r"^([A-Za-z0-9_][A-Za-z0-9_.-]*):(?:[ \t]+(.*))?$")
 _XML_TAG = re.compile(r"<\s*/?\s*[A-Za-z][^<>]*>")
 _PLAIN_FORBIDDEN_START = frozenset("-?:,[]{}#&*!|>%@'\"`")
 _PLAIN_BREAK = re.compile(r":[ \t]|[ \t]#")
+
+
+@dataclass
+class _ScanState:
+    """Per-frontmatter parser state across lines."""
+
+    seen: set[str]
+    duplicates: set[str]
+    values: dict[str, str]
+    in_sequence: bool = False
+    block_mode: str = "disallowed"
+    block_indent: int | None = None
+    block_kind: str | None = None
 
 
 def _parse_quoted(value: str) -> str | None:
@@ -106,13 +122,14 @@ def _is_list_item(line: str) -> bool:
     return line == "-" or line.startswith("- ")
 
 
-def _has_continuation(frontmatter: list[str], start: int) -> bool:
-    """Return whether the next non-blank, non-column-0-comment line is indented or a list item."""
+def _has_continuation(frontmatter: list[str], start: int, *, list_items: bool = True) -> bool:
+    """Return whether the next non-blank, non-comment line continues a scalar value."""
     for index in range(start, len(frontmatter)):
         line = frontmatter[index]
-        if line.strip(" \t") == "" or line.startswith("#"):
+        stripped = line.lstrip(" \t")
+        if stripped == "" or stripped.startswith("#"):
             continue
-        return line.startswith((" ", "\t")) or _is_list_item(line)
+        return line.startswith((" ", "\t")) or (list_items and _is_list_item(line))
     return False
 
 
@@ -122,22 +139,82 @@ def _opens_sequence(line: str) -> bool:
     return stripped == "" or stripped.startswith("#")
 
 
-def _check_line_structure(
-    path: str, line_no: int, line: str, *, in_sequence: bool
-) -> tuple[bool, bool, str | None]:
-    """Validate one frontmatter line's structure and return (is_key, in_sequence, finding)."""
-    if line == "" or line.startswith((" ", "\t", "#")):
-        return False, in_sequence, None
-    if _is_list_item(line):
-        finding = (
-            None
-            if in_sequence
-            else f"{path}: frontmatter line {line_no} is a list item outside a sequence value"
-        )
-        return False, in_sequence, finding
-    if _ANY_KEY_LINE.match(line) is None:
-        return False, False, f"{path}: frontmatter line {line_no} is not a key, comment or list item"
-    return True, _opens_sequence(line), None
+def _is_valid_optional_scalar(raw: str | None) -> bool:
+    """Return whether raw after `:` or `-` is empty, a `#` comment, or a supported scalar."""
+    stripped = "" if raw is None else raw.lstrip(" \t")
+    if stripped == "" or stripped.startswith("#"):
+        return True
+    return _parse_scalar(stripped, indented=False) is not None
+
+
+def _parse_nested_entry(stripped: str) -> tuple[str | None, bool]:
+    """Return (kind, valid) where kind is 'key', 'item', or None."""
+    if _is_list_item(stripped):
+        return "item", _is_valid_optional_scalar(stripped[2:])
+    match = _ANY_KEY_LINE.match(stripped)
+    if match is None:
+        return None, False
+    return "key", _is_valid_optional_scalar(match.group(2))
+
+
+def _nested_block_valid(line: str, stripped: str, state: _ScanState) -> bool:
+    """Update block indent/kind state and return whether stripped is valid in the block."""
+    indent_str = line[: len(line) - len(stripped)]
+    if "\t" in indent_str:
+        return False
+    indent = len(indent_str)
+    if state.block_indent is None:
+        state.block_indent = indent
+    elif indent != state.block_indent:
+        return False
+    kind, valid = _parse_nested_entry(stripped)
+    if kind is None:
+        return False
+    if state.block_kind is None:
+        state.block_kind = kind
+    return valid and kind == state.block_kind
+
+
+def _check_nested_line(path: str, line_no: int, line: str, state: _ScanState) -> str | None:
+    """Validate one non-blank indented line under the active top-level context."""
+    stripped = line.lstrip(" \t")
+    if stripped.startswith("#"):
+        return None
+    if state.block_mode == "ignore":
+        state.in_sequence = False
+        return None
+    if state.block_mode != "open":
+        return f"{path}: frontmatter line {line_no} is an unsupported nested value"
+    state.in_sequence = False
+    if not _nested_block_valid(line, stripped, state):
+        return f"{path}: frontmatter line {line_no} is an unsupported nested value"
+    return None
+
+
+def _check_list_item(path: str, line_no: int, line: str, state: _ScanState) -> str | None:
+    """Validate one column-0 YAML list item against sequence state and scalar syntax."""
+    state.block_mode = "disallowed"
+    if not state.in_sequence:
+        return f"{path}: frontmatter line {line_no} is a list item outside a sequence value"
+    if not _is_valid_optional_scalar(line[2:]):
+        return f"{path}: frontmatter line {line_no} is an unsupported list item"
+    return None
+
+
+def _check_other_key(
+    path: str, key: str, raw: str | None, *, opens_block: bool, continued: bool, state: _ScanState
+) -> str | None:
+    """Validate a top-level key other than name or description and update block state."""
+    state.block_indent = None
+    state.block_kind = None
+    if opens_block:
+        state.block_mode = "open"
+        return None
+    if continued or _parse_scalar(raw, indented=False) is None:
+        state.block_mode = "ignore"
+        return f"{path}: unsupported {key} form"
+    state.block_mode = "disallowed"
+    return None
 
 
 def _record_field(
@@ -206,38 +283,57 @@ def _check_fields(path: str, seen: set[str], values: dict[str, str]) -> list[str
     return findings
 
 
+def _scan_line(path: str, index: int, frontmatter: list[str], state: _ScanState) -> str | None:
+    """Validate one frontmatter line at 0-based index and update state."""
+    line = frontmatter[index]
+    line_no = index + 2
+    if line.strip(" \t") == "" or line.startswith("#"):
+        return None
+    if line.startswith((" ", "\t")):
+        return _check_nested_line(path, line_no, line, state)
+    if _is_list_item(line):
+        return _check_list_item(path, line_no, line, state)
+    match = _ANY_KEY_LINE.match(line)
+    if match is None:
+        state.in_sequence = False
+        state.block_mode = "disallowed"
+        return f"{path}: frontmatter line {line_no} is not a key, comment or list item"
+    key, raw = match.group(1), match.group(2)
+    opens_block = _opens_sequence(line)
+    state.in_sequence = opens_block
+    if key in ("name", "description"):
+        state.block_mode = "ignore"
+        return _record_field(
+            path,
+            key,
+            raw,
+            indented=_has_continuation(frontmatter, index + 1),
+            seen=state.seen,
+            duplicates=state.duplicates,
+            values=state.values,
+        )
+    return _check_other_key(
+        path,
+        key,
+        raw,
+        opens_block=opens_block,
+        continued=_has_continuation(frontmatter, index + 1, list_items=False),
+        state=state,
+    )
+
+
 def problems(path: str, text: str) -> list[str]:
     """Return one message per Agent Skills frontmatter finding in text."""
     frontmatter, errors = _frontmatter_lines(path, text)
     if frontmatter is None:
         return errors
-    seen: set[str] = set()
-    duplicates: set[str] = set()
-    values: dict[str, str] = {}
+    state = _ScanState(seen=set(), duplicates=set(), values={})
     findings: list[str] = []
-    in_sequence = False
-    for index, line in enumerate(frontmatter):
-        is_key, in_sequence, finding = _check_line_structure(
-            path, index + 2, line, in_sequence=in_sequence
-        )
+    for index in range(len(frontmatter)):
+        finding = _scan_line(path, index, frontmatter, state)
         if finding is not None:
             findings.append(finding)
-            continue
-        match = _KEY_LINE.match(line) if is_key else None
-        if match is None:
-            continue
-        field_finding = _record_field(
-            path,
-            match.group(1),
-            match.group(2),
-            indented=_has_continuation(frontmatter, index + 1),
-            seen=seen,
-            duplicates=duplicates,
-            values=values,
-        )
-        if field_finding is not None:
-            findings.append(field_finding)
-    return findings + _check_fields(path, seen, values)
+    return findings + _check_fields(path, state.seen, state.values)
 
 
 def _check_disk_file(root: Path, rel: str) -> list[str]:

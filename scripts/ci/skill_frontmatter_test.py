@@ -535,6 +535,105 @@ class SkillFrontmatterTest(unittest.TestCase):
         )
         self.assertEqual(skill_frontmatter.skill_findings(self.root), [])
 
+    def test_flow_sequence_metadata_fails(self) -> None:
+        """An unclosed flow sequence on metadata fails as an unsupported metadata form."""
+        self.write("alpha/SKILL.md", "---\nname: alpha\ndescription: Valid.\nmetadata: [\n---\n")
+        self.assertEqual(self.check(), ["alpha/SKILL.md: unsupported metadata form"])
+
+    def test_flow_sequence_allowed_tools_fails(self) -> None:
+        """A flow sequence on allowed-tools fails as an unsupported allowed-tools form."""
+        self.write("alpha/SKILL.md", "---\nname: alpha\nallowed-tools: [Read, Bash]\ndescription: Valid.\n---\n")
+        self.assertEqual(self.check(), ["alpha/SKILL.md: unsupported allowed-tools form"])
+
+    def test_block_scalar_other_key_fails_once(self) -> None:
+        """A block scalar on license followed by an indented line produces one finding."""
+        self.write("alpha/SKILL.md", "---\nname: alpha\nlicense: |\n  MIT\ndescription: Valid.\n---\n")
+        self.assertEqual(self.check(), ["alpha/SKILL.md: unsupported license form"])
+
+    def test_continued_plain_other_key_fails_once(self) -> None:
+        """A plain value on license followed by an indented continuation produces one finding."""
+        self.write("alpha/SKILL.md", "---\nname: alpha\nlicense: MIT\n  more\ndescription: Valid.\n---\n")
+        self.assertEqual(self.check(), ["alpha/SKILL.md: unsupported license form"])
+
+    def test_single_quoted_and_plain_other_keys_pass(self) -> None:
+        """Single-quoted and plain scalars on other top-level keys pass."""
+        doc = "---\nname: alpha\nlicense: 'MIT'\ncompatibility: claude-code\ndescription: Valid.\n---\n"
+        self.write("alpha/SKILL.md", doc)
+        self.assertEqual(self.check(), [])
+
+    def test_non_string_scalar_on_other_key_passes(self) -> None:
+        """A non-string plain scalar on a top-level key other than name or description passes."""
+        self.write("alpha/SKILL.md", "---\nname: alpha\nversion: 3.17.0\ndescription: Valid.\n---\n")
+        self.assertEqual(self.check(), [])
+
+    def test_nested_metadata_plain_and_quoted_scalars_pass(self) -> None:
+        """Same-indented plain and double-quoted key-value lines under metadata pass."""
+        doc = (
+            "---\n"
+            "name: alpha\n"
+            "metadata:\n"
+            "  author: olgasafonova\n"
+            '  derived_from: "https://x.y (MIT)"\n'
+            "description: Valid.\n"
+            "---\n"
+        )
+        self.write("alpha/SKILL.md", doc)
+        self.assertEqual(self.check(), [])
+
+    def test_nested_metadata_flow_scalar_fails_with_line_number(self) -> None:
+        """A flow indicator inside a nested metadata value fails naming its 1-based line."""
+        doc = "---\nname: alpha\nmetadata:\n  author: [\ndescription: Valid.\n---\n"
+        self.write("alpha/SKILL.md", doc)
+        self.assertEqual(self.check(), ["alpha/SKILL.md: frontmatter line 4 is an unsupported nested value"])
+
+    def test_nested_metadata_deeper_indentation_fails(self) -> None:
+        """A deeper-indented line inside metadata fails on the deeper line."""
+        doc = "---\nname: alpha\nmetadata:\n  a: x\n    b: y\ndescription: Valid.\n---\n"
+        self.write("alpha/SKILL.md", doc)
+        self.assertEqual(self.check(), ["alpha/SKILL.md: frontmatter line 5 is an unsupported nested value"])
+
+    def test_nested_metadata_tab_indentation_fails(self) -> None:
+        """A tab-indented line inside metadata fails naming its 1-based line."""
+        doc = "---\nname: alpha\nmetadata:\n\tauthor: x\ndescription: Valid.\n---\n"
+        self.write("alpha/SKILL.md", doc)
+        self.assertEqual(self.check(), ["alpha/SKILL.md: frontmatter line 4 is an unsupported nested value"])
+
+    def test_nested_metadata_mixed_mapping_and_list_fails(self) -> None:
+        """Mixing a list item into a nested mapping block fails on the list item line."""
+        doc = "---\nname: alpha\nmetadata:\n  a: x\n  - y\ndescription: Valid.\n---\n"
+        self.write("alpha/SKILL.md", doc)
+        self.assertEqual(self.check(), ["alpha/SKILL.md: frontmatter line 5 is an unsupported nested value"])
+
+    def test_nested_indented_scalar_list_passes(self) -> None:
+        """Same-indented scalar list items under metadata pass."""
+        doc = "---\nname: alpha\nmetadata:\n  - Read\n  - Bash\ndescription: Valid.\n---\n"
+        self.write("alpha/SKILL.md", doc)
+        self.assertEqual(self.check(), [])
+
+    def test_nested_metadata_indented_comment_passes(self) -> None:
+        """An indented comment before nested mapping entries under metadata passes."""
+        doc = "---\nname: alpha\nmetadata:\n  # comment\n  a: x\ndescription: Valid.\n---\n"
+        self.write("alpha/SKILL.md", doc)
+        self.assertEqual(self.check(), [])
+
+    def test_column_zero_flow_list_item_fails_with_line_number(self) -> None:
+        """A column-0 list item with a flow value fails as an unsupported list item."""
+        doc = "---\nname: alpha\nallowed-tools:\n- [\ndescription: Valid.\n---\n"
+        self.write("alpha/SKILL.md", doc)
+        self.assertEqual(self.check(), ["alpha/SKILL.md: frontmatter line 4 is an unsupported list item"])
+
+    def test_indented_line_after_column_zero_list_item_fails(self) -> None:
+        """An indented continuation after a column-0 list item fails on the indented line."""
+        doc = "---\nname: alpha\nallowed-tools:\n- Read\n  more\ndescription: Valid.\n---\n"
+        self.write("alpha/SKILL.md", doc)
+        self.assertEqual(self.check(), ["alpha/SKILL.md: frontmatter line 5 is an unsupported nested value"])
+
+    def test_indented_line_after_opening_fence_fails(self) -> None:
+        """An indented line right after the opening fence fails on line 2."""
+        doc = "---\n  a: x\nname: alpha\ndescription: Valid.\n---\n"
+        self.write("alpha/SKILL.md", doc)
+        self.assertEqual(self.check(), ["alpha/SKILL.md: frontmatter line 2 is an unsupported nested value"])
+
 
 if __name__ == "__main__":
     unittest.main()
