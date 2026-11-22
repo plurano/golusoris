@@ -36,6 +36,8 @@ pre-commit:
       run: sh .config/lefthook/engine.sh compile-context --verify
     context-size:
       run: python3 -B scripts/ci/context_size.py .
+    skill-frontmatter:
+      run: python3 -B scripts/ci/skill_frontmatter.py .
     hiss-audit:
       run: sh .config/lefthook/engine.sh audit
     hiss-coverage:

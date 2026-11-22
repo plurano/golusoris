@@ -23,7 +23,7 @@ We plan to move these into a dedicated skills repo once the collection grows —
 ## Why only MIT / Apache-2.0
 
 - **MIT** permits copying + modification with attribution — satisfied by this README + retaining each upstream repo's SKILL.md front-matter.
-- **Apache-2.0** permits the same plus requires NOTICE retention and stating modifications. These files are vendored **verbatim** (no modifications); the per-skill row above is the attribution notice.
+- **Apache-2.0** permits the same plus requires NOTICE retention and stating modifications. These files are vendored **verbatim** except `vibesec/SKILL.md`, whose frontmatter `name` changed (see Divergence policy); the per-skill row above is the attribution notice.
 - **CC-BY-SA-4.0** (e.g., trailofbits/skills) requires share-alike relicensing, which would impose a license on golusoris that doesn't match the rest of the repo. Skipped.
 - **Anthropics' proprietary license** (anthropics/skills) explicitly forbids "Reproduce or copy these materials" and "Create derivative works". Skipped entirely — use the skills via claude.ai if needed, don't copy them.
 
@@ -35,3 +35,5 @@ We plan to move these into a dedicated skills repo once the collection grows —
 ## Divergence policy
 
 Files here are copies, not submodules. We don't auto-track upstream. When refreshing from upstream, note the commit SHA in the commit message so drift is auditable.
+
+Local changes to reapply after every refresh: `vibesec/SKILL.md` declares `name: vibesec` instead of the upstream name `VibeSec-Skill` (BehiSecc/VibeSec-Skill at `0590993b`), because the Agent Skills specification requires a lowercase name equal to the skill directory; `scripts/ci/skill_frontmatter.py` enforces it.
