@@ -100,7 +100,8 @@ class DocstringCoveragePolicyTest(unittest.TestCase):
         base_ref = base
         if base == "origin/main":
             base_ref = "refs/remotes/origin/main"
-        return policy.check(self.fx.root, base_ref, list(paths))
+        base_sha = policy.merge_base_sha(self.fx.root, base_ref)
+        return policy.check(self.fx.root, base_sha, list(paths))
 
     def start_topic(self) -> None:
         """Record origin/main at the current commit and open the topic branch."""
@@ -134,7 +135,13 @@ class DocstringCoveragePolicyTest(unittest.TestCase):
 
     def test_c1_python_with_docstring(self) -> None:
         """C1: documented complex Python function yields no findings."""
-        text = '"""doc."""\ndef f(a):\n    if a:\n        return 1\n    return 2\n'
+        text = (
+            "def f(a):\n"
+            '    """Return 1 when a is set."""\n'
+            "    if a:\n"
+            "        return 1\n"
+            "    return 2\n"
+        )
         self.start_topic()
         self.fx.write("scripts/ci/x.py", text)
         self.fx.commit("topic")
@@ -182,12 +189,18 @@ class DocstringCoveragePolicyTest(unittest.TestCase):
 
     def test_b4_python_deletion_inside_function(self) -> None:
         """B4: partial deletions inside a surviving function still count as touched."""
-        base = "def f():\n    if True:\n        return 1\n    return 2\n"
+        base = (
+            "def f():\n"
+            "    if True:\n"
+            "        x = 1\n"
+            "        return 1\n"
+            "    return 2\n"
+        )
         self.fx.write("scripts/ci/x.py", base)
         self.fx.commit("base")
         self.fx.mark_origin()
         self.fx.branch()
-        topic = "def f():\n    if True:\n        return 2\n    return 2\n"
+        topic = "def f():\n    if True:\n        return 1\n    return 2\n"
         self.fx.write("scripts/ci/x.py", topic)
         self.fx.commit("topic")
         self.assertEqual(len(self.findings("scripts/ci/x.py")), 1)
@@ -235,15 +248,15 @@ class DocstringCoveragePolicyTest(unittest.TestCase):
     def test_b9_committed_blob_not_worktree(self) -> None:
         """B9: HEAD blob is checked even when the worktree has a new docstring."""
         text = "def f():\n    if True:\n        return 1\n    return 2\n"
+        self.start_topic()
         self.fx.write("scripts/ci/x.py", text)
-        self.fx.commit("base")
-        self.fx.mark_origin()
-        self.fx.branch()
-        self.fx.write("scripts/ci/x.py", text + "# touch\n")
         self.fx.commit("topic")
         worktree = (
-            '"""added."""\n'
-            "def f():\n    if True:\n        return 1\n    return 2\n"
+            "def f():\n"
+            '    """added."""\n'
+            "    if True:\n"
+            "        return 1\n"
+            "    return 2\n"
         )
         self.fx.write("scripts/ci/x.py", worktree)
         self.assertEqual(len(self.findings("scripts/ci/x.py")), 1)
@@ -299,6 +312,60 @@ class DocstringCoveragePolicyTest(unittest.TestCase):
         self.fx.commit("topic")
         self.assertEqual(len(self.findings("scripts/ci/x.sh")), 1)
 
+    def test_b14_shell_dollar_hash_not_comment(self) -> None:
+        """B14: $# inside a test must not be treated as starting a comment."""
+        text = 'f() {\n\t[ "$#" -gt 1 ] && echo a\n}\n'
+        self.start_topic()
+        self.fx.write("scripts/ci/x.sh", text)
+        self.fx.commit("topic")
+        self.assertEqual(len(self.findings("scripts/ci/x.sh")), 1)
+
+    def test_b15_path_overflow_note(self) -> None:
+        """B15: overflow paths beyond MAX_FILES emit a truncation note on stderr."""
+        self.start_topic()
+        self.fx.write("scripts/ci/a.py", "def f():\n    return 1\n")
+        self.fx.write("scripts/ci/b.py", "def g():\n    return 1\n")
+        self.fx.commit("topic")
+        with patch.object(policy, "MAX_FILES", 1):
+            code, _, err = self.run_main(["--pushed", "scripts/ci/a.py", "scripts/ci/b.py"])
+        self.assertEqual(code, 0)
+        self.assertIn("1 paths not checked", err)
+
+    def test_b16_long_hunk_reaches_late_function(self) -> None:
+        """B16: a function past line 16385 of one added hunk still counts as touched."""
+        text = "x = 0\n" * 16_400 + "def f():\n    if True:\n        return 1\n    return 2\n"
+        self.start_topic()
+        self.fx.write("scripts/ci/x.py", text)
+        self.fx.commit("topic")
+        found = self.findings("scripts/ci/x.py")
+        self.assertEqual([item.line for item in found], [16_401])
+
+    def test_b17_hunk_overflow_checks_every_function(self) -> None:
+        """B17: past MAX_HUNKS every function counts as touched, never fewer."""
+        body = "def {0}():\n    if True:\n        return 1\n    return 2\n"
+        base = body.format("f") + "x = 0\n" * 5 + body.format("g")
+        self.fx.write("scripts/ci/x.py", base)
+        self.fx.commit("base")
+        self.fx.mark_origin()
+        self.fx.branch()
+        topic = base.replace("return 1", "return 3")
+        self.fx.write("scripts/ci/x.py", topic)
+        self.fx.commit("topic")
+        with patch.object(policy, "MAX_HUNKS", 1):
+            found = self.findings("scripts/ci/x.py")
+        self.assertEqual(sorted(item.message.split()[1] for item in found), ["f", "g"])
+
+    def test_b18_long_span_late_touch(self) -> None:
+        """B18: a touch past line 16385 of a long function counts as touched."""
+        self.assertTrue(policy.span_touched((1, 20_000), {19_999}))
+        self.assertFalse(policy.span_touched((1, 20_000), {20_001}))
+
+    def test_b19_raw_path_bound_counts_dropped(self) -> None:
+        """B19: raw paths past MAX_RAW_PATHS count as not checked, never silently."""
+        with patch.object(policy, "MAX_RAW_PATHS", 1):
+            kept, overflow = policy.normalize_paths(["scripts/ci/a.py", "scripts/ci/b.py"])
+        self.assertEqual((kept, overflow), (["scripts/ci/a.py"], 1))
+
     def test_n1_python_parse_error(self) -> None:
         """N1: syntax errors surface as parse-error findings."""
         text = "def f(:"
@@ -320,6 +387,26 @@ class DocstringCoveragePolicyTest(unittest.TestCase):
         code, _, err = self.run_main(["--pushed", "scripts/ci/x.py"])
         self.assertEqual(code, 2)
         self.assertIn("origin/main", err)
+
+    def test_n3_file_too_large(self) -> None:
+        """N3: sources above MAX_SOURCE_LINES yield a file-too-large finding."""
+        text = "\n".join(f"x{i} = {i}" for i in range(1, 6))
+        with patch.object(policy, "MAX_SOURCE_LINES", 3):
+            found = policy.check_source("x.py", text)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0].rule, "file-too-large")
+
+    def test_n4_git_diff_failure_after_merge_base(self) -> None:
+        """N4: git failures after merge-base resolution report git diff, not merge base."""
+        self.start_topic()
+        self.fx.write("scripts/ci/x.py", "def f():\n    return 1\n")
+        self.fx.commit("topic")
+        boom = subprocess.CalledProcessError(128, ["diff"], "", "boom")
+        with patch.object(policy, "diff_touched_lines", side_effect=boom):
+            code, _, err = self.run_main(["--pushed", "scripts/ci/x.py"])
+        self.assertEqual(code, 2)
+        self.assertIn("git diff failed", err)
+        self.assertNotIn("merge base", err)
 
     def test_w1_wiring(self) -> None:
         """W1: lefthook and python-tests register docstring coverage."""

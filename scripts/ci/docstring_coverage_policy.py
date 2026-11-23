@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import NamedTuple
 
 MAX_FILES = 2000
+MAX_RAW_PATHS = 200_000
+MAX_SOURCE_LINES = 200_000
 MAX_HUNKS = 5000
 MAX_SHELL_BODY_LINES = 10000
 GIT_TIMEOUT_SECONDS = 60
@@ -43,7 +45,7 @@ def normalize_paths(raw: list[str]) -> tuple[list[str], int]:
     """Keep deduped .py and .sh paths, returning overflow count beyond MAX_FILES."""
     kept: list[str] = []
     seen: set[str] = set()
-    for item in raw[: MAX_FILES + 4096]:
+    for item in raw[:MAX_RAW_PATHS]:
         norm = item.replace("\\", "/")
         if not (norm.endswith(".py") or norm.endswith(".sh")):
             continue
@@ -51,7 +53,7 @@ def normalize_paths(raw: list[str]) -> tuple[list[str], int]:
             continue
         seen.add(norm)
         kept.append(norm)
-    overflow = max(0, len(kept) - MAX_FILES)
+    overflow = max(0, len(kept) - MAX_FILES) + max(0, len(raw) - MAX_RAW_PATHS)
     return kept[:MAX_FILES], overflow
 
 
@@ -82,8 +84,8 @@ def head_blob_text(repo_root: Path, path: str) -> str | None:
         return None
 
 
-def parse_touched_lines(diff_text: str) -> set[int]:
-    """Parse unified diff hunks into a set of touched 1-based line numbers."""
+def parse_touched_lines(diff_text: str) -> set[int] | None:
+    """Parse unified diff hunks into touched 1-based lines; None means every line."""
     touched: set[int] = set()
     hunks = 0
     for line in diff_text.splitlines():
@@ -91,7 +93,7 @@ def parse_touched_lines(diff_text: str) -> set[int]:
             continue
         hunks += 1
         if hunks > MAX_HUNKS:
-            break
+            return None
         match = HUNK_RE.match(line)
         if not match:
             continue
@@ -99,15 +101,15 @@ def parse_touched_lines(diff_text: str) -> set[int]:
         count = int(match.group(2)) if match.group(2) is not None else 1
         if count > 0:
             end_line = start + count - 1
-            for num in range(start, min(end_line, start + 16_384) + 1):
+            for num in range(start, min(end_line, MAX_SOURCE_LINES) + 1):
                 touched.add(num)
         else:
             touched.add(max(start, 1))
     return touched
 
 
-def diff_touched_lines(repo_root: Path, base_sha: str, path: str) -> set[int]:
-    """Return lines touched between base_sha and HEAD for one path."""
+def diff_touched_lines(repo_root: Path, base_sha: str, path: str) -> set[int] | None:
+    """Return lines touched between base_sha and HEAD for one path; None means every line."""
     diff = _run_git_text(
         repo_root,
         ["diff", "-U0", "--no-color", "--no-ext-diff", base_sha, "HEAD", "--", path],
@@ -129,7 +131,7 @@ def function_span(node: ast.AST) -> tuple[int, int]:
 def span_touched(span: tuple[int, int], touched: set[int]) -> bool:
     """Return whether any line in span intersects touched."""
     lo, hi = span
-    end = min(hi, lo + 16_384)
+    end = min(hi, MAX_SOURCE_LINES)
     for line in range(lo, end + 1):
         if line in touched:
             return True
@@ -209,11 +211,11 @@ def _line_indent(line: str) -> int:
 
 
 def _strip_sh_comment_tail(line: str) -> str:
-    """Drop a simple # comment tail from a shell source line."""
-    idx = line.find("#")
-    if idx < 0:
+    """Drop a shell # comment tail only when # starts the line or follows whitespace."""
+    match = re.search(r"(?:^|\s)#", line)
+    if not match:
         return line
-    return line[:idx]
+    return line[: match.start()]
 
 
 def _shell_body_end(lines: list[str], start: int, def_indent: int) -> int:
@@ -261,8 +263,7 @@ def _is_full_line_comment(line: str) -> bool:
 def _shell_function_defs(lines: list[str]) -> list[tuple[int, str, int, int, int]]:
     """Return shell def metadata as (def_line, name, def_idx, body_start, body_end)."""
     defs: list[tuple[int, str, int, int, int]] = []
-    total = min(len(lines), MAX_SHELL_BODY_LINES + 4096)
-    for idx in range(total):
+    for idx in range(len(lines)):
         match = SHELL_DEF_RE.match(lines[idx])
         if not match or (not match.group(1) and not match.group(3)):
             continue
@@ -300,6 +301,15 @@ def check_shell_source(path: str, source: str, touched: set[int]) -> list[Findin
 def check_source(path: str, text: str, touched: set[int] | None = None) -> list[Finding]:
     """Check one in-memory file; default touched set covers every line."""
     lines = text.splitlines()
+    if len(lines) > MAX_SOURCE_LINES:
+        return [
+            Finding(
+                path,
+                1,
+                "file-too-large",
+                f"source has {len(lines)} lines, bound {MAX_SOURCE_LINES}; split it",
+            )
+        ]
     if touched is None:
         touched = set(range(1, min(len(lines), 1_000_000) + 1))
     norm = path.replace("\\", "/")
@@ -316,16 +326,16 @@ def check_path(repo_root: Path, base_sha: str, path: str) -> list[Finding]:
     if blob is None:
         return []
     touched = diff_touched_lines(repo_root, base_sha, path)
-    if not touched:
+    if touched is not None and not touched:
         return []
     return check_source(path, blob, touched)
 
 
-def check(repo_root: Path, base_ref: str, paths: list[str]) -> list[Finding]:
+def check(repo_root: Path, base_sha: str, paths: list[str]) -> list[Finding]:
     """Check pushed paths against merge-base diff using committed HEAD blobs."""
-    base_sha = merge_base_sha(repo_root, base_ref)
+    norm_paths, _overflow = normalize_paths(paths)
     findings: list[Finding] = []
-    for path in paths[:MAX_FILES]:
+    for path in norm_paths:
         findings.extend(check_path(repo_root, base_sha, path))
     findings.sort(key=lambda item: (item.path, item.line))
     return findings
@@ -342,23 +352,38 @@ def policy_repo_root() -> Path:
     return Path(__file__).resolve().parent.parent.parent
 
 
+def parse_args(argv: list[str]) -> tuple[str, list[str]] | None:
+    """Parse --base and --pushed; None means usage error."""
+    if argv and argv[0] not in ("--base", "--pushed"):
+        return None
+    base_ref = "origin/main"
+    rest = argv
+    if rest and rest[0] == "--base":
+        if len(rest) < 2:
+            return None
+        base_ref = rest[1]
+        rest = rest[2:]
+    if not rest or rest[0] != "--pushed":
+        return None
+    return base_ref, rest[1:]
+
+
+def _git_failure_stderr(exc: subprocess.CalledProcessError) -> str:
+    """Format a short stderr tail for a failed git invocation."""
+    cmd = exc.cmd[0] if exc.cmd else "git"
+    stderr = exc.stderr or ""
+    tail = stderr.strip().splitlines()[-1] if stderr.strip() else ""
+    return f"docstring-coverage: git {cmd} failed: {tail}"
+
+
 def main() -> int:
     """Parse argv, resolve merge base, and run docstring coverage checks."""
-    args = sys.argv[1:]
-    if args and args[0] != "--base" and args[0] != "--pushed":
+    parsed = parse_args(sys.argv[1:])
+    if parsed is None:
         usage()
         return 2
-    base_ref = "origin/main"
-    if args and args[0] == "--base":
-        if len(args) < 2:
-            usage()
-            return 2
-        base_ref = args[1]
-        args = args[2:]
-    if not args or args[0] != "--pushed":
-        usage()
-        return 2
-    paths, overflow = normalize_paths(args[1:])
+    base_ref, raw_paths = parsed
+    paths, overflow = normalize_paths(raw_paths)
     if overflow:
         print(
             f"docstring-coverage: path list truncated; {overflow} paths not checked",
@@ -367,13 +392,19 @@ def main() -> int:
     if not paths:
         print("docstring-coverage: no pushed Python or shell files, skipping")
         return 0
+    repo = policy_repo_root()
     try:
-        findings = check(policy_repo_root(), base_ref, paths)
+        base_sha = merge_base_sha(repo, base_ref)
     except subprocess.CalledProcessError:
         print(
             f"docstring-coverage: cannot resolve merge base with {base_ref}; fetch it",
             file=sys.stderr,
         )
+        return 2
+    try:
+        findings = check(repo, base_sha, paths)
+    except subprocess.CalledProcessError as exc:
+        print(_git_failure_stderr(exc), file=sys.stderr)
         return 2
     emit(findings)
     return 1 if findings else 0
