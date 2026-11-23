@@ -385,20 +385,55 @@ class ShellFlakePolicyPushedTest(unittest.TestCase):
         )
         self.assertEqual(findings, [])
 
-    @patch.object(shell_flake_policy, "MAX_SCAN_FILES", 1)
-    @patch.object(shell_flake_policy, "scan_repository", return_value=[])
-    def test_n3_path_bound_falls_back_to_full_scan(self, mock_scan: MagicMock) -> None:
+    @patch.object(shell_flake_policy, "MAX_SCAN_FILES", 2)
+    def test_n3_path_bound_falls_back_to_full_scan(self) -> None:
         """N3: exceeding MAX_SCAN_FILES triggers bounded full-repository scan."""
         self._commit_paths(
             {
                 "scripts/ci/a.sh": "echo ok\n",
-                "scripts/ci/b.sh": "echo ok\n",
+                "scripts/ci/b.sh": "echo x | head -1\n",
             }
         )
-        shell_flake_policy.scan_pushed(
-            self.repo_root, ["scripts/ci/a.sh", "scripts/ci/b.sh"]
+        findings = shell_flake_policy.scan_pushed(
+            self.repo_root,
+            ["scripts/ci/a.sh", "scripts/ci/b.sh", "scripts/ci/gone.sh"],
         )
-        mock_scan.assert_called_once()
+        self.assertTrue(
+            any(
+                f.rule == "early-exit-reader" and f.path == "scripts/ci/b.sh"
+                for f in findings
+            )
+        )
+
+    @patch.object(shell_flake_policy, "MAX_SCAN_FILES", 2)
+    def test_n4_overbound_uncommitted_blocks_full_scan(self) -> None:
+        """N4: over-bound fallback checks worktree divergence before full scan."""
+        self._commit_paths(
+            {
+                "scripts/ci/a.sh": "echo ok\n",
+                "scripts/ci/b.sh": "echo x | head -1\n",
+            }
+        )
+        (self.repo_root / "scripts/ci/b.sh").write_text("echo ok\n", encoding="utf-8")
+        findings = shell_flake_policy.scan_pushed(
+            self.repo_root,
+            ["scripts/ci/a.sh", "scripts/ci/b.sh", "scripts/ci/gone.sh"],
+        )
+        self.assertEqual([f.rule for f in findings], ["uncommitted-change"])
+
+    def test_b4_out_of_scope_dirt_ignored_for_pushed_paths(self) -> None:
+        """B4: uncommitted out-of-scope files do not block in-bound pushed scan."""
+        self._commit_paths(
+            {
+                "scripts/ci/a.sh": "echo ok\n",
+                "internal/x.txt": "x\n",
+            }
+        )
+        (self.repo_root / "internal/x.txt").write_text("dirty\n", encoding="utf-8")
+        findings = shell_flake_policy.scan_pushed(
+            self.repo_root, ["scripts/ci/a.sh"]
+        )
+        self.assertEqual(findings, [])
 
     def test_w1_lefthook_prepush_wiring(self) -> None:
         """W1: lefthook pre-push runs shell_flake_policy.py --pushed on push_files."""

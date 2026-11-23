@@ -396,14 +396,44 @@ def scan_arguments(args: list[str]) -> list[Finding]:
     return findings
 
 
+def select_repository_files(
+    repo_root: Path, praetor: set[str]
+) -> tuple[list[str], list[Finding]]:
+    """Return in-scope tracked paths and any collection findings."""
+    files, findings = collect_repo_files(repo_root)
+    kept = [
+        rel
+        for rel in files
+        if is_in_repo_scope(rel, praetor) or is_in_download_scope(rel, praetor)
+    ]
+    return kept, findings
+
+
+def scan_selected(
+    repo_root: Path, selected: list[str], praetor: set[str]
+) -> list[Finding]:
+    """Scan a bounded list of in-scope relative paths."""
+    findings: list[Finding] = []
+    for rel in selected[:MAX_SCAN_FILES]:
+        dl_ok = is_in_download_scope(rel, praetor)
+        findings.extend(scan_file(rel, dl_ok, repo_root))
+    return findings
+
+
 def scan_repository(repo_root: Path, praetor_files: set[str]) -> list[Finding]:
     """Scan all in-scope repository files."""
-    files, findings = collect_repo_files(repo_root)
-    for rel in files:
-        reader_ok = is_in_repo_scope(rel, praetor_files)
-        dl_ok = is_in_download_scope(rel, praetor_files)
-        if reader_ok or dl_ok:
-            findings.extend(scan_file(rel, dl_ok, repo_root))
+    files, findings = select_repository_files(repo_root, praetor_files)
+    findings.extend(scan_selected(repo_root, files, praetor_files))
+    return findings
+
+
+def scan_full_fallback(repo_root: Path, praetor: set[str]) -> list[Finding]:
+    """Full in-scope scan with worktree divergence check."""
+    files, findings = select_repository_files(repo_root, praetor)
+    divergence = check_pushed_worktree_divergence(repo_root, files)
+    if divergence:
+        return findings + divergence
+    findings.extend(scan_selected(repo_root, files, praetor))
     return findings
 
 
@@ -430,19 +460,19 @@ def check_pushed_worktree_divergence(
     bounded = selected[:MAX_SCAN_FILES]
     if not bounded:
         return []
-    cmd = ["git", "-C", str(repo_root), "diff", "--quiet", "HEAD", "--", *bounded]
     try:
-        res = subprocess.run(  # noqa: S603 - fixed git command without shell. # nosec B603
-            cmd,
+        out = subprocess.check_output(  # noqa: S603 - fixed git command without shell. # nosec B603
+            ["git", "-C", str(repo_root), "diff", "--name-only", "-z", "HEAD"],  # noqa: S607 - git executable on runner PATH. # nosec B607
+            text=True,
             timeout=60,
         )
     except (subprocess.SubprocessError, OSError) as err:
         return [Finding(".", 0, "git-error", str(err))]
-    if res.returncode == 1:
-        msg = "pushed file has uncommitted changes; commit or stash them"
-        return [Finding(".", 0, "uncommitted-change", msg)]
-    if res.returncode != 0:
-        return [Finding(".", 0, "git-error", f"git diff exited {res.returncode}")]
+    dirty = {entry for entry in out.split("\0") if entry}
+    for rel in bounded:
+        if rel in dirty:
+            msg = "pushed file has uncommitted changes; commit or stash them"
+            return [Finding(".", 0, "uncommitted-change", msg)]
     return []
 
 
@@ -454,7 +484,7 @@ def scan_pushed(repo_root: Path, paths: list[str]) -> list[Finding]:
             "scanning all in-scope repository files"
         )
         print(note, file=sys.stderr)
-        return scan_repository(repo_root, get_praetor_files(repo_root))
+        return scan_full_fallback(repo_root, get_praetor_files(repo_root))
     normalized = normalize_pushed_paths(paths)
     praetor = get_praetor_files(repo_root)
     selected = filter_pushed_in_scope(normalized, praetor)
@@ -464,11 +494,7 @@ def scan_pushed(repo_root: Path, paths: list[str]) -> list[Finding]:
     divergence = check_pushed_worktree_divergence(repo_root, selected)
     if divergence:
         return divergence
-    findings: list[Finding] = []
-    for rel in selected[:MAX_SCAN_FILES]:
-        check_dl = is_in_download_scope(rel, praetor)
-        findings.extend(scan_file(rel, check_dl, repo_root))
-    return findings
+    return scan_selected(repo_root, selected, praetor)
 
 
 def main() -> int:
