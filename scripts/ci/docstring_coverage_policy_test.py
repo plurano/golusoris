@@ -116,6 +116,19 @@ class DocstringCoveragePolicyTest(unittest.TestCase):
         self.fx.mark_origin()
         self.fx.branch()
 
+    def branch_fixture(self, rel: str, base: str, topic: str) -> list[policy.Finding]:
+        """Check rel in a fresh fixture whose topic branch turns base into topic."""
+        fx = GitFixture()
+        self.addCleanup(fx.close)
+        fx.write(rel, base)
+        fx.commit("base")
+        fx.mark_origin()
+        fx.branch()
+        fx.write(rel, topic)
+        fx.commit("topic")
+        base_sha = policy.merge_base_sha(fx.root, "refs/remotes/origin/main")
+        return policy.check(fx.root, base_sha, [rel])
+
     def run_main(self, argv: list[str]) -> tuple[int, str, str]:
         """Invoke main() with patched repository root and captured stdio."""
         out = io.StringIO()
@@ -513,6 +526,326 @@ class DocstringCoveragePolicyTest(unittest.TestCase):
             at = policy.check_source("scripts/ci/x.py", "a = 1\rb = 2\rc = 3\n")
         self.assertEqual([item.rule for item in over], ["file-too-large"])
         self.assertEqual(at, [])
+
+    def test_n12_head_blob_read_failure_fails_closed(self) -> None:
+        """N12: git show failure after ls-tree must exit 2, not skip the path."""
+        real = policy._run_git_text
+
+        def boom(repo_root: Path, args: list[str]) -> str:
+            """Fail git show; pass every other git call through."""
+            if args and args[0] == "show":
+                raise subprocess.CalledProcessError(128, ["show"], "", "fatal: bad object")
+            return real(repo_root, args)
+
+        self.start_topic()
+        self.fx.write("scripts/ci/x.py", "def f():\n    return 1\n")
+        self.fx.commit("topic")
+        with patch.object(policy, "_run_git_text", side_effect=boom):
+            code, _, err = self.run_main(["--pushed", "scripts/ci/x.py"])
+        self.assertEqual(code, 2)
+        self.assertIn("git show failed", err)
+
+    def test_b49_non_blob_entry_is_absent(self) -> None:
+        """B49: a scoped path that names a tree at the revision reads as absent."""
+        self.fx.write("scripts/ci/d.sh/inner.txt", "x\n")
+        self.fx.commit("base")
+        self.assertIsNone(policy.blob_text(self.fx.root, "HEAD", "scripts/ci/d.sh"))
+        self.assertEqual(policy.blob_text(self.fx.root, "HEAD", "scripts/ci/d.sh/inner.txt"), "x\n")
+
+    def test_b25_path_absent_at_head_skipped(self) -> None:
+        """B25: deleting a path before push skips it instead of failing open."""
+        self.fx.write(
+            "scripts/ci/x.py",
+            "def f(a):\n    if a:\n        return 1\n    return 2\n",
+        )
+        self.fx.commit("base")
+        self.fx.mark_origin()
+        self.fx.branch()
+        (self.fx.root / "scripts/ci/x.py").unlink()
+        self.fx.commit("topic")
+        self.assertEqual(self.findings("scripts/ci/x.py"), [])
+
+    def test_b26_shell_def_trailing_comment(self) -> None:
+        """B26: brace opener with trailing comment still parses the function body."""
+        text = "f() { # implementation\n  if [ -n \"$1\" ]; then echo a; fi\n}\n"
+        self.start_topic()
+        self.fx.write("scripts/ci/x.sh", text)
+        self.fx.commit("topic")
+        found = self.findings("scripts/ci/x.sh")
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0].line, 1)
+
+    def test_b27_shell_one_line_body(self) -> None:
+        """B27: one-line shell function bodies are checked."""
+        text = "f() { if true; then :; fi; }\n"
+        self.start_topic()
+        self.fx.write("scripts/ci/x.sh", text)
+        self.fx.commit("topic")
+        found = self.findings("scripts/ci/x.sh")
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0].line, 1)
+
+    def test_b28_shell_one_line_simple(self) -> None:
+        """B28: trivial one-line shell functions stay out of scope."""
+        text = "f() { echo a; }\n"
+        self.start_topic()
+        self.fx.write("scripts/ci/x.sh", text)
+        self.fx.commit("topic")
+        self.assertEqual(self.findings("scripts/ci/x.sh"), [])
+
+    def test_b29_shell_one_line_then_function(self) -> None:
+        """B29: only the multi-line neighbor is reported when the prior def is simple."""
+        text = "f() { echo a; }\ng() {\n  if a; then b; fi\n}\n"
+        self.start_topic()
+        self.fx.write("scripts/ci/x.sh", text)
+        self.fx.commit("topic")
+        found = self.findings("scripts/ci/x.sh")
+        self.assertEqual([item.line for item in found], [2])
+
+    def test_b30_shell_subshell_body(self) -> None:
+        """B30: parenthesized subshell bodies count complexity."""
+        text = "f() (\n  if [ -n \"$1\" ]; then echo a; fi\n)\n"
+        self.start_topic()
+        self.fx.write("scripts/ci/x.sh", text)
+        self.fx.commit("topic")
+        found = self.findings("scripts/ci/x.sh")
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0].line, 1)
+
+    def test_b31_shell_keyword_prefixed_name(self) -> None:
+        """B31: function names containing keywords do not inflate complexity."""
+        text = "for-each() { echo a; }\n"
+        self.start_topic()
+        self.fx.write("scripts/ci/x.sh", text)
+        self.fx.commit("topic")
+        self.assertEqual(self.findings("scripts/ci/x.sh"), [])
+
+    def test_b32_deleting_neighbor_keeps_function_clean(self) -> None:
+        """B32: deletion-only hunks on a neighbor do not touch surviving functions."""
+        base = (
+            "def f(a):\n    if a:\n        return 1\n    return 2\n"
+            "def g():\n    return 3\n"
+        )
+        self.fx.write("scripts/ci/x.py", base)
+        self.fx.commit("base")
+        self.fx.mark_origin()
+        self.fx.branch()
+        topic = "def f(a):\n    if a:\n        return 1\n    return 2\n"
+        self.fx.write("scripts/ci/x.py", topic)
+        self.fx.commit("topic")
+        self.assertEqual(self.findings("scripts/ci/x.py"), [])
+
+    def test_b33_tail_deletion_touches_function(self) -> None:
+        """B33: deleting tail lines inside a function reports it."""
+        base = "def f(a):\n    if a:\n        return 1\n    x = 2\n    return x\n"
+        self.fx.write("scripts/ci/x.py", base)
+        self.fx.commit("base")
+        self.fx.mark_origin()
+        self.fx.branch()
+        topic = "def f(a):\n    if a:\n        return 1\n    x = 2\n"
+        self.fx.write("scripts/ci/x.py", topic)
+        self.fx.commit("topic")
+        found = self.findings("scripts/ci/x.py")
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0].line, 1)
+
+    def test_b34_method_deletion_qualname(self) -> None:
+        """B34: deletion hunks attribute to qualified Python method names."""
+        base = (
+            "class C:\n"
+            "    def m(self, a):\n"
+            "        if a:\n"
+            "            x = 1\n"
+            "            return 1\n"
+            "        return 2\n"
+            "    def n(self):\n"
+            "        return 3\n"
+        )
+        cases = (
+            (base.replace("            x = 1\n", ""), 1, "C.m"),
+            (base.replace("    def n(self):\n        return 3\n", ""), 0, ""),
+        )
+        for topic, expect_len, qual in cases:
+            with self.subTest(qual=qual or "none"):
+                found = self.branch_fixture("scripts/ci/x.py", base, topic)
+                self.assertEqual(len(found), expect_len)
+                if qual:
+                    self.assertIn(qual, found[0].message)
+
+    def test_b35_shell_deleting_neighbor(self) -> None:
+        """B35: shell deletion attribution leaves surviving neighbors clean."""
+        cases = (
+            (
+                "f() {\n  if a; then b; fi\n}\ng() {\n  echo y\n}\n",
+                "f() {\n  if a; then b; fi\n}\n",
+                0,
+                0,
+            ),
+            (
+                "f() {\n  if a; then b; fi\n  echo x\n}\n",
+                "f() {\n  if a; then b; fi\n}\n",
+                1,
+                1,
+            ),
+        )
+        for base, topic, expect_len, line in cases:
+            with self.subTest(line=line):
+                found = self.branch_fixture("scripts/ci/x.sh", base, topic)
+                self.assertEqual(len(found), expect_len)
+                if line:
+                    self.assertEqual(found[0].line, line)
+
+    def test_b36_unparseable_base_falls_back(self) -> None:
+        """B36: unparseable base blobs fall back to deletion anchors."""
+        base = "def f(a):\n    if a:\n        return 1\n    return 2\n)\n"
+        self.fx.write("scripts/ci/x.py", base)
+        self.fx.commit("base")
+        self.fx.mark_origin()
+        self.fx.branch()
+        topic = "def f(a):\n    if a:\n        return 1\n    return 2\n"
+        self.fx.write("scripts/ci/x.py", topic)
+        self.fx.commit("topic")
+        found = self.findings("scripts/ci/x.py")
+        self.assertEqual(len(found), 1)
+
+    def test_b37_python_definition_time_expressions(self) -> None:
+        """B37: defaults and annotations do not inflate Python complexity."""
+        text = (
+            "def f(value=a or b):\n    return value\n"
+            "@d(1 if x else 2)\n"
+            "def g():\n    return 1\n"
+            "def h(a: int if X else str) -> None:\n    return None\n"
+        )
+        self.start_topic()
+        self.fx.write("scripts/ci/x.py", text)
+        self.fx.commit("topic")
+        self.assertEqual(self.findings("scripts/ci/x.py"), [])
+
+    def test_b38_shell_body_over_bound(self) -> None:
+        """B38: oversized shell bodies yield analysis-limit, not silent passes."""
+        over = "f() {\n  :\n  :\n  :\n  :\n  if a; then b; fi\n}\n"
+        with patch.object(policy, "MAX_SHELL_BODY_LINES", 3):
+            found = policy.check_source("scripts/ci/x.sh", over)
+        self.assertEqual([item.rule for item in found], ["analysis-limit"])
+
+        at_bound = "f() {\n  :\n  :\n  if a; then b; fi\n}\n"
+        with patch.object(policy, "MAX_SHELL_BODY_LINES", 3):
+            found = policy.check_source("scripts/ci/x.sh", at_bound)
+        self.assertEqual([item.rule for item in found], ["missing-docstring"])
+
+        documented = "# doc\n" + over
+        with patch.object(policy, "MAX_SHELL_BODY_LINES", 3):
+            self.assertEqual(policy.check_source("scripts/ci/x.sh", documented), [])
+
+    def test_b39_shell_quoted_keyword(self) -> None:
+        """B39: quoted shell keywords do not count as decisions."""
+        text = "f() {\n  printf '%s\\n' 'if'\n}\n"
+        self.start_topic()
+        self.fx.write("scripts/ci/x.sh", text)
+        self.fx.commit("topic")
+        self.assertEqual(self.findings("scripts/ci/x.sh"), [])
+
+    def test_b40_shell_quoted_hash_keeps_decision(self) -> None:
+        """B40: decisions after quoted segments still count."""
+        text = "f() {\n  printf '%s\\n' ' # value'; false || true\n}\n"
+        self.start_topic()
+        self.fx.write("scripts/ci/x.sh", text)
+        self.fx.commit("topic")
+        self.assertEqual(len(self.findings("scripts/ci/x.sh")), 1)
+
+    def test_b41_shell_dquote_subst_counts(self) -> None:
+        """B41: command substitutions inside double quotes count decisions."""
+        text = 'f() {\n  x="$(git rev-parse HEAD || true)"\n}\n'
+        self.start_topic()
+        self.fx.write("scripts/ci/x.sh", text)
+        self.fx.commit("topic")
+        self.assertEqual(len(self.findings("scripts/ci/x.sh")), 1)
+
+    def test_b42_shell_heredoc_skipped(self) -> None:
+        """B42: heredoc bodies do not count shell keywords."""
+        for opener in ("<<EOF", "<<'EOF'", "<<-EOF"):
+            with self.subTest(opener=opener):
+                closer = "\tEOF" if opener == "<<-EOF" else "EOF"
+                body = (
+                    "f() {\n"
+                    f"  cat {opener}\n"
+                    "if this\n"
+                    "}\n"
+                    f"{closer}\n"
+                    "}\n"
+                )
+                self.assertEqual(self.branch_fixture("scripts/ci/x.sh", "", body), [])
+
+    def test_b43_shell_multiline_dquote(self) -> None:
+        """B43: multiline double quotes mask embedded keywords."""
+        text = 'f() {\n  echo "a\nif b\n"\n}\n'
+        self.start_topic()
+        self.fx.write("scripts/ci/x.sh", text)
+        self.fx.commit("topic")
+        self.assertEqual(self.findings("scripts/ci/x.sh"), [])
+
+    def test_b44_shell_param_expansion_text(self) -> None:
+        """B44: parameter expansions mask keyword text."""
+        text = 'f() {\n  echo "${v:-if}" ${#v}\n}\n'
+        self.start_topic()
+        self.fx.write("scripts/ci/x.sh", text)
+        self.fx.commit("topic")
+        self.assertEqual(self.findings("scripts/ci/x.sh"), [])
+
+    def test_b45_shell_contexts_close_cleanly(self) -> None:
+        """B45: nested expansions, arithmetic and subshells leave later functions scanned."""
+        tail = "g() {\n  if a; then b; fi\n}\n"
+        openers = (
+            '"$(a)"',
+            '"`a`"',
+            '"${v:-$(a)}"',
+            '$(echo "$(a)")',
+            "$(( 1 << 2 ))",
+            "$( (a) )",
+            "$'a\\'b'",
+        )
+        for opener in openers:
+            with self.subTest(opener=opener):
+                text = f"f() {{\n  x={opener}\n}}\n{tail}"
+                found = policy.check_source("scripts/ci/x.sh", text)
+                self.assertEqual([(item.line, item.rule) for item in found], [(4, "missing-docstring")])
+                self.assertIn("function g", found[0].message)
+        masked = 'f() {\n  x="$( (a) "if" )"\n}\n'
+        self.assertEqual(policy.check_source("scripts/ci/x.sh", masked), [])
+
+    def test_b46_shell_heredoc_in_substitution(self) -> None:
+        """B46: a heredoc opened inside $(...) masks its body and restores code after it."""
+        text = "f() {\n  x=$(cat <<'EOF'\nif this\nEOF\n)\n}\ng() {\n  if a; then b; fi\n}\n"
+        found = policy.check_source("scripts/ci/x.sh", text)
+        self.assertEqual([(item.line, item.rule) for item in found], [(7, "missing-docstring")])
+
+    def test_b47_shell_heredoc_delimiter_exact(self) -> None:
+        """B47: a heredoc line that only resembles the delimiter does not close it."""
+        text = "f() {\n  cat <<EOF\nEOF \nif x\nEOF\n}\n"
+        self.assertEqual(policy.check_source("scripts/ci/x.sh", text), [])
+        closed = "f() {\n  cat <<EOF\nEOF\nif x; then y; fi\n}\n"
+        self.assertEqual(len(policy.check_source("scripts/ci/x.sh", closed)), 1)
+
+    def test_b48_malformed_hunk_header_fails_closed(self) -> None:
+        """B48: an unparseable hunk header treats every line as touched."""
+        self.assertIsNone(policy.parse_diff("@@ -1 +1 @@\n@@ bogus @@\n"))
+        self.assertEqual(policy.parse_touched_lines("@@ -1 +1 @@\n"), {1})
+
+    def test_n13_shell_nesting_overflow(self) -> None:
+        """N13: shell nesting beyond the bound yields analysis-limit."""
+        text = 'f() {\n  echo "$(echo "$(echo x)")"\n}\n'
+        with patch.object(policy, "MAX_SHELL_NESTING", 2):
+            found = policy.check_source("scripts/ci/x.sh", text)
+        self.assertEqual([item.rule for item in found], ["analysis-limit"])
+
+    def test_n14_parse_diff_shapes(self) -> None:
+        """N14: deletion-only hunks populate deleted ranges, not touched lines."""
+        parsed = policy.parse_diff("@@ -5,2 +4,0 @@\n")
+        self.assertEqual(parsed, policy.DiffTouch(set(), [(5, 6)], [4]))
+        self.assertEqual(policy.parse_diff("@@ -1 +1 @@\n").lines, {1})
+        self.assertEqual(policy.parse_touched_lines("@@ -5,2 +4,0 @@\n"), set())
+        start = policy.parse_diff("@@ -1,2 +0,0 @@\n")
+        self.assertEqual(start.anchors, [1])
 
 
 if __name__ == "__main__":
