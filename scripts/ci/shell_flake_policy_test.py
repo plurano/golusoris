@@ -461,6 +461,23 @@ class ShellFlakePolicyPushedTest(unittest.TestCase):
         self.assertEqual([f.rule for f in findings], ["uncommitted-change"])
 
     @patch.object(shell_flake_policy, "MAX_SCAN_FILES", 2)
+    def test_n6_overbound_committed_deletion_skips(self) -> None:
+        """N6: over-bound fallback skips a committed deletion of a pushed path."""
+        self._commit_paths(
+            {
+                "scripts/ci/a.sh": "echo ok\n",
+                "scripts/ci/gone.sh": "echo x | head -1\n",
+            }
+        )
+        self._git("rm", "-q", "scripts/ci/gone.sh")
+        self._commit("remove")
+        findings = shell_flake_policy.scan_pushed(
+            self.repo_root,
+            ["scripts/ci/a.sh", "scripts/ci/b.sh", "scripts/ci/gone.sh"],
+        )
+        self.assertEqual(findings, [])
+
+    @patch.object(shell_flake_policy, "MAX_SCAN_FILES", 2)
     def test_b6_overbound_candidate_union_bound(self) -> None:
         """B6: union of index and HEAD divergence candidates enforces scan limit."""
         self._commit_paths(
