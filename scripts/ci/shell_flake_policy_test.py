@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import os
 import subprocess  # Fixture git commands and SubprocessError in mocked git failures. # nosec B404
 import sys
@@ -16,6 +17,17 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import shell_flake_policy
+
+PLANTED_EXCLUSION = json.dumps(
+    {
+        "packageRules": [
+            {
+                "description": "praetor-managed files",
+                "matchFileNames": ["scripts/ci/planted.sh"],
+            }
+        ]
+    }
+)
 
 
 class ShellFlakePolicyTest(unittest.TestCase):
@@ -194,7 +206,7 @@ class ShellFlakePolicyTest(unittest.TestCase):
     @patch("subprocess.check_output")
     def test_scan_limit_tracked_files_exceeded(self, mock_ls: MagicMock) -> None:
         """Verify exceeding MAX_SCAN_FILES triggers scan-limit finding."""
-        mock_ls.return_value = "file1\nfile2\nfile3\n"
+        mock_ls.return_value = "file1\0file2\0file3\0"
         findings = shell_flake_policy.scan_repository(self.temp_root, set())
         self.assert_has_rule(findings, "scan-limit")
 
@@ -274,7 +286,7 @@ class ShellFlakePolicyTest(unittest.TestCase):
     ) -> None:
         """Verify scan_repository resolves relative paths against repo_root."""
         self.write_fixture("scripts/ci/root_probe.sh", "echo hello | head -1\n")
-        mock_ls.return_value = "scripts/ci/root_probe.sh\n"
+        mock_ls.return_value = "scripts/ci/root_probe.sh\0"
         findings = shell_flake_policy.scan_repository(self.temp_root, set())
         self.assert_has_rule(findings, "early-exit-reader")
         self.assertEqual(findings[0].path, "scripts/ci/root_probe.sh")
@@ -497,6 +509,96 @@ class ShellFlakePolicyPushedTest(unittest.TestCase):
         self.assertTrue(
             any(
                 f.rule == "scan-limit" and "divergence candidate count" in f.message
+                for f in findings
+            )
+        )
+
+    @patch.object(shell_flake_policy, "MAX_SCAN_FILES", 2)
+    def test_b7_overbound_non_ascii_path_scanned(self) -> None:
+        """B7: over-bound fallback scans non-ASCII paths when core.quotePath quotes listings."""
+        self._git("config", "core.quotePath", "true")
+        self._commit_paths(
+            {
+                "scripts/ci/a.sh": "echo ok\n",
+                "scripts/ci/café.sh": "echo x | head -1\n",
+            }
+        )
+        findings = shell_flake_policy.scan_pushed(
+            self.repo_root,
+            ["scripts/ci/a.sh", "scripts/ci/café.sh", "scripts/ci/gone.sh"],
+        )
+        self.assertTrue(
+            any(
+                f.rule == "early-exit-reader" and f.path == "scripts/ci/café.sh"
+                for f in findings
+            )
+        )
+
+    @patch.object(shell_flake_policy, "MAX_SCAN_FILES", 2)
+    def test_n7_overbound_non_ascii_uncommitted_blocks_scan(self) -> None:
+        """N7: over-bound fallback detects divergence on non-ASCII pushed paths."""
+        self._git("config", "core.quotePath", "true")
+        self._commit_paths(
+            {
+                "scripts/ci/a.sh": "echo ok\n",
+                "scripts/ci/café.sh": "echo ok\n",
+            }
+        )
+        (self.repo_root / "scripts/ci/café.sh").write_text(
+            "echo x | head -1\n", encoding="utf-8"
+        )
+        findings = shell_flake_policy.scan_pushed(
+            self.repo_root,
+            ["scripts/ci/a.sh", "scripts/ci/café.sh", "scripts/ci/gone.sh"],
+        )
+        self.assertEqual([f.rule for f in findings], ["uncommitted-change"])
+
+    def test_n8_pushed_ignores_uncommitted_exclusion(self) -> None:
+        """N8: pushed scan ignores uncommitted renovate.json exclusions."""
+        self._commit_paths(
+            {
+                "renovate.json": '{"packageRules": []}\n',
+                "scripts/ci/planted.sh": "echo x | head -1\n",
+            }
+        )
+        (self.repo_root / "renovate.json").write_text(
+            PLANTED_EXCLUSION, encoding="utf-8"
+        )
+        findings = shell_flake_policy.scan_pushed(
+            self.repo_root, ["scripts/ci/planted.sh"]
+        )
+        self.assertTrue(any(f.rule == "early-exit-reader" for f in findings))
+
+    def test_b8_pushed_honours_committed_exclusion(self) -> None:
+        """B8: pushed scan honours committed renovate.json exclusions."""
+        self._commit_paths(
+            {
+                "renovate.json": PLANTED_EXCLUSION + "\n",
+                "scripts/ci/planted.sh": "echo x | head -1\n",
+            }
+        )
+        findings = shell_flake_policy.scan_pushed(
+            self.repo_root, ["scripts/ci/planted.sh"]
+        )
+        self.assertEqual(findings, [])
+
+    @patch.object(shell_flake_policy, "MAX_SCAN_FILES", 2)
+    def test_n9_overbound_ignores_uncommitted_exclusion(self) -> None:
+        """N9: over-bound fallback ignores uncommitted renovate.json exclusions."""
+        self._commit_paths(
+            {
+                "renovate.json": '{"packageRules": []}\n',
+                "scripts/ci/planted.sh": "echo x | head -1\n",
+            }
+        )
+        (self.repo_root / "renovate.json").write_text(PLANTED_EXCLUSION, encoding="utf-8")
+        findings = shell_flake_policy.scan_pushed(
+            self.repo_root,
+            ["renovate.json", "scripts/ci/planted.sh", "scripts/ci/gone.sh"],
+        )
+        self.assertTrue(
+            any(
+                f.rule == "early-exit-reader" and f.path == "scripts/ci/planted.sh"
                 for f in findings
             )
         )

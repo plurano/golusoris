@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import re
-import subprocess  # Runs only the fixed git ls-files command below. # nosec B404
+import subprocess  # Runs only fixed git commands without a shell. # nosec B404
 import sys
 from fnmatch import fnmatch
 from pathlib import Path
@@ -48,14 +48,11 @@ class Finding(NamedTuple):
     message: str
 
 
-def get_praetor_files(repo_root: Path) -> set[str]:
-    """Read praetor-managed files from renovate.json packageRules."""
-    renovate_path = repo_root / "renovate.json"
-    if not renovate_path.is_file():
-        return set()
+def parse_praetor_files(text: str) -> set[str]:
+    """Extract praetor-managed paths from renovate.json packageRules JSON."""
     try:
-        data = json.loads(renovate_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
+        data = json.loads(text)
+    except json.JSONDecodeError:
         return set()
     praetor_paths: set[str] = set()
     for rule in data.get("packageRules", [])[:64]:
@@ -63,6 +60,34 @@ def get_praetor_files(repo_root: Path) -> set[str]:
             for name in rule.get("matchFileNames", [])[:256]:
                 praetor_paths.add(str(name))
     return praetor_paths
+
+
+def get_praetor_files(repo_root: Path) -> set[str]:
+    """Read praetor-managed files from worktree renovate.json packageRules."""
+    renovate_path = repo_root / "renovate.json"
+    if not renovate_path.is_file():
+        return set()
+    try:
+        text = renovate_path.read_text(encoding="utf-8")
+    except OSError:
+        return set()
+    return parse_praetor_files(text)
+
+
+def get_committed_praetor_files(repo_root: Path) -> set[str]:
+    """Read praetor-managed files from HEAD renovate.json packageRules."""
+    try:
+        out = subprocess.check_output(  # noqa: S603 - fixed git command without shell. # nosec B603
+            ["git", "-C", str(repo_root), "show", "HEAD:renovate.json"],  # noqa: S607 - git executable on runner PATH. # nosec B607
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stderr=subprocess.DEVNULL,
+            timeout=60,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return set()
+    return parse_praetor_files(out)
 
 
 def is_in_repo_scope(path_str: str, praetor_files: set[str]) -> bool:
@@ -362,13 +387,15 @@ def collect_git_files(repo_root: Path, argv: list[str]) -> tuple[list[str], list
     """Run a fixed git file-listing command and return paths with scan-limit findings."""
     try:
         res = subprocess.check_output(  # noqa: S603 - fixed git command without shell. # nosec B603
-            ["git", "-C", str(repo_root), *argv],  # noqa: S607 - git executable on runner PATH. # nosec B607
+            ["git", "-C", str(repo_root), argv[0], "-z", *argv[1:]],  # noqa: S607 - git executable on runner PATH. # nosec B607
             text=True,
+            encoding="utf-8",
+            errors="surrogateescape",
             timeout=60,
         )
     except (subprocess.SubprocessError, OSError) as err:
         return [], [Finding(".", 0, "scan-limit", f"git {argv[0]} failed: {err}")]
-    all_files = res.splitlines()
+    all_files = [entry for entry in res.split("\0") if entry]
     findings: list[Finding] = []
     if len(all_files) > MAX_SCAN_FILES:
         findings.append(
@@ -512,9 +539,9 @@ def scan_pushed(repo_root: Path, paths: list[str]) -> list[Finding]:
             "scanning all in-scope repository files"
         )
         print(note, file=sys.stderr)
-        return scan_full_fallback(repo_root, get_praetor_files(repo_root))
+        return scan_full_fallback(repo_root, get_committed_praetor_files(repo_root))
     normalized = normalize_pushed_paths(paths)
-    praetor = get_praetor_files(repo_root)
+    praetor = get_committed_praetor_files(repo_root)
     selected = filter_pushed_in_scope(normalized, praetor)
     if not selected:
         print("shell-flake-policy: no pushed in-scope files, skipping", file=sys.stderr)
