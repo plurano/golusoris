@@ -556,6 +556,14 @@
       "automerge": false
     },
     {
+      "description": "Update the yq policy tool and backup-restore image together.",
+      "matchPackageNames": [
+        "github.com/mikefarah/yq/v4",
+        "mikefarah/yq"
+      ],
+      "groupName": "yq"
+    },
+    {
       "description": "Review media image and APK updates as one ABI-tested set.",
       "matchFileNames": [
         "tools/Dockerfile.media.template"

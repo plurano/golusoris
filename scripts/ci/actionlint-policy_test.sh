@@ -46,9 +46,19 @@ check_rebuild_trigger_contract() {
 	fi
 }
 
+check_yq() {
+	local bin="$1" version
+	if [[ ! -x "$bin" ]] || ! version="$("$bin" --version)" ||
+		[[ "$version" != "yq (https://github.com/mikefarah/yq/) version $YQ_VERSION" ]]; then
+		printf 'pinned yq %s is required (got %s); run make tools-bootstrap\n' \
+			"$YQ_VERSION" "${version:-unavailable}" >&2
+		return 1
+	fi
+}
+
 check_scorecard_policy_contract() {
 	local workflow="$1" ruleset="$2"
-	yq -o=json '.' "$workflow" >"$suite_root/scorecard-analysis.json" || return
+	"$yq_bin" -o=json '.' "$workflow" >"$suite_root/scorecard-analysis.json" || return
 	python3 - "$suite_root/scorecard-analysis.json" "$ruleset" <<'PY'
 import json
 import pathlib
@@ -133,7 +143,7 @@ PY
 reject_publish_change() {
 	local mutation="$1" diagnostic="$2"
 	local fixture="$suite_root/scorecard-publish-mutated.json"
-	yq -o=json "$mutation" "$publish_workflow" >"$fixture" || return
+	"$yq_bin" -o=json "$mutation" "$publish_workflow" >"$fixture" || return
 	expect_failure_matching "$diagnostic" check_scorecard_publish_contract "$fixture" || {
 		printf 'Scorecard mutation: %s\n' "$mutation" >&2
 		return 1
@@ -142,10 +152,10 @@ reject_publish_change() {
 
 test_scorecard_publish_contract() {
 	local publish_workflow="$repo_root/.github/workflows/scorecard-publish.yml"
-	yq -o=json '.' "$publish_workflow" >"$suite_root/scorecard-publish.json"
+	"$yq_bin" -o=json '.' "$publish_workflow" >"$suite_root/scorecard-publish.json"
 	check_scorecard_publish_contract "$suite_root/scorecard-publish.json"
 	local failed=0 key draft_step
-	draft_step="$(yq -o=json -I=0 '.jobs.analysis.steps[0]' "$repo_root/.github/workflows/scorecard.yml")"
+	draft_step="$("$yq_bin" -o=json -I=0 '.jobs.analysis.steps[0]' "$repo_root/.github/workflows/scorecard.yml")"
 	reject_publish_change ".jobs[].steps += [$draft_step]" 'unallowed action' || failed=1
 	reject_publish_change '.jobs[].steps += [{"run": "echo notice"}]' 'steps must use actions' || failed=1
 	reject_publish_change 'del(.jobs[].steps[] | select(.uses | test("^actions/upload-artifact@")))' 'required actions' || failed=1
@@ -542,6 +552,22 @@ if [[ "${1:-}" == --ryuk-only ]]; then
 	exit 0
 fi
 
+# shellcheck source=tools/tool-versions.env
+. "$repo_root/tools/tool-versions.env"
+# shellcheck source=scripts/ci/lib/lint-tools.sh
+. "$repo_root/scripts/ci/lib/lint-tools.sh"
+yq_bin="$(locate_tool "${YQ_BIN:-}" yq)"
+readonly yq_bin
+check_yq "$yq_bin"
+
+cat >"$suite_root/yq-wrong" <<'EOF'
+#!/usr/bin/env bash
+printf 'yq (https://github.com/mikefarah/yq/) version v0.0.0\n'
+EOF
+chmod +x "$suite_root/yq-wrong"
+expect_failure_matching 'run make tools-bootstrap' check_yq "$suite_root/yq-wrong"
+expect_failure_matching 'run make tools-bootstrap' check_yq "$suite_root/yq-missing"
+
 clean_root="$(new_repo clean)"
 write_clean_workflow "$clean_root/.github/workflows/clean.yml"
 write_clean_workflow "$clean_root/.gitea/workflows/clean.yml"
@@ -640,13 +666,13 @@ expect_failure_matching 'required context contains runner label' \
 	check_required_contexts_label_free "$required_label_negative"
 
 scorecard_pr_negative="$suite_root/scorecard-no-pr.yml"
-yq 'del(.on.pull_request)' "$repo_root/.github/workflows/scorecard.yml" >"$scorecard_pr_negative"
+"$yq_bin" 'del(.on.pull_request)' "$repo_root/.github/workflows/scorecard.yml" >"$scorecard_pr_negative"
 expect_failure_matching 'scorecard workflow lacks pull_request main trigger' \
 	check_scorecard_policy_contract "$scorecard_pr_negative" \
 	"$repo_root/.github/rulesets/main.json"
 
 scorecard_push_negative="$suite_root/scorecard-analysis-push.yml"
-yq '.on.push = {"branches": ["main"]}' "$repo_root/.github/workflows/scorecard.yml" >"$scorecard_push_negative"
+"$yq_bin" '.on.push = {"branches": ["main"]}' "$repo_root/.github/workflows/scorecard.yml" >"$scorecard_push_negative"
 expect_failure_matching 'scorecard analysis triggers changed' \
 	check_scorecard_policy_contract "$scorecard_push_negative" "$repo_root/.github/rulesets/main.json"
 
