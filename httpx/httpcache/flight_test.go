@@ -346,7 +346,10 @@ func TestCacheCanceledLeaderReleasesStreamingSlot(t *testing.T) {
 		synctest.Wait()
 		cancel()
 		synctest.Wait()
-		require.Empty(t, done)
+		if len(done) != 0 {
+			close(gate)
+			t.Fatal("canceled leader returned before its transport call ended")
+		}
 		close(gate)
 		require.ErrorIs(t, <-done, context.Canceled)
 		synctest.Wait()

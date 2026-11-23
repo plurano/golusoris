@@ -48,6 +48,7 @@ func TestFlightsKeptWhileCanceledStarterJoins(t *testing.T) {
 		synctest.Wait()
 		select {
 		case <-done:
+			close(gate)
 			t.Fatal("canceled starter returned before callback finished")
 		default:
 		}

@@ -143,19 +143,17 @@ func (g *Group[K, V]) leave(self *invocation) bool {
 // begin admits a flight callback or rejects a caller that left before the callback started.
 func (g *Group[K, V]) begin(ctx context.Context, key K, flight *keyedFlight, self *invocation) error {
 	g.mu.Lock()
+	defer g.mu.Unlock()
 	if self != nil && self.left {
-		g.mu.Unlock()
 		return fmt.Errorf("singleflight: call: %w", ctx.Err())
 	}
 	if g.flights[key] != flight && flight.users == 0 {
-		g.mu.Unlock()
 		return fmt.Errorf("singleflight: call: %w", context.Canceled)
 	}
 	if self != nil {
 		self.running = true
 	}
 	flight.running = true
-	g.mu.Unlock()
 	return nil
 }
 

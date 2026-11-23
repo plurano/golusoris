@@ -489,6 +489,7 @@ func TestDoCancelableCancelJoinsCallback(t *testing.T) {
 		synctest.Wait()
 		select {
 		case <-done:
+			close(release)
 			t.Fatal("returned before callback finished")
 		default:
 		}
@@ -523,6 +524,7 @@ func TestDoCancelableCanceledStarterJoinsFlight(t *testing.T) {
 		synctest.Wait()
 		select {
 		case <-first:
+			close(gate)
 			t.Fatal("canceled starter returned before callback finished")
 		default:
 		}
