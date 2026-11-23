@@ -95,6 +95,7 @@ check_scorecard_publish_contract() {
 	python3 - "$1" <<'PY'
 import json
 import pathlib
+import re
 import sys
 
 workflow = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
@@ -127,8 +128,10 @@ for step in job["steps"]:
     if "run" in step or "uses" not in step:
         raise SystemExit("scorecard publish steps must use actions")
     action, _, ref = step["uses"].partition("@")
-    if action not in allowed or not ref:
+    if action not in allowed:
         raise SystemExit(f"scorecard publish job has unallowed action: {step['uses']}")
+    if not re.fullmatch(r"[0-9a-f]{40}", ref):
+        raise SystemExit(f"scorecard publish job must pin {action} to a full commit SHA: {step['uses']}")
     actions.append(action)
     inputs = step.get("with", {})
     if action == "ossf/scorecard-action" and inputs.get("publish_results") is not True:
@@ -154,9 +157,13 @@ test_scorecard_publish_contract() {
 	local publish_workflow="$repo_root/.github/workflows/scorecard-publish.yml"
 	"$yq_bin" -o=json '.' "$publish_workflow" >"$suite_root/scorecard-publish.json"
 	check_scorecard_publish_contract "$suite_root/scorecard-publish.json"
-	local failed=0 key draft_step
+	local failed=0 key draft_step ref
 	draft_step="$("$yq_bin" -o=json -I=0 '.jobs.analysis.steps[0]' "$repo_root/.github/workflows/scorecard.yml")"
 	reject_publish_change ".jobs[].steps += [$draft_step]" 'unallowed action' || failed=1
+	for ref in v7 3d3c42e5aac5ba805825da76410c181273ba90b 3D3C42E5AAC5BA805825DA76410C181273BA90B1 ''; do
+		reject_publish_change "(.jobs[].steps[] | select(.uses | test(\"^actions/checkout@\"))).uses = \"actions/checkout@$ref\"" \
+			'must pin actions/checkout to a full commit SHA' || failed=1
+	done
 	reject_publish_change '.jobs[].steps += [{"run": "echo notice"}]' 'steps must use actions' || failed=1
 	reject_publish_change 'del(.jobs[].steps[] | select(.uses | test("^actions/upload-artifact@")))' 'required actions' || failed=1
 	reject_publish_change '(.jobs[].steps[] | select(.with | has("persist-credentials"))).with.persist-credentials = true' 'checkout must disable' || failed=1
