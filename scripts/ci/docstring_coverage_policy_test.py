@@ -397,14 +397,14 @@ class DocstringCoveragePolicyTest(unittest.TestCase):
         self.assertEqual(found[0].rule, "parse-error")
 
     def test_n2_missing_base_main(self) -> None:
-        """N2: missing origin/main merge base fails closed with exit code two."""
+        """N2: missing origin/main merge base fails closed with exit code three."""
         self.fx.write("scripts/ci/x.py", "def f():\n    return 1\n")
         self.fx.commit("base")
         self.fx.branch()
         self.fx.write("scripts/ci/x.py", "def f():\n    return 2\n")
         self.fx.commit("topic")
         code, _, err = self.run_main(["--pushed", "scripts/ci/x.py"])
-        self.assertEqual(code, 2)
+        self.assertEqual(code, 3)
         self.assertIn("origin/main", err)
 
     def test_n3_file_too_large(self) -> None:
@@ -423,7 +423,7 @@ class DocstringCoveragePolicyTest(unittest.TestCase):
         boom = subprocess.CalledProcessError(128, ["diff"], "", "boom")
         with patch.object(policy, "diff_touched_lines", side_effect=boom):
             code, _, err = self.run_main(["--pushed", "scripts/ci/x.py"])
-        self.assertEqual(code, 2)
+        self.assertEqual(code, 3)
         self.assertIn("git diff failed", err)
         self.assertNotIn("merge base", err)
 
@@ -542,7 +542,7 @@ class DocstringCoveragePolicyTest(unittest.TestCase):
         self.fx.commit("topic")
         with patch.object(policy, "_run_git_text", side_effect=boom):
             code, _, err = self.run_main(["--pushed", "scripts/ci/x.py"])
-        self.assertEqual(code, 2)
+        self.assertEqual(code, 3)
         self.assertIn("git show failed", err)
 
     def test_b49_non_blob_entry_is_absent(self) -> None:
@@ -983,6 +983,216 @@ class DocstringCoveragePolicyTest(unittest.TestCase):
         self.assertEqual(len(found), 1)
         self.assertEqual(found[0].path, "scripts/ci/x.py")
         self.assertEqual(found[0].line, 10)
+
+    @unittest.skipIf(sys.platform == "win32", "literal pathspec colon names are unix-specific")
+    def test_b55_literal_pathspec_name(self) -> None:
+        """B55: git magic pathspec filenames are read via literal pathspecs."""
+        topic = "x = 1\n\n\ndef f(a):\n    if a:\n        return 1\n    return 2\n"
+        found = self.branch_fixture(":(literal)x.py", "x = 1\n", topic)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0].rule, "missing-docstring")
+        self.assertEqual(found[0].path, ":(literal)x.py")
+        self.assertEqual(found[0].line, 4)
+
+    def test_b56_diff_attribute_text_patch(self) -> None:
+        """B56: -diff attributes still yield textual hunks with --text."""
+        self.fx.write(".gitattributes", "*.py -diff\n")
+        self.fx.write("scripts/ci/x.py", "x = 1\n")
+        self.fx.commit("base")
+        self.fx.mark_origin()
+        self.fx.branch()
+        topic = "x = 1\n\n\ndef f(a):\n    if a:\n        return 1\n    return 2\n"
+        self.fx.write("scripts/ci/x.py", topic)
+        self.fx.commit("topic")
+        base_sha = policy.merge_base_sha(self.fx.root, "refs/remotes/origin/main")
+        found = policy.check(self.fx.root, base_sha, ["scripts/ci/x.py"])
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0].line, 4)
+
+    def test_b57_inter_hunk_context_config(self) -> None:
+        """B57: diff.interHunkContext must not merge separate edits into one hunk."""
+        self.fx._run(["config", "diff.interHunkContext", "10"])
+        base = (
+            "def g():\n"
+            '    """Doc."""\n'
+            "    return 0\n"
+            "\n"
+            "\n"
+            "def f(a):\n"
+            "    if a:\n"
+            "        return 1\n"
+            "    return 2\n"
+            "\n"
+            "\n"
+            "def h():\n"
+            '    """Doc."""\n'
+            "    return 0\n"
+        )
+        topic = (
+            "def g():\n"
+            '    """Doc."""\n'
+            "    return 3\n"
+            "\n"
+            "\n"
+            "def f(a):\n"
+            "    if a:\n"
+            "        return 1\n"
+            "    return 2\n"
+            "\n"
+            "\n"
+            "def h():\n"
+            '    """Doc."""\n'
+            "    return 4\n"
+        )
+        self.fx.write("scripts/ci/x.py", base)
+        self.fx.commit("base")
+        self.fx.mark_origin()
+        self.fx.branch()
+        self.fx.write("scripts/ci/x.py", topic)
+        self.fx.commit("topic")
+        self.assertEqual(self.findings("scripts/ci/x.py"), [])
+
+    def test_b58_here_string_not_heredoc(self) -> None:
+        """B58: <<< here-strings must not start a heredoc scan."""
+        cases = (
+            'f() {\n  grep -q x <<<"$v"\n  if a; then b; fi\n}\n',
+            "f() {\n  cat <<< value\n  if a; then b; fi\n}\n",
+        )
+        for text in cases:
+            with self.subTest(text=text[:20]):
+                found = policy.check_source("scripts/ci/x.sh", text)
+                self.assertEqual([item.rule for item in found], ["missing-docstring"])
+                self.assertEqual(found[0].line, 1)
+
+    def test_b59_heredoc_delimiter_operator(self) -> None:
+        """B59: heredoc delimiters stop at shell operators, not mid-word."""
+        tail = "g() {\n  if a; then b; fi\n}\n"
+        for opener in ("<<EOF;", '<<"EOF";', '<<E"O"F;', "<<\\EOF;", "<<EOF|tr a b"):
+            with self.subTest(opener=opener):
+                text = "g() {\n  cat " + opener + "\ntext\nEOF\n}\n" + tail
+                found = policy.check_source("scripts/ci/x.sh", text)
+                self.assertEqual(len(found), 1)
+                self.assertEqual(found[0].rule, "missing-docstring")
+                self.assertEqual(found[0].line, 6)
+
+    def test_b60_over_bound_span_ends_at_closer(self) -> None:
+        """B60: over-bound bodies end at the real closer, not at the line bound."""
+        text = (
+            "f() {\n"
+            "  :\n"
+            "  :\n"
+            "  :\n"
+            "  :\n"
+            "}\n"
+            "# doc\n"
+            "g() {\n"
+            "  if a; then b; fi\n"
+            "}\n"
+        )
+        with patch.object(policy, "MAX_SHELL_BODY_LINES", 3):
+            self.assertEqual(policy.check_source("scripts/ci/x.sh", text, {9}), [])
+            found = policy.check_source("scripts/ci/x.sh", text, {3})
+        self.assertEqual([item.rule for item in found], ["analysis-limit"])
+        self.assertEqual(found[0].line, 1)
+
+    def test_b61_shell_doc_comment_deletion(self) -> None:
+        """B61: deleting shell doc comments above a def counts as touching the function."""
+        cases = (
+            ("# Explain f\nf() {\n  if a; then b; fi\n}\n", "f() {\n  if a; then b; fi\n}\n", 1),
+            ("# Note\n\nf() {\n  if a; then b; fi\n}\n", "\nf() {\n  if a; then b; fi\n}\n", 0),
+            ("#!/bin/sh\nf() {\n  if a; then b; fi\n}\n", "f() {\n  if a; then b; fi\n}\n", 0),
+        )
+        for base, topic, expect_len in cases:
+            with self.subTest(expect_len=expect_len):
+                found = self.branch_fixture("scripts/ci/x.sh", base, topic)
+                self.assertEqual(len(found), expect_len)
+                if expect_len:
+                    self.assertEqual(found[0].rule, "missing-docstring")
+                    self.assertEqual(found[0].line, 1)
+
+    def test_b62_keyword_arguments_not_decisions(self) -> None:
+        """B62: echoed keywords and subshell decisions are tokenized, not word-bound."""
+        bt = "`"
+        cases = (
+            ("f() {\n  echo if\n  echo for while until elif\n}\n", []),
+            ("f() {\n  x=$(if a; then echo b; fi)\n}\n", ["missing-docstring"]),
+            ("f() {\n  x=" + bt + "if a; then echo b; fi" + bt + "\n}\n", ["missing-docstring"]),
+            ("f() {\n  ! if a; then b; fi\n}\n", ["missing-docstring"]),
+            ("f() {\n  time while a; do b; done\n}\n", ["missing-docstring"]),
+        )
+        for text, rules in cases:
+            with self.subTest(rules=rules):
+                found = policy.check_source("scripts/ci/x.sh", text)
+                self.assertEqual([item.rule for item in found], rules)
+
+    def test_b63_brace_redirect_closer(self) -> None:
+        """B63: a redirect after } still closes the function body on that line."""
+        text = "f() {\n  echo x\n} >out\n# doc\ng() {\n  if a; then b; fi\n}\n"
+        self.assertEqual(policy.check_source("scripts/ci/x.sh", text, {6}), [])
+        self.assertEqual(policy.check_source("scripts/ci/x.sh", text, {2}), [])
+
+    def test_b64_nested_group_same_indent(self) -> None:
+        """B64: an inner brace group must not end the outer function early."""
+        text = "f() {\n  {\n    echo y\n}\n  if a; then b; fi\n}\n"
+        found = policy.check_source("scripts/ci/x.sh", text, {5})
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0].rule, "missing-docstring")
+        self.assertEqual(found[0].line, 1)
+
+    def test_b65_compound_function_bodies(self) -> None:
+        """B65: compound keyword bodies are accepted and bounded like braced bodies."""
+        cases = (
+            ("f() if a; then b; fi\n", ["missing-docstring"], 1),
+            ("f() for x in a b; do\n  if a; then b; fi\ndone\n", ["missing-docstring"], 1),
+            ("f() while a; do b; done\n", ["missing-docstring"], 1),
+            (
+                "f() case $1 in\n  a) b;;\n  c) d;;\nesac\n",
+                ["missing-docstring"],
+                1,
+            ),
+            ("# doc\nf() if a; then b; fi\n", [], 0),
+            ("f() { echo; }\n", [], 0),
+        )
+        for text, rules, line in cases:
+            with self.subTest(line=line):
+                found = policy.check_source("scripts/ci/x.sh", text)
+                self.assertEqual([item.rule for item in found], rules)
+                if line:
+                    self.assertEqual(found[0].line, line)
+        span_text = "f() if a; then\n  b\nfi\n# doc\ng() {\n  if c; then d; fi\n}\n"
+        self.assertEqual(policy.check_source("scripts/ci/x.sh", span_text, {6}), [])
+
+    def test_n15_shell_block_nesting_overflow(self) -> None:
+        """N15: structural block nesting beyond the bound yields analysis-limit."""
+        text = "f() {\n" + "  {\n" * 5 + "  }\n" * 5 + "}\n"
+        with patch.object(policy, "MAX_SHELL_NESTING", 4):
+            found = policy.check_source("scripts/ci/x.sh", text)
+        self.assertEqual([item.rule for item in found], ["analysis-limit"])
+        self.assertEqual(found[0].line, 1)
+
+
+    def test_n16_usage_error_exits_three(self) -> None:
+        """N16: malformed argv is a usage error with exit code three."""
+        for argv in ([], ["--bogus"], ["--base"], ["--base", "origin/main"]):
+            with self.subTest(argv=argv):
+                code, out, _ = self.run_main(argv)
+                self.assertEqual(code, 3)
+                self.assertEqual(out, "")
+
+    def test_b66_case_arm_paren_keeps_body_open(self) -> None:
+        """B66: a case arm paren does not pop the case or the function block."""
+        text = "f() {\n  case $1 in\n    a) b ;;\n  esac\n  if c; then d; fi\n}\n"
+        found = policy.check_source("scripts/ci/x.sh", text, {5})
+        self.assertEqual([item.rule for item in found], ["missing-docstring"])
+        self.assertEqual(found[0].line, 1)
+
+    def test_b67_brace_on_next_line(self) -> None:
+        """B67: a body brace on the line after the header bounds the function."""
+        text = "f()\n{\n  if a; then b; fi\n}\n# doc\ng() {\n  :\n}\n"
+        found = policy.check_source("scripts/ci/x.sh", text, {3})
+        self.assertEqual([item.rule for item in found], ["missing-docstring"])
+        self.assertEqual(found[0].line, 1)
+        self.assertEqual(policy.check_source("scripts/ci/x.sh", text, {7}), [])
 
 
 if __name__ == "__main__":
