@@ -60,6 +60,12 @@ class GitFixture:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding="utf-8")
 
+    def write_bytes(self, rel: str, data: bytes) -> None:
+        """Write raw bytes for newline fixtures under the repository root."""
+        path = self.root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+
     def commit(self, message: str = "commit") -> None:
         """Stage all changes and create one signed-off commit."""
         self._run(["add", "-A"])
@@ -428,6 +434,85 @@ class DocstringCoveragePolicyTest(unittest.TestCase):
             path = root / name
             text = path.read_text(encoding="utf-8")
             self.assertEqual(policy.check_source(str(path), text), [])
+
+    def test_b20_python_lone_cr_line_numbers(self) -> None:
+        """B20: lone CR in blob must not hide a touched complex Python function."""
+        data = (
+            b"# a\rb\rc\rd\re\rf\rg\n"
+            b"def f(a):\n"
+            b"    if a:\n"
+            b"        return 1\n"
+            b"    return 2\n"
+        )
+        self.start_topic()
+        self.fx.write_bytes("scripts/ci/x.py", data)
+        self.fx.commit("topic")
+        found = self.findings("scripts/ci/x.py")
+        self.assertEqual([item.line for item in found], [2])
+        self.assertEqual(found[0].rule, "missing-docstring")
+
+    def test_b21_shell_lone_cr_line_numbers(self) -> None:
+        """B21: lone CR in blob must not hide a touched complex shell function."""
+        data = (
+            b"x=a\rb\rc\rd\re\rf\rg\n"
+            b"f() {\n"
+            b'  if [ -n "$1" ]; then echo a; fi\n'
+            b"}\n"
+        )
+        self.start_topic()
+        self.fx.write_bytes("scripts/ci/x.sh", data)
+        self.fx.commit("topic")
+        found = self.findings("scripts/ci/x.sh")
+        self.assertEqual([item.line for item in found], [2])
+
+    def test_b22_python_crlf_line_numbers(self) -> None:
+        """B22: CRLF Python sources still report findings on the correct git line."""
+        data = b"x = 1\r\ndef f(a):\r\n    if a:\r\n        return 1\r\n    return 2\r\n"
+        self.start_topic()
+        self.fx.write_bytes("scripts/ci/x.py", data)
+        self.fx.commit("topic")
+        found = self.findings("scripts/ci/x.py")
+        self.assertEqual([item.line for item in found], [2])
+
+    def test_b23_shell_crlf_line_numbers(self) -> None:
+        """B23: CRLF shell sources still report findings on the correct git line."""
+        data = b"f() {\r\n  if [ -n \"$1\" ]; then echo a; fi\r\n}\r\n"
+        self.start_topic()
+        self.fx.write_bytes("scripts/ci/x.sh", data)
+        self.fx.commit("topic")
+        found = self.findings("scripts/ci/x.sh")
+        self.assertEqual([item.line for item in found], [1])
+
+    def test_n10_diff_content_cr_no_fake_hunk(self) -> None:
+        """N10: CR inside a diff content line must not start a fake hunk header."""
+        touched = policy.parse_touched_lines("@@ -0,0 +1 @@\n+x\r@@ -1 +900 @@\n")
+        self.assertEqual(touched, {1})
+
+    def test_b24_python_lone_cr_untouched_function(self) -> None:
+        """B24: lone CR must not widen spans so an untouched function is reported."""
+        base = (
+            b"# a\rb\n"
+            b"def f(a):\n"
+            b"    if a:\n"
+            b"        return 1\n"
+            b"    return 2\n"
+            b"x = 1\n"
+        )
+        self.fx.write_bytes("scripts/ci/x.py", base)
+        self.fx.commit("base")
+        self.fx.mark_origin()
+        self.fx.branch()
+        self.fx.write_bytes("scripts/ci/x.py", base.replace(b"x = 1\n", b"x = 2\n"))
+        self.fx.commit("topic")
+        self.assertEqual(self.findings("scripts/ci/x.py"), [])
+
+    def test_n11_lone_cr_lines_count_toward_bound(self) -> None:
+        """N11: lone CR lines count toward MAX_SOURCE_LINES; exactly the bound passes."""
+        with patch.object(policy, "MAX_SOURCE_LINES", 3):
+            over = policy.check_source("scripts/ci/x.py", "a = 1\rb = 2\rc = 3\rd = 4\n")
+            at = policy.check_source("scripts/ci/x.py", "a = 1\rb = 2\rc = 3\n")
+        self.assertEqual([item.rule for item in over], ["file-too-large"])
+        self.assertEqual(at, [])
 
 
 if __name__ == "__main__":

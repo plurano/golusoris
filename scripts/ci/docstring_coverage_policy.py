@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import ast
+import itertools
 import re
 import subprocess  # Runs only fixed git invocations below. # nosec B404
 import sys
@@ -24,6 +25,7 @@ SHELL_DEF_RE = re.compile(
     r"^\s*(function\s+)?([A-Za-z_][A-Za-z0-9_:-]*)\s*(\(\s*\))?\s*\{?\s*$"
 )
 SH_WORD_RE = re.compile(r"\b(if|elif|for|while|until)\b")
+PY_NEWLINE_RE = re.compile(r"\r\n|\r|\n")
 
 
 class Finding(NamedTuple):
@@ -62,13 +64,14 @@ def _run_git_text(repo_root: Path, args: list[str]) -> str:
     proc = subprocess.run(  # noqa: S603 - fixed git argv, no shell. # nosec B603
         ["git", "-C", str(repo_root), *args],  # noqa: S607 - git on PATH. # nosec B607
         capture_output=True,
-        text=True,
         timeout=GIT_TIMEOUT_SECONDS,
         check=False,
     )
+    stdout = proc.stdout.decode("utf-8", "replace")
+    stderr = proc.stderr.decode("utf-8", "replace")
     if proc.returncode != 0:
-        raise subprocess.CalledProcessError(proc.returncode, args, proc.stdout, proc.stderr)
-    return proc.stdout
+        raise subprocess.CalledProcessError(proc.returncode, args, stdout, stderr)
+    return stdout
 
 
 def merge_base_sha(repo_root: Path, base_ref: str) -> str:
@@ -88,7 +91,7 @@ def parse_touched_lines(diff_text: str) -> set[int] | None:
     """Parse unified diff hunks into touched 1-based lines; None means every line."""
     touched: set[int] = set()
     hunks = 0
-    for line in diff_text.splitlines():
+    for line in diff_text.split("\n"):
         if not line.startswith("@@"):
             continue
         hunks += 1
@@ -115,6 +118,35 @@ def diff_touched_lines(repo_root: Path, base_sha: str, path: str) -> set[int] | 
         ["diff", "-U0", "--no-color", "--no-ext-diff", base_sha, "HEAD", "--", path],
     )
     return parse_touched_lines(diff)
+
+
+def lf_lines(text: str) -> list[str]:
+    """Split text into git-numbered lines on LF only."""
+    lines = text.split("\n")
+    if text.endswith("\n"):
+        lines = lines[:-1]
+    return [line[:-1] if line.endswith("\r") else line for line in lines]
+
+
+def python_git_lines(source: str) -> list[int]:
+    """Map each Python line number to its git 1-based line number."""
+    mapping: list[int] = [0, 1]
+    git_line = 1
+    for match in itertools.islice(PY_NEWLINE_RE.finditer(source), MAX_SOURCE_LINES):
+        if match.group().endswith("\n"):
+            git_line += 1
+        mapping.append(git_line)
+    return mapping
+
+
+def _python_git_line(line: int, mapping: list[int]) -> int:
+    """Convert one Python line number to a git line number."""
+    return mapping[min(line, len(mapping) - 1)]
+
+
+def _python_git_span(span: tuple[int, int], mapping: list[int]) -> tuple[int, int]:
+    """Convert an inclusive Python line span to git lines; the map never decreases."""
+    return (_python_git_line(span[0], mapping), _python_git_line(span[1], mapping))
 
 
 def function_span(node: ast.AST) -> tuple[int, int]:
@@ -179,15 +211,16 @@ def iter_functions(tree: ast.Module) -> Iterable[ast.FunctionDef | ast.AsyncFunc
 
 def check_python_source(path: str, source: str, touched: set[int]) -> list[Finding]:
     """Analyze Python source text for missing docstrings on touched functions."""
+    line_map = python_git_lines(source)
     try:
         tree = ast.parse(source, filename=path)
     except SyntaxError as err:
-        line = err.lineno or 1
+        line = _python_git_line(err.lineno or 1, line_map)
         msg = err.msg or "syntax error"
         return [Finding(path, line, "parse-error", msg)]
     findings: list[Finding] = []
     for fn in iter_functions(tree):
-        if not span_touched(function_span(fn), touched):
+        if not span_touched(_python_git_span(function_span(fn), line_map), touched):
             continue
         complexity = function_complexity(fn)
         if complexity < 2:
@@ -197,7 +230,7 @@ def check_python_source(path: str, source: str, touched: set[int]) -> list[Findi
         findings.append(
             Finding(
                 path,
-                fn.lineno,
+                _python_git_line(fn.lineno, line_map),
                 "missing-docstring",
                 f"function {fn.name} (complexity {complexity}) touched by this branch has no docstring",
             )
@@ -276,7 +309,7 @@ def _shell_function_defs(lines: list[str]) -> list[tuple[int, str, int, int, int
 
 def check_shell_source(path: str, source: str, touched: set[int]) -> list[Finding]:
     """Analyze shell source text for missing docstrings on touched functions."""
-    lines = source.splitlines()
+    lines = lf_lines(source)
     findings: list[Finding] = []
     for def_line, name, def_idx, body_start, body_end in _shell_function_defs(lines):
         span = (def_line, body_end + 1)
@@ -300,14 +333,16 @@ def check_shell_source(path: str, source: str, touched: set[int]) -> list[Findin
 
 def check_source(path: str, text: str, touched: set[int] | None = None) -> list[Finding]:
     """Check one in-memory file; default touched set covers every line."""
-    lines = text.splitlines()
-    if len(lines) > MAX_SOURCE_LINES:
+    lines = lf_lines(text)
+    lone_cr = text.count("\r") - text.count("\r\n")
+    line_count = len(lines) + lone_cr
+    if line_count > MAX_SOURCE_LINES:
         return [
             Finding(
                 path,
                 1,
                 "file-too-large",
-                f"source has {len(lines)} lines, bound {MAX_SOURCE_LINES}; split it",
+                f"source has {line_count} lines, bound {MAX_SOURCE_LINES}; split it",
             )
         ]
     if touched is None:
