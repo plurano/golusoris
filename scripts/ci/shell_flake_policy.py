@@ -383,19 +383,21 @@ def scan_file(
     return findings
 
 
+def split_nul_paths(raw: bytes) -> list[str]:
+    """Decode NUL-separated git path bytes; text mode would rewrite embedded carriage returns."""
+    return [entry.decode("utf-8", "surrogateescape") for entry in raw.split(b"\0") if entry]
+
+
 def collect_git_files(repo_root: Path, argv: list[str]) -> tuple[list[str], list[Finding]]:
     """Run a fixed git file-listing command and return paths with scan-limit findings."""
     try:
         res = subprocess.check_output(  # noqa: S603 - fixed git command without shell. # nosec B603
             ["git", "-C", str(repo_root), argv[0], "-z", *argv[1:]],  # noqa: S607 - git executable on runner PATH. # nosec B607
-            text=True,
-            encoding="utf-8",
-            errors="surrogateescape",
             timeout=60,
         )
     except (subprocess.SubprocessError, OSError) as err:
         return [], [Finding(".", 0, "scan-limit", f"git {argv[0]} failed: {err}")]
-    all_files = [entry for entry in res.split("\0") if entry]
+    all_files = split_nul_paths(res)
     findings: list[Finding] = []
     if len(all_files) > MAX_SCAN_FILES:
         findings.append(
@@ -518,12 +520,11 @@ def check_pushed_worktree_divergence(
     try:
         out = subprocess.check_output(  # noqa: S603 - fixed git command without shell. # nosec B603
             ["git", "-C", str(repo_root), "diff", "--name-only", "--no-renames", "-z", "HEAD"],  # noqa: S607 - git executable on runner PATH. # nosec B607
-            text=True,
             timeout=60,
         )
     except (subprocess.SubprocessError, OSError) as err:
         return [Finding(".", 0, "git-error", str(err))]
-    dirty = {entry for entry in out.split("\0") if entry}
+    dirty = set(split_nul_paths(out))
     for rel in bounded:
         if rel in dirty:
             msg = "pushed file has uncommitted changes; commit or stash them"

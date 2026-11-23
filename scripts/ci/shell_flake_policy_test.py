@@ -206,7 +206,7 @@ class ShellFlakePolicyTest(unittest.TestCase):
     @patch("subprocess.check_output")
     def test_scan_limit_tracked_files_exceeded(self, mock_ls: MagicMock) -> None:
         """Verify exceeding MAX_SCAN_FILES triggers scan-limit finding."""
-        mock_ls.return_value = "file1\0file2\0file3\0"
+        mock_ls.return_value = b"file1\0file2\0file3\0"
         findings = shell_flake_policy.scan_repository(self.temp_root, set())
         self.assert_has_rule(findings, "scan-limit")
 
@@ -286,7 +286,7 @@ class ShellFlakePolicyTest(unittest.TestCase):
     ) -> None:
         """Verify scan_repository resolves relative paths against repo_root."""
         self.write_fixture("scripts/ci/root_probe.sh", "echo hello | head -1\n")
-        mock_ls.return_value = "scripts/ci/root_probe.sh\0"
+        mock_ls.return_value = b"scripts/ci/root_probe.sh\0"
         findings = shell_flake_policy.scan_repository(self.temp_root, set())
         self.assert_has_rule(findings, "early-exit-reader")
         self.assertEqual(findings[0].path, "scripts/ci/root_probe.sh")
@@ -602,6 +602,34 @@ class ShellFlakePolicyPushedTest(unittest.TestCase):
                 for f in findings
             )
         )
+
+    @unittest.skipIf(sys.platform == "win32", "Windows file names cannot contain a carriage return")
+    @patch.object(shell_flake_policy, "MAX_SCAN_FILES", 2)
+    def test_b9_overbound_carriage_return_path_scanned(self) -> None:
+        """B9: over-bound fallback scans paths whose names contain a carriage return."""
+        cr_path = "scripts/ci/a\rb.sh"
+        self._commit_paths(
+            {
+                "scripts/ci/a.sh": "echo ok\n",
+                cr_path: "echo x | head -1\n",
+            }
+        )
+        findings = shell_flake_policy.scan_pushed(
+            self.repo_root,
+            ["scripts/ci/a.sh", cr_path, "scripts/ci/gone.sh"],
+        )
+        self.assertTrue(
+            any(f.rule == "early-exit-reader" and f.path == cr_path for f in findings)
+        )
+
+    @unittest.skipIf(sys.platform == "win32", "Windows file names cannot contain a carriage return")
+    def test_n10_pushed_carriage_return_uncommitted_blocks_scan(self) -> None:
+        """N10: uncommitted change on a carriage-return path returns uncommitted-change."""
+        cr_path = "scripts/ci/a\rb.sh"
+        self._commit_paths({cr_path: "echo ok\n"})
+        (self.repo_root / cr_path).write_text("echo x | head -1\n", encoding="utf-8")
+        findings = shell_flake_policy.scan_pushed(self.repo_root, [cr_path])
+        self.assertEqual([f.rule for f in findings], ["uncommitted-change"])
 
     def test_w1_lefthook_prepush_wiring(self) -> None:
         """W1: lefthook pre-push runs shell_flake_policy.py --pushed on push_files."""
