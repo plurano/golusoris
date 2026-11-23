@@ -134,6 +134,7 @@ run_tests() {
 		'scripts/ci/context_size_test.py'
 		'scripts/ci/skill_frontmatter_test.py'
 		'scripts/ci/tiny-litert-sidecar-docs-policy_test.py'
+		'scripts/ci/docstring_coverage_policy_test.py'
 	)
 	local test_file bare_before
 	local -A seen=()
