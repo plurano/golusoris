@@ -367,6 +367,7 @@ class ShellFlakePolicyPushedTest(unittest.TestCase):
         self.assertEqual(findings, [])
         mock_scan.assert_not_called()
 
+    @patch.object(shell_flake_policy, "WINDOWS_PATHS", True)
     def test_b3_windows_path_normalized(self) -> None:
         """B3: backslash path separators are normalized before scan."""
         self._commit_paths({"scripts/ci/planted.sh": "echo x | head -1\n"})
@@ -374,6 +375,78 @@ class ShellFlakePolicyPushedTest(unittest.TestCase):
             self.repo_root, [r"scripts\ci\planted.sh"]
         )
         self.assertTrue(any(f.rule == "early-exit-reader" for f in findings))
+
+    @unittest.skipIf(sys.platform == "win32", "Windows file names cannot contain a backslash")
+    def test_b10_posix_backslash_name_kept(self) -> None:
+        """B10: POSIX pushed paths keep literal backslashes in file names."""
+        self._commit_paths({r"scripts/ci/a\b.sh": "echo x | head -1\n"})
+        findings = shell_flake_policy.scan_pushed(
+            self.repo_root, [r"scripts/ci/a\b.sh"]
+        )
+        self.assertTrue(
+            any(
+                f.rule == "early-exit-reader" and f.path == r"scripts/ci/a\b.sh"
+                for f in findings
+            )
+        )
+
+    @patch.object(shell_flake_policy, "MAX_SCAN_FILES", 2)
+    def test_b11_fallback_bound_after_scope_filter(self) -> None:
+        """B11: over-bound push list falls back without scan-limit when one path is in scope."""
+        self._commit_paths(
+            {
+                "docs/a.md": "a\n",
+                "docs/b.md": "b\n",
+                "docs/c.md": "c\n",
+                "scripts/ci/clean.sh": "echo ok\n",
+            }
+        )
+        findings = shell_flake_policy.scan_pushed(
+            self.repo_root,
+            ["docs/a.md", "docs/b.md", "docs/c.md"],
+        )
+        self.assertEqual(findings, [])
+
+    @patch.object(shell_flake_policy, "MAX_SCAN_FILES", 2)
+    def test_b12_fallback_scans_in_scope_file_past_raw_bound(self) -> None:
+        """B12: fallback scope filter reaches an in-scope violation listed past MAX_SCAN_FILES."""
+        self._commit_paths(
+            {
+                "docs/a.md": "a\n",
+                "docs/b.md": "b\n",
+                "docs/c.md": "c\n",
+                "scripts/ci/planted.sh": "echo x | head -1\n",
+            }
+        )
+        findings = shell_flake_policy.scan_pushed(
+            self.repo_root,
+            ["docs/a.md", "docs/b.md", "docs/c.md"],
+        )
+        self.assertTrue(any(f.rule == "early-exit-reader" for f in findings))
+        self.assertFalse(any(f.rule == "scan-limit" for f in findings))
+
+    @patch.object(shell_flake_policy, "MAX_SCAN_FILES", 2)
+    @patch.object(shell_flake_policy, "MAX_LISTED_PATHS", 3)
+    def test_n11_fallback_listing_bound(self) -> None:
+        """N11: raw git listing bound applies before scope filtering in fallback."""
+        self._commit_paths(
+            {
+                "docs/a.md": "a\n",
+                "docs/b.md": "b\n",
+                "docs/c.md": "c\n",
+                "scripts/ci/clean.sh": "echo ok\n",
+            }
+        )
+        findings = shell_flake_policy.scan_pushed(
+            self.repo_root,
+            ["docs/a.md", "docs/b.md", "docs/c.md"],
+        )
+        self.assertTrue(
+            any(
+                f.rule == "scan-limit" and "listing exceeds scan limit" in f.message
+                for f in findings
+            )
+        )
 
     def test_n1_uncommitted_change_blocks_scan(self) -> None:
         """N1: worktree drift against HEAD returns uncommitted-change without scan."""

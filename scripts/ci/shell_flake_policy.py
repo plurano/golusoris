@@ -36,7 +36,10 @@ EXCLUDED_EXACT = {
 
 YAML_BLOCK_SCALAR_RE = re.compile(r"^\s*(?:-\s+)?(?:[a-zA-Z0-9_-]+:\s*)?[|>][-+0-9]*\s*$")
 MAX_SCAN_FILES = 20000
+MAX_LISTED_PATHS = 1_000_000  # Scalar bound on one raw git listing before scope filtering.
 MAX_FILE_LINES = 10000
+# Git and lefthook give "/" paths; only Windows argv may carry "\" separators.
+WINDOWS_PATHS = sys.platform == "win32"
 
 
 class Finding(NamedTuple):
@@ -388,8 +391,8 @@ def split_nul_paths(raw: bytes) -> list[str]:
     return [entry.decode("utf-8", "surrogateescape") for entry in raw.split(b"\0") if entry]
 
 
-def collect_git_files(repo_root: Path, argv: list[str]) -> tuple[list[str], list[Finding]]:
-    """Run a fixed git file-listing command and return paths with scan-limit findings."""
+def list_git_paths(repo_root: Path, argv: list[str]) -> tuple[list[str], list[Finding]]:
+    """List paths from a fixed git file-listing command with a raw listing bound."""
     try:
         res = subprocess.check_output(  # noqa: S603 - fixed git command without shell. # nosec B603
             ["git", "-C", str(repo_root), argv[0], "-z", *argv[1:]],  # noqa: S607 - git executable on runner PATH. # nosec B607
@@ -397,8 +400,23 @@ def collect_git_files(repo_root: Path, argv: list[str]) -> tuple[list[str], list
         )
     except (subprocess.SubprocessError, OSError) as err:
         return [], [Finding(".", 0, "scan-limit", f"git {argv[0]} failed: {err}")]
-    all_files = split_nul_paths(res)
+    paths = split_nul_paths(res)
     findings: list[Finding] = []
+    if len(paths) > MAX_LISTED_PATHS:
+        findings.append(
+            Finding(
+                ".",
+                0,
+                "scan-limit",
+                f"git {argv[0]} listing exceeds scan limit {MAX_LISTED_PATHS}: {len(paths)}",
+            )
+        )
+    return paths[:MAX_LISTED_PATHS], findings
+
+
+def collect_git_files(repo_root: Path, argv: list[str]) -> tuple[list[str], list[Finding]]:
+    """Run a fixed git file-listing command and return paths with scan-limit findings."""
+    all_files, findings = list_git_paths(repo_root, argv)
     if len(all_files) > MAX_SCAN_FILES:
         findings.append(
             Finding(
@@ -465,10 +483,10 @@ def fallback_candidates(
     repo_root: Path, files: list[str], praetor: set[str]
 ) -> tuple[list[str], list[Finding]]:
     """Union index-selected paths with HEAD in-scope paths for divergence checks."""
-    head, findings = collect_git_files(
+    head, findings = list_git_paths(
         repo_root, ["ls-tree", "-r", "--name-only", "HEAD"]
     )
-    in_scope = filter_pushed_in_scope(head, praetor)
+    in_scope = filter_pushed_in_scope(head, praetor, bound=MAX_LISTED_PATHS)
     merged = sorted(set(files) | set(in_scope))
     if len(merged) > MAX_SCAN_FILES:
         findings.append(
@@ -484,7 +502,9 @@ def fallback_candidates(
 
 def scan_full_fallback(repo_root: Path, praetor: set[str]) -> list[Finding]:
     """Full in-scope scan with worktree divergence check."""
-    files, findings = select_repository_files(repo_root, praetor)
+    index_paths, idx_findings = list_git_paths(repo_root, ["ls-files"])
+    files = filter_pushed_in_scope(index_paths, praetor, bound=MAX_LISTED_PATHS)
+    findings: list[Finding] = list(idx_findings)
     candidates, cand_findings = fallback_candidates(repo_root, files, praetor)
     findings.extend(cand_findings)
     divergence = check_pushed_worktree_divergence(repo_root, candidates)
@@ -495,14 +515,20 @@ def scan_full_fallback(repo_root: Path, praetor: set[str]) -> list[Finding]:
 
 
 def normalize_pushed_paths(paths: list[str]) -> list[str]:
-    """Normalize path separators for pushed file arguments."""
-    return [path.replace("\\", "/") for path in paths[:MAX_SCAN_FILES]]
+    """Normalize path separators for pushed file arguments; POSIX keeps literal backslashes."""
+    bounded = paths[:MAX_SCAN_FILES]
+    if not WINDOWS_PATHS:
+        return bounded
+    return [path.replace("\\", "/") for path in bounded]
 
 
-def filter_pushed_in_scope(paths: list[str], praetor: set[str]) -> list[str]:
+def filter_pushed_in_scope(
+    paths: list[str], praetor: set[str], *, bound: int | None = None
+) -> list[str]:
     """Keep pushed paths that fall in reader or download scan scope."""
+    limit = MAX_SCAN_FILES if bound is None else bound
     selected: list[str] = []
-    for rel in paths[:MAX_SCAN_FILES]:
+    for rel in paths[:limit]:
         in_reader = is_in_repo_scope(rel, praetor)
         in_dl = is_in_download_scope(rel, praetor)
         if in_reader or in_dl:
