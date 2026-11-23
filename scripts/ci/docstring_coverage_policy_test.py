@@ -841,11 +841,148 @@ class DocstringCoveragePolicyTest(unittest.TestCase):
     def test_n14_parse_diff_shapes(self) -> None:
         """N14: deletion-only hunks populate deleted ranges, not touched lines."""
         parsed = policy.parse_diff("@@ -5,2 +4,0 @@\n")
-        self.assertEqual(parsed, policy.DiffTouch(set(), [(5, 6)], [4]))
+        self.assertEqual(parsed, policy.DiffTouch(set(), [(5, 6)], [4], [(5, 2, 4, 0)]))
         self.assertEqual(policy.parse_diff("@@ -1 +1 @@\n").lines, {1})
         self.assertEqual(policy.parse_touched_lines("@@ -5,2 +4,0 @@\n"), set())
         start = policy.parse_diff("@@ -1,2 +0,0 @@\n")
         self.assertEqual(start.anchors, [1])
+
+    def test_b50_python_duplicate_name_deletion(self) -> None:
+        """B50: duplicate Python names attribute deletions by owner line, not by name."""
+        base = (
+            "def f(a):\n"
+            "    if a:\n"
+            "        return 1\n"
+            "    return 2\n"
+            "\n"
+            "\n"
+            "def f(b):\n"
+            "    x = 1\n"
+            "    return b\n"
+        )
+        base_y = (
+            "def f(a):\n"
+            "    if a:\n"
+            "        return 1\n"
+            "    y = 2\n"
+            "    return 2\n"
+            "\n"
+            "\n"
+            "def f(b):\n"
+            "    return b\n"
+        )
+        cases = (
+            (base, base.replace("    x = 1\n", ""), 0, 0),
+            (base_y, base_y.replace("    y = 2\n", ""), 1, 1),
+        )
+        for b, topic, expect_len, line in cases:
+            with self.subTest(expect_len=expect_len):
+                found = self.branch_fixture("scripts/ci/x.py", b, topic)
+                self.assertEqual(len(found), expect_len)
+                if line:
+                    self.assertEqual(found[0].line, line)
+
+    def test_b51_shell_duplicate_name_deletion(self) -> None:
+        """B51: duplicate shell names attribute deletions by owner line, not by name."""
+        base = "f() {\n  if a; then b; fi\n}\nf() {\n  echo x\n  echo y\n}\n"
+        cases = (
+            (base, base.replace("  echo y\n", ""), 0, 0),
+            (
+                "f() {\n  if a; then b; fi\n  echo x\n}\nf() {\n  echo y\n}\n",
+                "f() {\n  if a; then b; fi\n}\nf() {\n  echo y\n}\n",
+                1,
+                1,
+            ),
+        )
+        for b, topic, expect_len, line in cases:
+            with self.subTest(line=line):
+                found = self.branch_fixture("scripts/ci/x.sh", b, topic)
+                self.assertEqual(len(found), expect_len)
+                if line:
+                    self.assertEqual(found[0].line, line)
+
+    def test_b52_python_conditional_defs(self) -> None:
+        """B52: Python defs under control flow are scanned and attributed on touch."""
+        body = (
+            "    def f(a):\n"
+            "        if a:\n"
+            "            return 1\n"
+            "        x = 1\n"
+            "        return 2\n"
+        )
+        wrappers = (
+            ("if True:\n", "", 2),
+            ("try:\n", "except OSError:\n    pass\n", 2),
+            ("with ctx:\n", "", 2),
+            ("if False:\n    pass\nelse:\n", "", 4),
+            ("for _ in x:\n", "", 2),
+        )
+        for prefix, suffix, def_line in wrappers:
+            with self.subTest(prefix=prefix[:12]):
+                base = prefix + body + suffix
+                topic = prefix + body.replace("        x = 1\n", "") + suffix
+                found = self.branch_fixture("scripts/ci/x.py", base, topic)
+                self.assertEqual(len(found), 1)
+                self.assertEqual(found[0].rule, "missing-docstring")
+                self.assertEqual(found[0].line, def_line)
+        lone = (
+            "if True:\n"
+            "    def f(a):\n"
+            "        if a:\n"
+            "            return 1\n"
+            "        return 2\n"
+        )
+        rules = [item.rule for item in policy.check_source("scripts/ci/x.py", lone)]
+        self.assertEqual(rules, ["missing-docstring"])
+        neighbor_base = (
+            "if True:\n"
+            "    def f(a):\n"
+            "        if a:\n"
+            "            return 1\n"
+            "        return 2\n"
+            "    def g():\n"
+            "        x = 1\n"
+            "        return 0\n"
+        )
+        neighbor_topic = neighbor_base.replace("        x = 1\n", "")
+        self.assertEqual(self.branch_fixture("scripts/ci/x.py", neighbor_base, neighbor_topic), [])
+
+    def test_b53_shell_over_bound_body_touch(self) -> None:
+        """B53: over-bound shell bodies still see body-line touches and deletions."""
+        with patch.object(policy, "MAX_SHELL_BODY_LINES", 3):
+            base = "f() {\n  :\n  :\n  :\n  :\n  :\n}\n"
+            topic = "f() {\n  :\n  :\n  if a; then b; fi\n  :\n  :\n  :\n}\n"
+            rules = [item.rule for item in self.branch_fixture("scripts/ci/x.sh", base, topic)]
+            self.assertEqual(rules, ["analysis-limit"])
+            base2 = "f() {\n  :\n  :\n  :\n  :\n  if a; then b; fi\n  :\n}\n"
+            topic2 = "f() {\n  :\n  :\n  :\n  :\n  if a; then b; fi\n}\n"
+            rules2 = [item.rule for item in self.branch_fixture("scripts/ci/x.sh", base2, topic2)]
+            self.assertEqual(rules2, ["analysis-limit"])
+            doc = "# doc\n" + base
+            doc_topic = "# doc\n" + topic
+            self.assertEqual(self.branch_fixture("scripts/ci/x.sh", doc, doc_topic), [])
+
+    def test_b54_deletion_owner_line_shifts(self) -> None:
+        """B54: deletion owner lines follow inter-function insertions in the new file."""
+        base = (
+            "def g():\n"
+            "    return 0\n"
+            "\n"
+            "\n"
+            "def f(a):\n"
+            "    if a:\n"
+            "        return 1\n"
+            "    x = 1\n"
+            "    return 2\n"
+        )
+        topic = (
+            'def h():\n    """Doc."""\n    return 0\n\n\n'
+            + base.replace("    return 0", "    return 1", 1).replace("    x = 1\n", "")
+        )
+        found = self.branch_fixture("scripts/ci/x.py", base, topic)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0].path, "scripts/ci/x.py")
+        self.assertEqual(found[0].line, 10)
 
 
 if __name__ == "__main__":

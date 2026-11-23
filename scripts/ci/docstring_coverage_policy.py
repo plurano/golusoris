@@ -46,6 +46,7 @@ class DiffTouch(NamedTuple):
     lines: set[int]
     deleted: list[tuple[int, int]]
     anchors: list[int]
+    hunks: list[tuple[int, int, int, int]]
 
 
 def usage() -> None:
@@ -117,6 +118,7 @@ def parse_diff(diff_text: str) -> DiffTouch | None:
     lines: set[int] = set()
     deleted: list[tuple[int, int]] = []
     anchors: list[int] = []
+    hunks_list: list[tuple[int, int, int, int]] = []
     hunks = 0
     for line in diff_text.split("\n"):
         if not line.startswith("@@"):
@@ -131,6 +133,7 @@ def parse_diff(diff_text: str) -> DiffTouch | None:
         old_count = int(match.group(2)) if match.group(2) is not None else 1
         new_start = int(match.group(3))
         new_count = int(match.group(4)) if match.group(4) is not None else 1
+        hunks_list.append((old_start, old_count, new_start, new_count))
         if new_count > 0:
             end_line = new_start + new_count - 1
             for num in range(new_start, min(end_line, MAX_SOURCE_LINES) + 1):
@@ -139,7 +142,7 @@ def parse_diff(diff_text: str) -> DiffTouch | None:
             old_end = old_start + old_count - 1
             deleted.append((old_start, old_end))
             anchors.append(max(new_start, 1))
-    return DiffTouch(lines, deleted, anchors)
+    return DiffTouch(lines, deleted, anchors, hunks_list)
 
 
 def parse_touched_lines(diff_text: str) -> set[int] | None:
@@ -263,6 +266,8 @@ def iter_named_functions(
                 qual = f"{prefix}.{node.name}" if prefix else node.name
                 yield qual, node
                 stack.append((node, qual))
+            else:
+                stack.append((node, prefix))
 
 
 def _range_intersects(span: tuple[int, int], lo: int, hi: int) -> bool:
@@ -279,24 +284,54 @@ def _ranges_hit_span(span: tuple[int, int], ranges: list[tuple[int, int]]) -> bo
     return False
 
 
-def base_function_names(
-    path: str, base: str, ranges: list[tuple[int, int]]
-) -> frozenset[str] | None:
-    """Return function names deleted by old-side ranges in base at path."""
+def _surviving_new_line(
+    span: tuple[int, int], hunks: list[tuple[int, int, int, int]]
+) -> int | None:
+    """Return new-side line for first base line in span unchanged by hunks, else None."""
+    line = span[0]
+    delta = 0
+    for old_start, old_count, _new_start, new_count in hunks[:MAX_HUNKS]:
+        if old_count == 0:
+            if old_start < line:
+                delta += new_count
+                continue
+            break
+        old_end = old_start + old_count - 1
+        if old_end < line:
+            delta += new_count - old_count
+            continue
+        if old_start <= line:
+            line = old_end + 1
+            delta += new_count - old_count
+            continue
+        break
+    return line + delta if line <= span[1] else None
+
+
+def deleted_owner_lines(
+    path: str,
+    base: str,
+    ranges: list[tuple[int, int]],
+    hunks: list[tuple[int, int, int, int]],
+) -> set[int] | None:
+    """Return new-side owner lines for base functions hit by old-side deletion ranges."""
     if not ranges:
-        return frozenset()
+        return set()
     norm = path.replace("\\", "/")
     if norm.endswith(".py"):
-        return _python_base_function_names(path, base, ranges)
+        return _python_deleted_owner_lines(path, base, ranges, hunks)
     if norm.endswith(".sh"):
-        return _shell_base_function_names(base, ranges)
-    return frozenset()
+        return _shell_deleted_owner_lines(base, ranges, hunks)
+    return set()
 
 
-def _python_base_function_names(
-    path: str, base: str, ranges: list[tuple[int, int]]
-) -> frozenset[str] | None:
-    """Collect qualified Python names whose spans intersect deletion ranges."""
+def _python_deleted_owner_lines(
+    path: str,
+    base: str,
+    ranges: list[tuple[int, int]],
+    hunks: list[tuple[int, int, int, int]],
+) -> set[int] | None:
+    """Collect new-side owner lines for Python functions intersecting deletion ranges."""
     line_map = python_git_lines(base)
     try:
         tree = ast.parse(base, filename=path)
@@ -304,51 +339,63 @@ def _python_base_function_names(
         return None
     if len(lf_lines(base)) > MAX_SOURCE_LINES:
         return None
-    names: set[str] = set()
-    for qual, fn in iter_named_functions(tree):
+    owners: set[int] = set()
+    for _qual, fn in iter_named_functions(tree):
         span = _python_git_span(function_span(fn), line_map)
-        if _ranges_hit_span(span, ranges):
-            names.add(qual)
-    return frozenset(names)
+        if not _ranges_hit_span(span, ranges):
+            continue
+        surv = _surviving_new_line(span, hunks)
+        if surv is not None:
+            owners.add(surv)
+    return owners
 
 
-def _shell_base_function_names(base: str, ranges: list[tuple[int, int]]) -> frozenset[str] | None:
-    """Collect shell function names whose spans intersect deletion ranges."""
+def _shell_function_span(def_line: int, def_idx: int, body_end: int, line_count: int) -> tuple[int, int]:
+    """Return inclusive shell function span; an unbounded body runs to end of file."""
+    if body_end == -1:
+        return (def_line, line_count)
+    return (def_line, max(body_end, def_idx) + 1)
+
+
+def _shell_deleted_owner_lines(
+    base: str,
+    ranges: list[tuple[int, int]],
+    hunks: list[tuple[int, int, int, int]],
+) -> set[int] | None:
+    """Collect new-side owner lines for shell functions intersecting deletion ranges."""
     lines = lf_lines(base)
     if len(lines) > MAX_SOURCE_LINES:
         return None
     code = _shell_code_lines(lines)
     if code is None:
         return None
-    names: set[str] = set()
-    for def_line, name, _idx, _bs, body_end, _tail in _shell_function_defs(lines, code):
-        span = (def_line, body_end + 1)
-        if _ranges_hit_span(span, ranges):
-            names.add(name)
-    return frozenset(names)
+    owners: set[int] = set()
+    for def_line, _name, def_idx, _bs, body_end, _tail in _shell_function_defs(lines, code):
+        span = _shell_function_span(def_line, def_idx, body_end, len(lines))
+        if not _ranges_hit_span(span, ranges):
+            continue
+        surv = _surviving_new_line(span, hunks)
+        if surv is not None:
+            owners.add(surv)
+    return owners
 
 
-def deleted_function_names(
+def deleted_owner_touch(
     repo_root: Path, base_sha: str, path: str, diff: DiffTouch
-) -> tuple[frozenset[str], set[int]]:
-    """Map deletion-only hunks to base function names and anchor fallback lines."""
+) -> set[int]:
+    """Map deletion-only hunks to surviving owner lines or anchor fallback lines."""
     if not diff.deleted:
-        return frozenset(), set()
+        return set()
     base = blob_text(repo_root, base_sha, path)
     if base is None:
-        return frozenset(), set()
-    names = base_function_names(path, base, diff.deleted)
-    if names is None:
-        return frozenset(), set(diff.anchors)
-    return names, set()
+        return set()
+    owners = deleted_owner_lines(path, base, diff.deleted, diff.hunks)
+    if owners is None:
+        return set(diff.anchors)
+    return owners
 
 
-def check_python_source(
-    path: str,
-    source: str,
-    touched: set[int],
-    deleted_names: frozenset[str] = frozenset(),
-) -> list[Finding]:
+def check_python_source(path: str, source: str, touched: set[int]) -> list[Finding]:
     """Analyze Python source text for missing docstrings on touched functions."""
     line_map = python_git_lines(source)
     try:
@@ -360,8 +407,7 @@ def check_python_source(
     findings: list[Finding] = []
     for qual, fn in iter_named_functions(tree):
         span = _python_git_span(function_span(fn), line_map)
-        hit = span_touched(span, touched) or qual in deleted_names
-        if not hit:
+        if not span_touched(span, touched):
             continue
         complexity = function_complexity(fn)
         if complexity < 2:
@@ -681,12 +727,7 @@ def _shell_body_complexity(
     return score
 
 
-def check_shell_source(
-    path: str,
-    source: str,
-    touched: set[int],
-    deleted_names: frozenset[str] = frozenset(),
-) -> list[Finding]:
+def check_shell_source(path: str, source: str, touched: set[int]) -> list[Finding]:
     """Analyze shell source text for missing docstrings on touched functions."""
     lines = lf_lines(source)
     code = _shell_code_lines(lines)
@@ -703,9 +744,8 @@ def check_shell_source(
     for def_line, name, def_idx, body_start, body_end, opener in _shell_function_defs(
         lines, code
     ):
-        span = (def_line, max(body_end, def_idx) + 1)
-        hit = span_touched(span, touched) or name in deleted_names
-        if not hit:
+        span = _shell_function_span(def_line, def_idx, body_end, len(lines))
+        if not span_touched(span, touched):
             continue
         if _shell_has_docstring(lines, def_idx):
             continue
@@ -733,12 +773,7 @@ def check_shell_source(
     return findings
 
 
-def check_source(
-    path: str,
-    text: str,
-    touched: set[int] | None = None,
-    deleted_names: frozenset[str] = frozenset(),
-) -> list[Finding]:
+def check_source(path: str, text: str, touched: set[int] | None = None) -> list[Finding]:
     """Check one in-memory file; default touched set covers every line."""
     lines = lf_lines(text)
     lone_cr = text.count("\r") - text.count("\r\n")
@@ -756,9 +791,9 @@ def check_source(
         touched = set(range(1, min(len(lines), 1_000_000) + 1))
     norm = path.replace("\\", "/")
     if norm.endswith(".py"):
-        return check_python_source(path, text, touched, deleted_names)
+        return check_python_source(path, text, touched)
     if norm.endswith(".sh"):
-        return check_shell_source(path, text, touched, deleted_names)
+        return check_shell_source(path, text, touched)
     return []
 
 
@@ -770,11 +805,11 @@ def check_path(repo_root: Path, base_sha: str, path: str) -> list[Finding]:
     diff = diff_touched_lines(repo_root, base_sha, path)
     if diff is None:
         return check_source(path, blob, None)
-    names, extra = deleted_function_names(repo_root, base_sha, path, diff)
+    extra = deleted_owner_touch(repo_root, base_sha, path, diff)
     touched = diff.lines | extra
-    if not touched and not names:
+    if not touched:
         return []
-    return check_source(path, blob, touched, names)
+    return check_source(path, blob, touched)
 
 
 def check(repo_root: Path, base_sha: str, paths: list[str]) -> list[Finding]:
