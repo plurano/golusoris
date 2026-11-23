@@ -358,16 +358,16 @@ def scan_file(
     return findings
 
 
-def collect_repo_files(repo_root: Path) -> tuple[list[str], list[Finding]]:
-    """Collect tracked files via git ls-files."""
+def collect_git_files(repo_root: Path, argv: list[str]) -> tuple[list[str], list[Finding]]:
+    """Run a fixed git file-listing command and return paths with scan-limit findings."""
     try:
         res = subprocess.check_output(  # noqa: S603 - fixed git command without shell. # nosec B603
-            ["git", "-C", str(repo_root), "ls-files"],  # noqa: S607 - git executable on runner PATH. # nosec B607
+            ["git", "-C", str(repo_root), *argv],  # noqa: S607 - git executable on runner PATH. # nosec B607
             text=True,
             timeout=60,
         )
     except (subprocess.SubprocessError, OSError) as err:
-        return [], [Finding(".", 0, "scan-limit", f"git ls-files failed: {err}")]
+        return [], [Finding(".", 0, "scan-limit", f"git {argv[0]} failed: {err}")]
     all_files = res.splitlines()
     findings: list[Finding] = []
     if len(all_files) > MAX_SCAN_FILES:
@@ -380,6 +380,11 @@ def collect_repo_files(repo_root: Path) -> tuple[list[str], list[Finding]]:
             )
         )
     return all_files[:MAX_SCAN_FILES], findings
+
+
+def collect_repo_files(repo_root: Path) -> tuple[list[str], list[Finding]]:
+    """Collect tracked files via git ls-files."""
+    return collect_git_files(repo_root, ["ls-files"])
 
 
 def scan_arguments(args: list[str]) -> list[Finding]:
@@ -427,10 +432,33 @@ def scan_repository(repo_root: Path, praetor_files: set[str]) -> list[Finding]:
     return findings
 
 
+def fallback_candidates(
+    repo_root: Path, files: list[str], praetor: set[str]
+) -> tuple[list[str], list[Finding]]:
+    """Union index-selected paths with HEAD in-scope paths for divergence checks."""
+    head, findings = collect_git_files(
+        repo_root, ["ls-tree", "-r", "--name-only", "HEAD"]
+    )
+    in_scope = filter_pushed_in_scope(head, praetor)
+    merged = sorted(set(files) | set(in_scope))
+    if len(merged) > MAX_SCAN_FILES:
+        findings.append(
+            Finding(
+                ".",
+                0,
+                "scan-limit",
+                f"divergence candidate count exceeds scan limit {MAX_SCAN_FILES}: {len(merged)}",
+            )
+        )
+    return merged[:MAX_SCAN_FILES], findings
+
+
 def scan_full_fallback(repo_root: Path, praetor: set[str]) -> list[Finding]:
     """Full in-scope scan with worktree divergence check."""
     files, findings = select_repository_files(repo_root, praetor)
-    divergence = check_pushed_worktree_divergence(repo_root, files)
+    candidates, cand_findings = fallback_candidates(repo_root, files, praetor)
+    findings.extend(cand_findings)
+    divergence = check_pushed_worktree_divergence(repo_root, candidates)
     if divergence:
         return findings + divergence
     findings.extend(scan_selected(repo_root, files, praetor))
@@ -462,7 +490,7 @@ def check_pushed_worktree_divergence(
         return []
     try:
         out = subprocess.check_output(  # noqa: S603 - fixed git command without shell. # nosec B603
-            ["git", "-C", str(repo_root), "diff", "--name-only", "-z", "HEAD"],  # noqa: S607 - git executable on runner PATH. # nosec B607
+            ["git", "-C", str(repo_root), "diff", "--name-only", "--no-renames", "-z", "HEAD"],  # noqa: S607 - git executable on runner PATH. # nosec B607
             text=True,
             timeout=60,
         )

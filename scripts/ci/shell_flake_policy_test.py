@@ -435,6 +435,55 @@ class ShellFlakePolicyPushedTest(unittest.TestCase):
         )
         self.assertEqual(findings, [])
 
+    def test_b5_staged_rename_source_blocks_scan(self) -> None:
+        """B5: staged rename leaves source path dirty and blocks scan."""
+        self._commit_paths({"scripts/ci/planted.sh": "echo x | head -1\n"})
+        self._git("mv", "scripts/ci/planted.sh", "scripts/ci/moved.sh")
+        findings = shell_flake_policy.scan_pushed(
+            self.repo_root, ["scripts/ci/planted.sh"]
+        )
+        self.assertEqual([f.rule for f in findings], ["uncommitted-change"])
+
+    @patch.object(shell_flake_policy, "MAX_SCAN_FILES", 2)
+    def test_n5_overbound_staged_deletion_blocks_full_scan(self) -> None:
+        """N5: over-bound fallback sees HEAD path after staged rm and blocks scan."""
+        self._commit_paths(
+            {
+                "scripts/ci/a.sh": "echo ok\n",
+                "scripts/ci/b.sh": "echo x | head -1\n",
+            }
+        )
+        self._git("rm", "-q", "scripts/ci/b.sh")
+        findings = shell_flake_policy.scan_pushed(
+            self.repo_root,
+            ["scripts/ci/a.sh", "scripts/ci/b.sh", "scripts/ci/gone.sh"],
+        )
+        self.assertEqual([f.rule for f in findings], ["uncommitted-change"])
+
+    @patch.object(shell_flake_policy, "MAX_SCAN_FILES", 2)
+    def test_b6_overbound_candidate_union_bound(self) -> None:
+        """B6: union of index and HEAD divergence candidates enforces scan limit."""
+        self._commit_paths(
+            {
+                "scripts/ci/a.sh": "echo ok\n",
+                "scripts/ci/b.sh": "echo ok\n",
+            }
+        )
+        self._git("rm", "-q", "scripts/ci/b.sh")
+        target = self.repo_root / "scripts/ci/c.sh"
+        target.write_text("echo ok\n", encoding="utf-8")
+        self._git("add", "scripts/ci/c.sh")
+        findings = shell_flake_policy.scan_pushed(
+            self.repo_root,
+            ["scripts/ci/a.sh", "scripts/ci/b.sh", "scripts/ci/gone.sh"],
+        )
+        self.assertTrue(
+            any(
+                f.rule == "scan-limit" and "divergence candidate count" in f.message
+                for f in findings
+            )
+        )
+
     def test_w1_lefthook_prepush_wiring(self) -> None:
         """W1: lefthook pre-push runs shell_flake_policy.py --pushed on push_files."""
         lefthook = Path(__file__).resolve().parents[2] / "lefthook.yml"
