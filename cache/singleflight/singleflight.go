@@ -38,6 +38,12 @@ func (p *callbackPanic) Error() string {
 	return fmt.Sprintf("singleflight: callback panic: %v\n%s", p.value, p.stack)
 }
 
+// invocation tracks whether a DoCancelable caller started or left before its callback ran.
+type invocation struct {
+	running bool
+	left    bool
+}
+
 type keyedFlight struct {
 	group      singleflight.Group
 	users      int
@@ -67,7 +73,7 @@ func (g *Group[K, V]) Do(ctx context.Context, key K, fn func(ctx context.Context
 	flight := g.acquire(key)
 	defer g.release(key, flight)
 	value, err, shared := flight.group.Do(sharedFlightKey, func() (any, error) {
-		return g.call(ctx, key, flight, fn)
+		return g.call(ctx, key, flight, nil, fn)
 	})
 	if err != nil {
 		var zero V
@@ -82,15 +88,20 @@ func (g *Group[K, V]) Do(ctx context.Context, key K, fn func(ctx context.Context
 }
 
 // DoCancelable shares a flight while allowing each caller to stop waiting when its context ends.
+// A canceled caller whose context the callback runs under waits for the callback to return before it returns; other callers return at once.
 func (g *Group[K, V]) DoCancelable(ctx context.Context, key K, fn func(context.Context) (V, error)) (V, bool, error) {
 	var zero V
 	if err := ctx.Err(); err != nil {
 		return zero, false, fmt.Errorf("singleflight: wait: %w", err)
 	}
-	flight, done := g.start(ctx, key, fn)
+	self := &invocation{}
+	flight, done := g.start(ctx, key, self, fn)
 	defer g.release(key, flight)
 	select {
 	case <-ctx.Done():
+		if g.leave(self) {
+			<-done
+		}
 		return zero, false, fmt.Errorf("singleflight: wait: %w", ctx.Err())
 	case result := <-done:
 		if err := ctx.Err(); err != nil {
@@ -111,14 +122,41 @@ func (g *Group[K, V]) Forget(key K) {
 	}
 }
 
-func (g *Group[K, V]) start(ctx context.Context, key K, fn func(context.Context) (V, error)) (*keyedFlight, <-chan singleflight.Result) {
+func (g *Group[K, V]) start(ctx context.Context, key K, self *invocation, fn func(context.Context) (V, error)) (*keyedFlight, <-chan singleflight.Result) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	flight := g.acquireLocked(key)
 	flight.cancelable = true
 	return flight, flight.group.DoChan(sharedFlightKey, func() (any, error) {
-		return g.call(ctx, key, flight, fn)
+		return g.call(ctx, key, flight, self, fn)
 	})
+}
+
+// leave marks a DoCancelable caller gone and reports whether its callback may still be running.
+func (g *Group[K, V]) leave(self *invocation) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	self.left = !self.running
+	return self.running
+}
+
+// begin admits a flight callback or rejects a caller that left before the callback started.
+func (g *Group[K, V]) begin(ctx context.Context, key K, flight *keyedFlight, self *invocation) error {
+	g.mu.Lock()
+	if self != nil && self.left {
+		g.mu.Unlock()
+		return fmt.Errorf("singleflight: call: %w", ctx.Err())
+	}
+	if g.flights[key] != flight && flight.users == 0 {
+		g.mu.Unlock()
+		return fmt.Errorf("singleflight: call: %w", context.Canceled)
+	}
+	if self != nil {
+		self.running = true
+	}
+	flight.running = true
+	g.mu.Unlock()
+	return nil
 }
 
 func (g *Group[K, V]) acquire(key K) *keyedFlight {
@@ -140,14 +178,10 @@ func (g *Group[K, V]) acquireLocked(key K) *keyedFlight {
 	return flight
 }
 
-func (g *Group[K, V]) call(ctx context.Context, key K, flight *keyedFlight, fn func(context.Context) (V, error)) (value any, err error) {
-	g.mu.Lock()
-	if g.flights[key] != flight && flight.users == 0 {
-		g.mu.Unlock()
-		return nil, fmt.Errorf("singleflight: call: %w", context.Canceled)
+func (g *Group[K, V]) call(ctx context.Context, key K, flight *keyedFlight, self *invocation, fn func(context.Context) (V, error)) (value any, err error) {
+	if beginErr := g.begin(ctx, key, flight, self); beginErr != nil {
+		return nil, beginErr
 	}
-	flight.running = true
-	g.mu.Unlock()
 	defer g.finish(key, flight)
 	returned := false
 	defer func() {

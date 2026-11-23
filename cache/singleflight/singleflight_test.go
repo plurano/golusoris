@@ -462,7 +462,49 @@ func TestDoCancelableSharesValue(t *testing.T) {
 	})
 }
 
-func TestDoCancelableLastWaiterLeavesRunningFlight(t *testing.T) {
+// TestDoCancelableCancelJoinsCallback ensures a canceled starter does not return until fn exits.
+func TestDoCancelableCancelJoinsCallback(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		g := singleflight.New[string, int]()
+		release := make(chan struct{})
+		var closed, unjoined atomic.Bool
+		fn := func(ctx context.Context) (int, error) {
+			<-ctx.Done()
+			<-release
+			if closed.Load() {
+				unjoined.Store(true)
+			}
+			return 0, ctx.Err()
+		}
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan error, 1)
+		go func() {
+			_, _, err := g.DoCancelable(ctx, "key", fn)
+			closed.Store(true)
+			done <- err
+		}()
+		synctest.Wait()
+		cancel()
+		synctest.Wait()
+		select {
+		case <-done:
+			t.Fatal("returned before callback finished")
+		default:
+		}
+		close(release)
+		if err := <-done; !errors.Is(err, context.Canceled) {
+			t.Fatalf("starter = %v", err)
+		}
+		synctest.Wait()
+		if unjoined.Load() {
+			t.Fatal("callback observed caller return before fn finished")
+		}
+	})
+}
+
+// TestDoCancelableCanceledStarterJoinsFlight ensures a canceled starter blocks until the running callback completes.
+func TestDoCancelableCanceledStarterJoinsFlight(t *testing.T) {
 	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
 		g := singleflight.New[string, int]()
@@ -478,8 +520,11 @@ func TestDoCancelableLastWaiterLeavesRunningFlight(t *testing.T) {
 		}()
 		synctest.Wait()
 		cancel()
-		if result := <-first; !errors.Is(result.err, context.Canceled) {
-			t.Errorf("cancelled waiter = %+v", result)
+		synctest.Wait()
+		select {
+		case <-first:
+			t.Fatal("canceled starter returned before callback finished")
+		default:
 		}
 		next := make(chan callResult, 1)
 		go func() {
@@ -491,6 +536,9 @@ func TestDoCancelableLastWaiterLeavesRunningFlight(t *testing.T) {
 			t.Errorf("running callback count = %d, want 1", got)
 		}
 		close(gate)
+		if result := <-first; !errors.Is(result.err, context.Canceled) {
+			t.Errorf("canceled starter = %+v", result)
+		}
 		if result := <-next; result.value != 42 || result.err != nil {
 			t.Errorf("live waiter = %+v", result)
 		}
