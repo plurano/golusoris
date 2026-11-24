@@ -460,6 +460,19 @@ def check_python_source(path: str, source: str, touched: set[int]) -> list[Findi
     return findings
 
 
+_SH_DQ_ESCAPABLE = frozenset({'"', "\\", "$", "`"})
+
+
+def _sh_heredoc_quoted(line: str, pos: int, quote: str) -> tuple[str, str, int]:
+    """Consume one character or double-quote escape inside a quoted heredoc part."""
+    ch = line[pos]
+    if ch == quote:
+        return "", "", pos + 1
+    if quote == '"' and ch == "\\" and pos + 1 < len(line) and line[pos + 1] in _SH_DQ_ESCAPABLE:
+        return line[pos + 1], quote, pos + 2
+    return ch, quote, pos + 1
+
+
 def _sh_heredoc_word(line: str, pos: int) -> tuple[str, int]:
     """Return one shell word starting at pos as a heredoc delimiter."""
     out: list[str] = []
@@ -467,11 +480,8 @@ def _sh_heredoc_word(line: str, pos: int) -> tuple[str, int]:
     while pos < len(line):
         ch = line[pos]
         if quote:
-            if ch == quote:
-                quote = ""
-            else:
-                out.append(ch)
-            pos += 1
+            piece, quote, pos = _sh_heredoc_quoted(line, pos, quote)
+            out.append(piece)
             continue
         if ch.isspace() or ch in ";&|<>()":
             break
@@ -744,6 +754,8 @@ def _sh_block_open_kind(tok: str, is_cmd: bool) -> str | None:
         return None
     if tok == "{":
         return "{"
+    if tok == "[[":
+        return "[["
     if tok == "if":
         return "if"
     if tok == "case":
@@ -757,6 +769,8 @@ def _sh_block_close_kind(tok: str, is_cmd: bool) -> str | None:
     """Map one token to a structural block closer kind when applicable."""
     if tok == ")":
         return "("
+    if tok == "]]":
+        return "[["
     if not is_cmd:
         return None
     if tok == "}":

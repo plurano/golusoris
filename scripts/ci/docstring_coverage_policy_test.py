@@ -1224,6 +1224,63 @@ class DocstringCoveragePolicyTest(unittest.TestCase):
                     self.assertEqual(found[0].rule, "missing-docstring")
                     self.assertEqual(found[0].line, 2)
 
+    def test_b69_heredoc_dq_escape(self) -> None:
+        """B69: an escaped quote inside a double-quoted heredoc delimiter is removed like bash does."""
+        cases = (
+            (
+                "escaped-quote",
+                'cat <<"E\\"OF"\ntext\nE"OF\ng() {\n  if true; then :; fi\n}\n',
+                [(4, "missing-docstring")],
+            ),
+            (
+                "literal-backslash",
+                'cat <<"E\\xOF"\ntext\nE\\xOF\ng() {\n  if true; then :; fi\n}\n',
+                [(4, "missing-docstring")],
+            ),
+            (
+                "masked-inside-heredoc",
+                'cat <<"E\\"OF"\ng() {\n  if true; then :; fi\n}\nE"OF\n',
+                [],
+            ),
+        )
+        for label, text, expected in cases:
+            with self.subTest(case=label):
+                found = policy.check_source("scripts/ci/x.sh", text)
+                self.assertEqual([(item.line, item.rule) for item in found], expected)
+
+    def test_b70_double_bracket_body(self) -> None:
+        """B70: a [[ ]] function body spanning lines is bounded by its closing ]]."""
+        cases = (
+            (
+                "undocumented-multiline-body",
+                "f() [[ a == a &&\n  b == b ]]\n",
+                {2},
+                [(1, "missing-docstring")],
+            ),
+            (
+                "documented-multiline-body",
+                "# doc\nf() [[ a == a &&\n  b == b ]]\n",
+                {3},
+                [],
+            ),
+            (
+                "nested-inside-braced-body",
+                "f() {\n  [[ a &&\n    b ]] && c\n}\ng() {\n  if a; then b; fi\n}\n",
+                {6},
+                [(5, "missing-docstring")],
+            ),
+            (
+                "stray-closer-under-brace",
+                "f() {\n  echo ]]\n  if a; then b; fi\n}\n",
+                {3},
+                [(1, "missing-docstring")],
+            ),
+        )
+        for label, text, touched, expected in cases:
+            with self.subTest(case=label):
+                found = policy.check_source("scripts/ci/x.sh", text, touched)
+                self.assertEqual([(item.line, item.rule) for item in found], expected)
+
 
 if __name__ == "__main__":
     unittest.main()
