@@ -67,6 +67,7 @@ write_suite "$clean_root/scripts/ci/renovate_vulnerability_test.py" 'self.assert
 write_suite "$clean_root/scripts/ci/repo_git_test.py" 'self.assertTrue(True)'
 write_suite "$clean_root/scripts/ci/review_bot_badges_test.py" 'self.assertTrue(True)'
 write_suite "$clean_root/scripts/ci/context_size_test.py" 'self.assertTrue(True)'
+write_suite "$clean_root/scripts/ci/skill_frontmatter_test.py" 'self.assertTrue(True)'
 write_suite "$clean_root/scripts/ci/tiny-litert-sidecar-docs-policy_test.py" 'self.assertTrue(True)'
 write_suite "$clean_root/scripts/ci/pull_test_images_test.py" 'self.assertTrue(True)'
 git -C "$clean_root" add .
@@ -82,6 +83,7 @@ write_suite "$failure_root/scripts/ci/renovate_vulnerability_test.py" 'self.asse
 write_suite "$failure_root/scripts/ci/repo_git_test.py" 'self.assertTrue(True)'
 write_suite "$failure_root/scripts/ci/review_bot_badges_test.py" 'self.assertTrue(True)'
 write_suite "$failure_root/scripts/ci/context_size_test.py" 'self.assertTrue(True)'
+write_suite "$failure_root/scripts/ci/skill_frontmatter_test.py" 'self.assertTrue(True)'
 write_suite "$failure_root/scripts/ci/tiny-litert-sidecar-docs-policy_test.py" 'self.assertTrue(True)'
 write_suite "$failure_root/scripts/ci/pull_test_images_test.py" 'self.assertTrue(True)'
 git -C "$failure_root" add .
@@ -104,6 +106,7 @@ write_suite "$empty_root/scripts/ci/renovate_vulnerability_test.py" 'self.assert
 write_suite "$empty_root/scripts/ci/repo_git_test.py" 'self.assertTrue(True)'
 write_suite "$empty_root/scripts/ci/review_bot_badges_test.py" 'self.assertTrue(True)'
 write_suite "$empty_root/scripts/ci/context_size_test.py" 'self.assertTrue(True)'
+write_suite "$empty_root/scripts/ci/skill_frontmatter_test.py" 'self.assertTrue(True)'
 write_suite "$empty_root/scripts/ci/tiny-litert-sidecar-docs-policy_test.py" 'self.assertTrue(True)'
 write_suite "$empty_root/scripts/ci/pull_test_images_test.py" 'self.assertTrue(True)'
 git -C "$empty_root" add .
@@ -120,6 +123,7 @@ write_suite "$symlink_root/scripts/ci/renovate_vulnerability_test.py" 'self.asse
 write_suite "$symlink_root/scripts/ci/repo_git_test.py" 'self.assertTrue(True)'
 write_suite "$symlink_root/scripts/ci/review_bot_badges_test.py" 'self.assertTrue(True)'
 write_suite "$symlink_root/scripts/ci/context_size_test.py" 'self.assertTrue(True)'
+write_suite "$symlink_root/scripts/ci/skill_frontmatter_test.py" 'self.assertTrue(True)'
 write_suite "$symlink_root/scripts/ci/tiny-litert-sidecar-docs-policy_test.py" 'self.assertTrue(True)'
 write_suite "$symlink_root/scripts/ci/pull_test_images_test.py" 'self.assertTrue(True)'
 git -C "$symlink_root" add .
@@ -137,6 +141,7 @@ required_suites=(
 	'scripts/ci/repo_git_test.py'
 	'scripts/ci/review_bot_badges_test.py'
 	'scripts/ci/context_size_test.py'
+	'scripts/ci/skill_frontmatter_test.py'
 	'scripts/ci/tiny-litert-sidecar-docs-policy_test.py'
 )
 
@@ -221,7 +226,7 @@ assert_required_suite_once() {
 		printf 'required suite did not run exactly once\n' >&2
 		return 1
 	fi
-	[[ "$output" == *'11 suites passed'* ]]
+	[[ "$output" == *'12 suites passed'* ]]
 }
 
 extra_root="$(new_repo extra-suites)"
