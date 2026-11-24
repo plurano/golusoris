@@ -9,6 +9,7 @@ local module must be tidied so go.mod and go.sum match the updated graph, and
 embedded assets such as the Scalar API reference browser bundle are rebuilt.
 This tool executes go mod tidy across all modules, rebuilds the Scalar bundle,
 regenerates module-backed upstream documentation pins,
+recomputes the Go module sums pinned in tools/tool-versions.env,
 verifies that no unexpected files were modified or deleted, and writes a directory
 containing the regenerated files and a manifest describing them.
 
@@ -27,6 +28,7 @@ generated file deleted, 2 the tool could not run or command failed.
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -35,6 +37,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import zipfile
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -74,6 +77,13 @@ SCALAR_PATHS = [
     "apidocs/embed/SCALAR_RELEASED",
     "apidocs/embed/scalar.js",
 ]
+TOOL_VERSIONS = "tools/tool-versions.env"
+MAX_TOOL_VERSION_LINES = 256
+MODULE_SUM_LINE = re.compile(r"(?P<name>[A-Z][A-Z0-9_]*)_MODULE_SUM=(?P<sum>\S*)")
+MODULE_SUM_VALUE = re.compile(r"h1:[A-Za-z0-9+/]{43}=")
+GO_PIN_COMMENT = re.compile(
+    r"# renovate: datasource=go depName=(?P<module>\S+)(?: .*)?"
+)
 
 
 class CheckError(Exception):
@@ -141,6 +151,7 @@ def get_generated_files(root: Path) -> list[str]:
             paths.extend([f"{m}/go.mod", f"{m}/go.sum"])
     paths.extend(SCALAR_PATHS)
     paths.extend(upstream_paths(root))
+    paths.append(TOOL_VERSIONS)
     return sorted(paths)
 
 
@@ -422,6 +433,108 @@ def regenerate_upstream_pins(root: Path) -> list[list[str]]:
     return commands
 
 
+def module_sum_pins(text: str) -> list[tuple[str, str, int]]:
+    lines = text.splitlines()
+    if len(lines) > MAX_TOOL_VERSION_LINES:
+        raise CheckError(f"{TOOL_VERSIONS} exceeds {MAX_TOOL_VERSION_LINES} lines")
+    pins: list[tuple[str, str, int]] = []
+    for i in range(min(len(lines), MAX_TOOL_VERSION_LINES)):
+        sum_match = MODULE_SUM_LINE.fullmatch(lines[i])
+        if sum_match is None:
+            continue
+        name = sum_match["name"]
+        prefix = f"{name}_VERSION="
+        comment = GO_PIN_COMMENT.fullmatch(lines[i - 2]) if i >= 2 else None
+        version = (
+            lines[i - 1].removeprefix(prefix)
+            if i >= 2 and lines[i - 1].startswith(prefix)
+            else ""
+        )
+        if comment is None or not version or any(ch.isspace() for ch in version):
+            msg = (
+                f"{TOOL_VERSIONS}:{i + 1}: {name}_MODULE_SUM needs {name}_VERSION "
+                "and a datasource=go renovate comment above it"
+            )
+            raise CheckError(msg)
+        pins.append((comment["module"], version, i))
+    return pins
+
+
+def go_module_sum(
+    root: Path,
+    module: str,
+    version: str,
+    env: dict[str, str] | None = None,
+) -> tuple[str, list[str]]:
+    target = f"{module}@{version}"
+    cmd = [
+        "bash",
+        str(root / "scripts" / "ci" / "retry.sh"),
+        "go",
+        "mod",
+        "download",
+        "-json",
+        target,
+    ]
+    base_env = env if env is not None else os.environ
+    run_env = {
+        **base_env,
+        "GO111MODULE": "on",
+        "GOFLAGS": "-mod=mod -modcacherw",
+    }
+    with tempfile.TemporaryDirectory(prefix="golusoris-modsum-") as work_dir:
+        stdout = run_update_command(
+            cmd, Path(work_dir), MODULE_TIMEOUT_SECONDS, run_env
+        )
+    try:
+        data = json.loads(stdout)
+    except ValueError as error:
+        raise CheckError(f"go mod download {target}: invalid JSON: {error}") from error
+    if not isinstance(data, dict):
+        raise CheckError(f"go mod download {target}: expected JSON object")
+    if data.get("Error") not in (None, ""):
+        raise CheckError(f"go mod download {target}: {data['Error']}")
+    module_sum = data.get("Sum")
+    if (
+        not isinstance(module_sum, str)
+        or MODULE_SUM_VALUE.fullmatch(module_sum) is None
+    ):
+        raise CheckError(
+            f"go mod download {target}: invalid module sum {module_sum!r}"
+        )
+    return module_sum, cmd
+
+
+def regenerate_module_sums(
+    root: Path, env: dict[str, str] | None = None
+) -> list[list[str]]:
+    path = root / TOOL_VERSIONS
+    if not path.is_file():
+        return []
+    try:
+        text = path.read_bytes().decode("utf-8")
+    except (OSError, UnicodeError) as error:
+        raise CheckError(f"{TOOL_VERSIONS}: could not read: {error}") from error
+    pins = module_sum_pins(text)
+    if not pins:
+        return []
+    lines = text.splitlines()
+    raw_lines = text.splitlines(keepends=True)
+    commands: list[list[str]] = []
+    for i in range(min(len(pins), MAX_TOOL_VERSION_LINES)):
+        module, version, line_idx = pins[i]
+        new_sum, cmd = go_module_sum(root, module, version, env)
+        commands.append(cmd)
+        match = MODULE_SUM_LINE.fullmatch(lines[line_idx])
+        if match is not None and match["sum"] != new_sum:
+            ending = raw_lines[line_idx][len(lines[line_idx]) :]
+            raw_lines[line_idx] = f"{match['name']}_MODULE_SUM={new_sum}{ending}"
+    updated = "".join(raw_lines)
+    if updated != text:
+        path.write_bytes(updated.encode("utf-8"))
+    return commands
+
+
 def format_command(cmd: list[str]) -> list[str]:
     return ["python3" if arg == sys.executable else arg for arg in cmd]
 
@@ -492,6 +605,7 @@ def write_regenerated(
     root: Path,
     commands: dict[str, list[str]] | None = None,
     after_pass: Callable[[Path], None] | None = None,
+    module_env: dict[str, str] | None = None,
 ) -> tuple[list[str], str | None]:
     head = run_git(["rev-parse", "HEAD"], root).strip()
     if len(head) != 40 or not all(c in "0123456789abcdefABCDEF" for c in head):
@@ -516,6 +630,7 @@ def write_regenerated(
             run_update_command(scalar_cmd, root, SCALAR_TIMEOUT_SECONDS)
             executed.append(scalar_cmd)
         executed.extend(regenerate_upstream_pins(root))
+        executed.extend(regenerate_module_sums(root, module_env))
 
     raw_status = git_status_bytes(root)
     if not raw_status:
@@ -548,6 +663,7 @@ FIXTURE_GENERATED = sorted(
         UPSTREAM_CATALOGUE,
         "go.mod",
         "go.sum",
+        TOOL_VERSIONS,
         *SCALAR_PATHS,
     ]
 )
@@ -919,6 +1035,151 @@ def run_upstream_validation_cases() -> tuple[list[str], int]:
     return failures, refused
 
 
+def strip_module_sum_lines(text: str) -> str:
+    plain = text.splitlines()
+    raw = text.splitlines(keepends=True)
+    return "".join(
+        raw[i]
+        for i in range(min(len(plain), MAX_TOOL_VERSION_LINES))
+        if MODULE_SUM_LINE.fullmatch(plain[i]) is None
+    )
+
+
+def fixture_h1(prefix: str, files: dict[str, str]) -> str:
+    by_path = {prefix + name: content for name, content in files.items()}
+    lines = [
+        f"{hashlib.sha256(by_path[name].encode('utf-8')).hexdigest()}  {name}\n"
+        for name in sorted(by_path)[:MAX_CHANGED_FILES]
+    ]
+    summary = hashlib.sha256("".join(lines).encode("utf-8")).digest()
+    return "h1:" + base64.b64encode(summary).decode("ascii")
+
+
+def write_fixture_goproxy(proxy_dir: Path) -> dict[str, str]:
+    at_v = proxy_dir / "example.com" / "tool" / "@v"
+    at_v.mkdir(parents=True, exist_ok=True)
+    versions = ("v0.1.0", "v0.2.0")
+    (at_v / "list").write_text("".join(f"{v}\n" for v in versions), encoding="utf-8")
+    mod_text = "module example.com/tool\n\ngo 1.24\n"
+    sums: dict[str, str] = {}
+    for i in range(min(len(versions), MAX_TOOL_VERSION_LINES)):
+        v = versions[i]
+        info = json.dumps({"Version": v, "Time": "2026-01-01T00:00:00Z"}) + "\n"
+        (at_v / f"{v}.info").write_text(info, encoding="utf-8")
+        (at_v / f"{v}.mod").write_text(mod_text, encoding="utf-8")
+        files = {
+            "go.mod": mod_text,
+            "tool.go": f'package tool\n\nconst Version = "{v}"\n',
+        }
+        prefix = f"example.com/tool@{v}/"
+        items = list(files.items())
+        with zipfile.ZipFile(at_v / f"{v}.zip", "w") as archive:
+            for j in range(min(len(items), MAX_CHANGED_FILES)):
+                name, content = items[j]
+                archive.writestr(prefix + name, content)
+        sums[v] = fixture_h1(prefix, files)
+    return sums
+
+
+def run_module_sum_refusal_cases(
+    repo: Path, temp_dir: Path, env: dict[str, str], sample_sum: str
+) -> tuple[list[str], int]:
+    pin_cases = (
+        ("line-1", f"TOOL_MODULE_SUM={sample_sum}\n"),
+        (
+            "github-releases-comment",
+            (
+                "# renovate: datasource=github-releases depName=x/y\n"
+                f"TOOL_VERSION=v0.1.0\nTOOL_MODULE_SUM={sample_sum}\n"
+            ),
+        ),
+        (
+            "missing-version-line",
+            (
+                "# renovate: datasource=go depName=example.com/tool\n"
+                f"# missing version\nTOOL_MODULE_SUM={sample_sum}\n"
+            ),
+        ),
+    )
+    failures: list[str] = []
+    refused = 0
+    for i in range(min(len(pin_cases), MAX_TOOL_VERSION_LINES)):
+        label, bad_text = pin_cases[i]
+        try:
+            module_sum_pins(bad_text)
+        except CheckError:
+            refused += 1
+        else:
+            failures.append(f"module_sum_pins {label} was not refused")
+
+    reset_fixture_repo(repo)
+    original_head = run_git(["rev-parse", "HEAD"], repo).strip()
+    absent_pin = (
+        "# renovate: datasource=go depName=example.com/tool versioning=semver\n"
+        f"TOOL_VERSION=v0.3.0\nTOOL_MODULE_SUM={sample_sum}\n"
+    )
+    (repo / TOOL_VERSIONS).write_text(absent_pin, encoding="utf-8")
+    run_git(["commit", "-am", "plant missing module version v0.3.0"], repo)
+    try:
+        write_regenerated(temp_dir / "out-modsum-missing", repo, module_env=env)
+    except CheckError as error:
+        if "example.com/tool@v0.3.0" in str(error):
+            refused += 1
+        else:
+            failures.append(f"module sum v0.3.0 wrong refusal: {error}")
+    else:
+        failures.append("module sum v0.3.0 absent version was not refused")
+    run_git(["reset", "--hard", original_head], repo)
+    reset_fixture_repo(repo)
+    return failures, refused
+
+
+def run_module_sum_cases(repo: Path, temp_dir: Path) -> tuple[list[str], int, int]:
+    sums = write_fixture_goproxy(temp_dir / "goproxy")
+    env = {
+        **offline_env(),
+        "GOPROXY": (temp_dir / "goproxy").as_uri(),
+        "GONOSUMDB": "example.com",
+        "GOMODCACHE": str(temp_dir / "modcache"),
+        "RETRY_ATTEMPTS": "1",
+        "RETRY_DELAY_SECONDS": "0",
+    }
+    reset_fixture_repo(repo)
+    original_head = run_git(["rev-parse", "HEAD"], repo).strip()
+    header = (
+        "# renovate: datasource=go depName=example.com/tool versioning=semver\n"
+        "TOOL_VERSION=v0.2.0\n"
+    )
+    (repo / TOOL_VERSIONS).write_text(
+        f"{header}TOOL_MODULE_SUM={sums['v0.1.0']}\n", encoding="utf-8"
+    )
+    run_git(["commit", "-am", "plant stale module sum"], repo)
+    out = temp_dir / "out-modsum"
+    fails, _ = write_regenerated(out, repo, module_env=env)
+    failures = [f"module sum repair unexpectedly failed: {f}" for f in fails]
+    copied = out / "files" / TOOL_VERSIONS
+    expected = f"{header}TOOL_MODULE_SUM={sums['v0.2.0']}\n"
+    if not copied.is_file() or copied.read_text(encoding="utf-8") != expected:
+        failures.append("module sum repair did not write expected tool-versions.env")
+    accepted = 0
+    if not failures:
+        run_git(["commit", "-am", "accept regenerated module sum"], repo)
+        fails2, message = write_regenerated(
+            temp_dir / "out-modsum-current", repo, module_env=env
+        )
+        if fails2 or message != "nothing to regenerate":
+            failures.append(f"module sum repair not idempotent: {fails2}, {message}")
+        else:
+            accepted = 1
+    run_git(["reset", "--hard", original_head], repo)
+    reset_fixture_repo(repo)
+    ref_failures, refused = run_module_sum_refusal_cases(
+        repo, temp_dir, env, sums["v0.1.0"]
+    )
+    failures.extend(ref_failures)
+    return failures, refused, accepted
+
+
 def run_plant_case_c(repo: Path, temp_dir: Path) -> tuple[list[str], int]:
     failures: list[str] = []
     refused = 0
@@ -1109,16 +1370,19 @@ def selftest(root: Path | None = None) -> tuple[list[str], int, int]:
         verifier = repo / "scripts/verify-upstream-pins.sh"
         shutil.copy2(root / "scripts/verify-upstream-pins.sh", verifier)
         (repo / "tools").mkdir()
-        shutil.copy2(root / "tools/tool-versions.env", repo / "tools/tool-versions.env")
-        run_git(
-            ["add", "scripts/verify-upstream-pins.sh", "tools/tool-versions.env"], repo
+        source_tools = (root / TOOL_VERSIONS).read_text(encoding="utf-8")
+        (repo / TOOL_VERSIONS).write_text(
+            strip_module_sum_lines(source_tools), encoding="utf-8"
         )
+        run_git(["add", "scripts/verify-upstream-pins.sh", TOOL_VERSIONS], repo)
         run_git(["commit", "-m", "add upstream fixture verifier"], repo)
         upstream_repair = run_upstream_repair_case(repo, temp_dir)
         upstream_source = run_upstream_source_plant(repo, temp_dir)
         failures.extend(upstream_repair + upstream_source)
         upstream_validation, refused_upstream = run_upstream_validation_cases()
         failures.extend(upstream_validation)
+        fails_ms, refused_ms, accepted_ms = run_module_sum_cases(repo, temp_dir)
+        failures.extend(fails_ms)
         fails_ab, refused_ab = run_plant_cases_ab(repo, temp_dir)
         failures.extend(fails_ab)
         fails_sc, refused_sc = run_plant_case_scalar_unlisted(repo, temp_dir)
@@ -1134,20 +1398,11 @@ def selftest(root: Path | None = None) -> tuple[list[str], int, int]:
         fails_decl, refused_decl, accepted_decl = run_declared_cases(repo, generated)
         failures.extend(fails_decl)
 
-        total_refused = (
-            refused_rep
-            + refused_ab
-            + refused_sc
-            + refused_c
-            + refused_de
-            + refused_f
-            + refused_decl
-            + int(not upstream_source)
-            + refused_upstream
-        )
-        total_accepted = (
-            accepted_rep + accepted_gh + accepted_decl + int(not upstream_repair)
-        )
+        total_refused = refused_rep + refused_ab + refused_sc + refused_c + refused_de
+        total_refused += refused_f + refused_decl + int(not upstream_source)
+        total_refused += refused_upstream + refused_ms
+        total_accepted = accepted_rep + accepted_gh + accepted_decl + accepted_ms
+        total_accepted += int(not upstream_repair)
         return failures, total_refused, total_accepted
 
 
