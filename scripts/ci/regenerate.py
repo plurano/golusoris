@@ -449,6 +449,12 @@ def tool_version_lines(text: str) -> list[str]:
                 "line holds a control or line-separator character"
             )
             raise CheckError(msg)
+        if "\\" in lines[i]:
+            msg = (
+                f"{TOOL_VERSIONS}:{i + 1}: line holds a backslash; "
+                "bash and Make read line continuations differently"
+            )
+            raise CheckError(msg)
     return lines
 
 
@@ -476,7 +482,7 @@ def module_sum_pins(text: str) -> list[tuple[str, str, int]]:
         line = lines[i]
         sum_match = MODULE_SUM_LINE.fullmatch(line)
         if sum_match is None:
-            if "_MODULE_SUM" in line and not line.lstrip().startswith("#"):
+            if "_MODULE_SUM" in line.upper() and not line.lstrip().startswith("#"):
                 msg = (
                     f"{TOOL_VERSIONS}:{i + 1}: module sum pin must be "
                     "NAME_MODULE_SUM=h1:<43 base64 chars>= at column 0 "
@@ -1154,6 +1160,22 @@ def _module_sum_pin_cases(sample_sum: str) -> tuple[tuple[str, str], ...]:
             "version-hash",
             f"{go_comment}\nTOOL_VERSION=v0.1.0#c\nTOOL_MODULE_SUM={sample_sum}\n",
         ),
+        (
+            "comment-continuation",
+            (
+                f"{go_comment} {chr(92)}\n"
+                f"TOOL_VERSION=v0.1.0\nTOOL_MODULE_SUM={sample_sum}\n"
+            ),
+        ),
+        (
+            "name-continuation",
+            header + f"TOOL_MODULE_{chr(92)}\nSUM={sample_sum}\n",
+        ),
+        (
+            "hidden-after-continuation",
+            header + f": a{chr(92)}\n#; TOOL_MODULE_SUM={sample_sum}\n",
+        ),
+        ("lower-case-sum", header + f"tool_module_sum={sample_sum}\n"),
     )
 
 
