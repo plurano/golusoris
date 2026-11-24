@@ -292,28 +292,58 @@ class ShellFlakePolicyTest(unittest.TestCase):
         self.assertEqual(findings[0].path, "scripts/ci/root_probe.sh")
 
 
+MANAGED_EXCLUSION = json.dumps(
+    {
+        "packageRules": [
+            {
+                "description": "praetor-managed files",
+                "matchFileNames": ["scripts/ci/managed.sh"],
+            }
+        ]
+    }
+)
+
+
 class ShellFlakePolicyPushedTest(unittest.TestCase):
-    """Exercise pre-push --pushed path selection, divergence, and hook wiring."""
+    """Exercise pre-push stdin ref scanning, blob reads, and hook wiring."""
 
     def setUp(self) -> None:
         """Create a temporary git repository with isolated Git configuration."""
         self._temp_dir = tempfile.TemporaryDirectory(prefix="golusoris-flake-pushed-")
         self.repo_root = Path(self._temp_dir.name)
         self.addCleanup(self._temp_dir.cleanup)
+        env = patch.dict(os.environ)
+        self.addCleanup(env.stop)
+        env.start()
+        for key in list(os.environ):
+            if key.startswith("GIT_"):
+                del os.environ[key]
+        os.environ["GIT_CONFIG_GLOBAL"] = os.devnull
+        os.environ["GIT_CONFIG_NOSYSTEM"] = "1"
         self._git("init", "-q")
 
     def _git(self, *args: str) -> None:
         """Run one fixture git command without inherited Git variables."""
-        env = {key: val for key, val in os.environ.items() if not key.startswith("GIT_")}
-        env["GIT_CONFIG_GLOBAL"] = "/dev/null"
-        env["GIT_CONFIG_NOSYSTEM"] = "1"
         subprocess.run(  # noqa: S603 - fixed git argv in fixture, no shell. # nosec B603
             ["git", *args],  # noqa: S607 - git executable on runner PATH. # nosec B607
             cwd=self.repo_root,
-            env=env,
+            env=os.environ.copy(),
             check=True,
             timeout=60,
         )
+
+    def _out(self, *args: str) -> str:
+        """Run one fixture git command and return stripped stdout."""
+        proc = subprocess.run(  # noqa: S603 - fixed git argv in fixture, no shell. # nosec B603
+            ["git", *args],  # noqa: S607 - git executable on runner PATH. # nosec B607
+            cwd=self.repo_root,
+            env=os.environ.copy(),
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=60,
+        )
+        return proc.stdout.strip()
 
     def _commit(self, message: str) -> None:
         """Create one unsigned fixture commit with a fixed identity."""
@@ -329,118 +359,295 @@ class ShellFlakePolicyPushedTest(unittest.TestCase):
             self._git("add", rel)
         self._commit("fixture")
 
+    def _base(self, mapping: dict[str, str]) -> None:
+        """Seed origin/main at HEAD after one commit (empty mapping allowed)."""
+        if mapping:
+            self._commit_paths(mapping)
+        else:
+            identity = ("-c", "user.name=policy", "-c", "user.email=policy@example.invalid")
+            self._git(
+                *identity,
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "empty",
+            )
+        self._git("update-ref", "refs/remotes/origin/main", "HEAD")
+
+    def _push(self, oid: str | None = None) -> list[shell_flake_policy.Finding]:
+        """Run scan_pre_push with one synthetic pre-push stdin line."""
+        if oid is None:
+            oid = self._out("rev-parse", "HEAD")
+        zeros = "0" * 40
+        line = f"refs/heads/topic {oid} refs/heads/topic {zeros}\n"
+        return shell_flake_policy.scan_pre_push(self.repo_root, io.StringIO(line))
+
     def test_p1_planted_early_exit_reader(self) -> None:
-        """P1: in-scope pushed shell script with early-exit reader is flagged."""
+        """P1: in-scope shell script with early-exit reader is flagged on push."""
+        self._base({"README.md": "x\n"})
         self._commit_paths({"scripts/ci/planted.sh": "echo x | head -1\n"})
-        findings = shell_flake_policy.scan_pushed(
-            self.repo_root, ["scripts/ci/planted.sh"]
+        self.assertTrue(
+            any(f.rule == "early-exit-reader" for f in self._push())
         )
-        self.assertTrue(any(f.rule == "early-exit-reader" for f in findings))
 
     def test_p2_planted_bare_module_download(self) -> None:
-        """P2: pushed Makefile with bare go install is flagged."""
+        """P2: Makefile with bare go install is flagged on push."""
+        self._base({"README.md": "x\n"})
         self._commit_paths({"Makefile": "install:\n\tgo install example.com/x@v1\n"})
-        findings = shell_flake_policy.scan_pushed(self.repo_root, ["Makefile"])
-        self.assertTrue(any(f.rule == "bare-module-download" for f in findings))
+        self.assertTrue(any(f.rule == "bare-module-download" for f in self._push()))
 
     def test_c1_clean_pattern_passes(self) -> None:
-        """C1: approved reader pattern on pushed path yields no findings."""
+        """C1: approved reader pattern yields no findings on push."""
+        self._base({"README.md": "x\n"})
         body = 'out="$(producer)"; grep -q PAT <<<"$out"\n'
         self._commit_paths({"scripts/ci/clean.sh": body})
-        findings = shell_flake_policy.scan_pushed(
-            self.repo_root, ["scripts/ci/clean.sh"]
-        )
-        self.assertEqual(findings, [])
+        self.assertEqual(self._push(), [])
 
     def test_b1_out_of_scope_filtered(self) -> None:
-        """B1: out-of-scope paths are not scanned."""
+        """B1: out-of-scope paths are not scanned on push."""
+        self._base({"README.md": "x\n"})
         self._commit_paths({"internal/x.txt": "echo x | head -1\n"})
-        findings = shell_flake_policy.scan_pushed(
-            self.repo_root, ["internal/x.txt"]
-        )
-        self.assertEqual(findings, [])
+        self.assertEqual(self._push(), [])
 
-    @patch.object(shell_flake_policy, "scan_repository")
-    def test_b2_empty_path_list_skips_full_scan(self, mock_scan: MagicMock) -> None:
-        """B2: empty pushed path list does not fall back to full repository scan."""
-        findings = shell_flake_policy.scan_pushed(self.repo_root, [])
-        self.assertEqual(findings, [])
-        mock_scan.assert_not_called()
+    def test_n1_worktree_deletion_cannot_hide_violation(self) -> None:
+        """N1: local worktree deletion does not hide a committed violation."""
+        self._base({"README.md": "x\n"})
+        self._commit_paths({"scripts/ci/gone.sh": "echo x | head -1\n"})
+        (self.repo_root / "scripts/ci/gone.sh").unlink()
+        self.assertTrue(any(f.rule == "early-exit-reader" for f in self._push()))
 
-    @patch.object(shell_flake_policy, "WINDOWS_PATHS", True)
-    def test_b3_windows_path_normalized(self) -> None:
-        """B3: backslash path separators are normalized before scan."""
-        self._commit_paths({"scripts/ci/planted.sh": "echo x | head -1\n"})
-        findings = shell_flake_policy.scan_pushed(
-            self.repo_root, [r"scripts\ci\planted.sh"]
+    def test_n2_pushed_ref_differs_from_head(self) -> None:
+        """N2: scan uses the pushed oid, not HEAD when they differ."""
+        self._base({"README.md": "x\n"})
+        self._git("checkout", "-q", "-b", "other")
+        self._commit_paths({"scripts/ci/other.sh": "echo x | head -1\n"})
+        oid = self._out("rev-parse", "HEAD")
+        self._git("checkout", "-q", "-")
+        self.assertTrue(
+            any(f.rule == "early-exit-reader" for f in self._push(oid))
         )
-        self.assertTrue(any(f.rule == "early-exit-reader" for f in findings))
 
-    @unittest.skipIf(sys.platform == "win32", "Windows file names cannot contain a backslash")
-    def test_b10_posix_backslash_name_kept(self) -> None:
-        """B10: POSIX pushed paths keep literal backslashes in file names."""
-        self._commit_paths({r"scripts/ci/a\b.sh": "echo x | head -1\n"})
-        findings = shell_flake_policy.scan_pushed(
-            self.repo_root, [r"scripts/ci/a\b.sh"]
-        )
+    def test_n3_rename_into_scope(self) -> None:
+        """N3: rename into scripts/ci/ is scanned at the new path."""
+        self._base({"docs/old.txt": "echo x | head -1\n"})
+        self._git("config", "diff.renames", "true")
+        (self.repo_root / "scripts/ci").mkdir(parents=True, exist_ok=True)
+        self._git("mv", "docs/old.txt", "scripts/ci/new.sh")
+        self._commit("mv")
+        findings = self._push()
         self.assertTrue(
             any(
-                f.rule == "early-exit-reader" and f.path == r"scripts/ci/a\b.sh"
+                f.rule == "early-exit-reader" and f.path == "scripts/ci/new.sh"
                 for f in findings
             )
         )
 
-    @patch.object(shell_flake_policy, "MAX_SCAN_FILES", 2)
-    def test_b11_fallback_bound_after_scope_filter(self) -> None:
-        """B11: over-bound push list falls back without scan-limit when one path is in scope."""
-        self._commit_paths(
-            {
-                "docs/a.md": "a\n",
-                "docs/b.md": "b\n",
-                "docs/c.md": "c\n",
-                "scripts/ci/clean.sh": "echo ok\n",
-            }
+    def test_b2_committed_deletion_ignores_untracked_recreate(self) -> None:
+        """B2: committed deletion is not rescanned from an untracked recreate."""
+        self._base({"scripts/ci/gone.sh": "echo ok\n"})
+        self._git("rm", "-q", "scripts/ci/gone.sh")
+        self._commit("remove")
+        (self.repo_root / "scripts/ci").mkdir(parents=True, exist_ok=True)
+        (self.repo_root / "scripts/ci/gone.sh").write_text(
+            "echo x | head -1\n", encoding="utf-8"
         )
-        findings = shell_flake_policy.scan_pushed(
-            self.repo_root,
-            ["docs/a.md", "docs/b.md", "docs/c.md"],
+        self.assertEqual(self._push(), [])
+
+    def test_b3_uncommitted_dirt_ignored(self) -> None:
+        """B3: uncommitted worktree edits do not affect blob scan."""
+        self._base({"README.md": "x\n"})
+        self._commit_paths({"scripts/ci/x.sh": "echo ok\n"})
+        (self.repo_root / "scripts/ci/x.sh").write_text(
+            "echo x | head -1\n", encoding="utf-8"
         )
+        self.assertEqual(self._push(), [])
+
+    def test_b4_ref_deletion_skipped(self) -> None:
+        """B4: all-zero local oid (ref deletion) is skipped."""
+        zeros = "0" * 40
+        line = f"refs/heads/topic {zeros} refs/heads/topic {zeros}\n"
+        self._base({"README.md": "x\n"})
+        self.assertEqual(
+            shell_flake_policy.scan_pre_push(self.repo_root, io.StringIO(line)),
+            [],
+        )
+
+    def test_b5_two_refs_one_dirty_each(self) -> None:
+        """B5: two pushed refs yield one finding per violating path."""
+        self._base({"README.md": "x\n"})
+        self._git("checkout", "-q", "-b", "a")
+        self._commit_paths({"scripts/ci/a.sh": "echo x | head -1\n"})
+        oid_a = self._out("rev-parse", "HEAD")
+        self._git("checkout", "-q", "origin/main")
+        self._git("checkout", "-q", "-b", "b")
+        self._commit_paths({"scripts/ci/b.sh": "echo x | head -1\n"})
+        oid_b = self._out("rev-parse", "HEAD")
+        zeros = "0" * 40
+        stream = io.StringIO(
+            f"refs/heads/a {oid_a} refs/heads/a {zeros}\n"
+            f"refs/heads/b {oid_b} refs/heads/b {zeros}\n"
+        )
+        findings = shell_flake_policy.scan_pre_push(self.repo_root, stream)
+        paths = {f.path for f in findings if f.rule == "early-exit-reader"}
+        self.assertEqual(paths, {"scripts/ci/a.sh", "scripts/ci/b.sh"})
+
+    def test_n4_malformed_pre_push_line(self) -> None:
+        """N4: malformed pre-push stdin returns pre-push-input."""
+        self._base({"README.md": "x\n"})
+        findings = shell_flake_policy.scan_pre_push(
+            self.repo_root, io.StringIO("a b c\n")
+        )
+        self.assertTrue(
+            any(
+                f.rule == "pre-push-input" and "expected 4 fields" in f.message
+                for f in findings
+            )
+        )
+
+    def test_n5_invalid_local_oid(self) -> None:
+        """N5: invalid local oid returns pre-push-input."""
+        self._base({"README.md": "x\n"})
+        zeros = "0" * 40
+        line = f"refs/heads/x nothex refs/heads/x {zeros}\n"
+        findings = shell_flake_policy.scan_pre_push(self.repo_root, io.StringIO(line))
+        self.assertTrue(
+            any(
+                f.rule == "pre-push-input" and "invalid local oid" in f.message
+                for f in findings
+            )
+        )
+
+    @patch.object(shell_flake_policy, "MAX_PUSH_REFS", 2)
+    def test_n6_ref_count_bound(self) -> None:
+        """N6: more than MAX_PUSH_REFS lines returns pre-push-input."""
+        self._base({"README.md": "x\n"})
+        oid = self._out("rev-parse", "HEAD")
+        zeros = "0" * 40
+        lines = "".join(
+            f"refs/heads/r{i} {oid} refs/heads/r{i} {zeros}\n" for i in range(3)
+        )
+        findings = shell_flake_policy.scan_pre_push(
+            self.repo_root, io.StringIO(lines)
+        )
+        self.assertTrue(
+            any(
+                f.rule == "pre-push-input" and "ref count exceeds 2" in f.message
+                for f in findings
+            )
+        )
+
+    def test_n7_unknown_commit_oid(self) -> None:
+        """N7: unknown pushed oid returns git-error."""
+        self._base({"README.md": "x\n"})
+        bogus = "1" * 40
+        findings = self._push(bogus)
+        self.assertTrue(any(f.rule == "git-error" for f in findings))
+
+    def test_b6_missing_origin_main_skips(self) -> None:
+        """B6: missing origin/main prints skip and returns no findings."""
+        self._commit_paths({"scripts/ci/planted.sh": "echo x | head -1\n"})
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            findings = self._push()
         self.assertEqual(findings, [])
+        self.assertIn("origin/main not found", err.getvalue())
 
-    @patch.object(shell_flake_policy, "MAX_SCAN_FILES", 2)
-    def test_b12_fallback_scans_in_scope_file_past_raw_bound(self) -> None:
-        """B12: fallback scope filter reaches an in-scope violation listed past MAX_SCAN_FILES."""
+    def test_b7_committed_exclusion_at_pushed_ref(self) -> None:
+        """B7: committed renovate.json exclusion is honoured at pushed oid."""
+        self._base({"README.md": "x\n"})
         self._commit_paths(
             {
-                "docs/a.md": "a\n",
-                "docs/b.md": "b\n",
-                "docs/c.md": "c\n",
-                "scripts/ci/planted.sh": "echo x | head -1\n",
+                "renovate.json": MANAGED_EXCLUSION + "\n",
+                "scripts/ci/managed.sh": "echo x | head -1\n",
             }
         )
-        findings = shell_flake_policy.scan_pushed(
-            self.repo_root,
-            ["docs/a.md", "docs/b.md", "docs/c.md"],
-        )
-        self.assertTrue(any(f.rule == "early-exit-reader" for f in findings))
-        self.assertFalse(any(f.rule == "scan-limit" for f in findings))
+        self.assertEqual(self._push(), [])
 
-    @patch.object(shell_flake_policy, "MAX_SCAN_FILES", 2)
-    @patch.object(shell_flake_policy, "MAX_LISTED_PATHS", 3)
-    def test_n11_fallback_listing_bound(self) -> None:
-        """N11: raw git listing bound applies before scope filtering in fallback."""
+    def test_n8_uncommitted_exclusion_ignored(self) -> None:
+        """N8: uncommitted renovate.json exclusion does not affect push scan."""
+        self._base({"README.md": "x\n"})
+        self._commit_paths({"scripts/ci/managed.sh": "echo x | head -1\n"})
+        (self.repo_root / "renovate.json").write_text(
+            MANAGED_EXCLUSION, encoding="utf-8"
+        )
+        self.assertTrue(any(f.rule == "early-exit-reader" for f in self._push()))
+
+    def test_b8_non_ascii_path(self) -> None:
+        """B8: non-ASCII path names are reported with the committed path."""
+        self._base({"README.md": "x\n"})
+        path = "scripts/ci/caf\u00e9.sh"
+        self._commit_paths({path: "echo x | head -1\n"})
+        findings = self._push()
+        self.assertTrue(
+            any(f.rule == "early-exit-reader" and f.path == path for f in findings)
+        )
+
+    @unittest.skipIf(sys.platform == "win32", "Windows file names cannot contain a carriage return")
+    def test_b9_carriage_return_path(self) -> None:
+        """B9: paths containing a carriage return are scanned and reported."""
+        self._base({"README.md": "x\n"})
+        cr_path = "scripts/ci/a\rb.sh"
+        self._commit_paths({cr_path: "echo x | head -1\n"})
+        self.assertTrue(
+            any(f.rule == "early-exit-reader" and f.path == cr_path for f in self._push())
+        )
+
+    @unittest.skipIf(sys.platform == "win32", "Windows file names cannot contain a backslash")
+    def test_b10_posix_backslash_name(self) -> None:
+        """B10: POSIX backslash in a file name is kept in findings."""
+        self._base({"README.md": "x\n"})
+        bs_path = r"scripts/ci/a\b.sh"
+        self._commit_paths({bs_path: "echo x | head -1\n"})
+        self.assertTrue(
+            any(
+                f.rule == "early-exit-reader" and f.path == bs_path for f in self._push()
+            )
+        )
+
+    def test_n9_download_scope_backslash_fold(self) -> None:
+        """N9: policy_path fold affects download exclusion on POSIX vs Windows mode."""
+        praetor = {"scripts/ci/a/b.sh"}
+        with patch.object(shell_flake_policy, "WINDOWS_PATHS", False):
+            self.assertTrue(
+                shell_flake_policy.is_in_download_scope(r"scripts/ci/a\b.sh", praetor)
+            )
+        with patch.object(shell_flake_policy, "WINDOWS_PATHS", True):
+            self.assertFalse(
+                shell_flake_policy.is_in_download_scope(r"scripts/ci/a\b.sh", praetor)
+            )
+
+    @patch.object(shell_flake_policy, "MAX_SCAN_FILES", 1)
+    def test_b11_scan_bound(self) -> None:
+        """B11: in-scope file count over MAX_SCAN_FILES returns scan-limit."""
+        self._base({"README.md": "x\n"})
         self._commit_paths(
             {
-                "docs/a.md": "a\n",
-                "docs/b.md": "b\n",
-                "docs/c.md": "c\n",
-                "scripts/ci/clean.sh": "echo ok\n",
+                "scripts/ci/a.sh": "echo ok\n",
+                "scripts/ci/b.sh": "echo ok\n",
             }
         )
-        findings = shell_flake_policy.scan_pushed(
-            self.repo_root,
-            ["docs/a.md", "docs/b.md", "docs/c.md"],
+        findings = self._push()
+        self.assertTrue(
+            any(
+                f.rule == "scan-limit"
+                and "pushed in-scope file count exceeds scan limit 1" in f.message
+                for f in findings
+            )
         )
+
+    @patch.object(shell_flake_policy, "MAX_LISTED_PATHS", 1)
+    def test_n10_listing_bound(self) -> None:
+        """N10: raw diff listing bound returns scan-limit before scan."""
+        self._base({"README.md": "x\n"})
+        self._commit_paths(
+            {
+                "scripts/ci/a.sh": "echo ok\n",
+                "scripts/ci/b.sh": "echo ok\n",
+            }
+        )
+        findings = self._push()
         self.assertTrue(
             any(
                 f.rule == "scan-limit" and "listing exceeds scan limit" in f.message
@@ -448,264 +655,8 @@ class ShellFlakePolicyPushedTest(unittest.TestCase):
             )
         )
 
-    def test_n1_uncommitted_change_blocks_scan(self) -> None:
-        """N1: worktree drift against HEAD returns uncommitted-change without scan."""
-        self._commit_paths({"scripts/ci/clean.sh": "# clean\n"})
-        (self.repo_root / "scripts/ci/clean.sh").write_text(
-            "echo x | head -1\n", encoding="utf-8"
-        )
-        findings = shell_flake_policy.scan_pushed(
-            self.repo_root, ["scripts/ci/clean.sh"]
-        )
-        self.assertTrue(any(f.rule == "uncommitted-change" for f in findings))
-        self.assertFalse(any(f.rule == "early-exit-reader" for f in findings))
-
-    def test_n2_deleted_committed_path_skips(self) -> None:
-        """N2: deleted committed path produces no findings."""
-        self._commit_paths({"scripts/ci/planted.sh": "echo x | head -1\n"})
-        self._git("rm", "-q", "scripts/ci/planted.sh")
-        self._commit("remove")
-        findings = shell_flake_policy.scan_pushed(
-            self.repo_root, ["scripts/ci/planted.sh"]
-        )
-        self.assertEqual(findings, [])
-
-    @patch.object(shell_flake_policy, "MAX_SCAN_FILES", 2)
-    def test_n3_path_bound_falls_back_to_full_scan(self) -> None:
-        """N3: exceeding MAX_SCAN_FILES triggers bounded full-repository scan."""
-        self._commit_paths(
-            {
-                "scripts/ci/a.sh": "echo ok\n",
-                "scripts/ci/b.sh": "echo x | head -1\n",
-            }
-        )
-        findings = shell_flake_policy.scan_pushed(
-            self.repo_root,
-            ["scripts/ci/a.sh", "scripts/ci/b.sh", "scripts/ci/gone.sh"],
-        )
-        self.assertTrue(
-            any(
-                f.rule == "early-exit-reader" and f.path == "scripts/ci/b.sh"
-                for f in findings
-            )
-        )
-
-    @patch.object(shell_flake_policy, "MAX_SCAN_FILES", 2)
-    def test_n4_overbound_uncommitted_blocks_full_scan(self) -> None:
-        """N4: over-bound fallback checks worktree divergence before full scan."""
-        self._commit_paths(
-            {
-                "scripts/ci/a.sh": "echo ok\n",
-                "scripts/ci/b.sh": "echo x | head -1\n",
-            }
-        )
-        (self.repo_root / "scripts/ci/b.sh").write_text("echo ok\n", encoding="utf-8")
-        findings = shell_flake_policy.scan_pushed(
-            self.repo_root,
-            ["scripts/ci/a.sh", "scripts/ci/b.sh", "scripts/ci/gone.sh"],
-        )
-        self.assertEqual([f.rule for f in findings], ["uncommitted-change"])
-
-    def test_b4_out_of_scope_dirt_ignored_for_pushed_paths(self) -> None:
-        """B4: uncommitted out-of-scope files do not block in-bound pushed scan."""
-        self._commit_paths(
-            {
-                "scripts/ci/a.sh": "echo ok\n",
-                "internal/x.txt": "x\n",
-            }
-        )
-        (self.repo_root / "internal/x.txt").write_text("dirty\n", encoding="utf-8")
-        findings = shell_flake_policy.scan_pushed(
-            self.repo_root, ["scripts/ci/a.sh"]
-        )
-        self.assertEqual(findings, [])
-
-    def test_b5_staged_rename_source_blocks_scan(self) -> None:
-        """B5: staged rename leaves source path dirty and blocks scan."""
-        self._commit_paths({"scripts/ci/planted.sh": "echo x | head -1\n"})
-        self._git("mv", "scripts/ci/planted.sh", "scripts/ci/moved.sh")
-        findings = shell_flake_policy.scan_pushed(
-            self.repo_root, ["scripts/ci/planted.sh"]
-        )
-        self.assertEqual([f.rule for f in findings], ["uncommitted-change"])
-
-    @patch.object(shell_flake_policy, "MAX_SCAN_FILES", 2)
-    def test_n5_overbound_staged_deletion_blocks_full_scan(self) -> None:
-        """N5: over-bound fallback sees HEAD path after staged rm and blocks scan."""
-        self._commit_paths(
-            {
-                "scripts/ci/a.sh": "echo ok\n",
-                "scripts/ci/b.sh": "echo x | head -1\n",
-            }
-        )
-        self._git("rm", "-q", "scripts/ci/b.sh")
-        findings = shell_flake_policy.scan_pushed(
-            self.repo_root,
-            ["scripts/ci/a.sh", "scripts/ci/b.sh", "scripts/ci/gone.sh"],
-        )
-        self.assertEqual([f.rule for f in findings], ["uncommitted-change"])
-
-    @patch.object(shell_flake_policy, "MAX_SCAN_FILES", 2)
-    def test_n6_overbound_committed_deletion_skips(self) -> None:
-        """N6: over-bound fallback skips a committed deletion of a pushed path."""
-        self._commit_paths(
-            {
-                "scripts/ci/a.sh": "echo ok\n",
-                "scripts/ci/gone.sh": "echo x | head -1\n",
-            }
-        )
-        self._git("rm", "-q", "scripts/ci/gone.sh")
-        self._commit("remove")
-        findings = shell_flake_policy.scan_pushed(
-            self.repo_root,
-            ["scripts/ci/a.sh", "scripts/ci/b.sh", "scripts/ci/gone.sh"],
-        )
-        self.assertEqual(findings, [])
-
-    @patch.object(shell_flake_policy, "MAX_SCAN_FILES", 2)
-    def test_b6_overbound_candidate_union_bound(self) -> None:
-        """B6: union of index and HEAD divergence candidates enforces scan limit."""
-        self._commit_paths(
-            {
-                "scripts/ci/a.sh": "echo ok\n",
-                "scripts/ci/b.sh": "echo ok\n",
-            }
-        )
-        self._git("rm", "-q", "scripts/ci/b.sh")
-        target = self.repo_root / "scripts/ci/c.sh"
-        target.write_text("echo ok\n", encoding="utf-8")
-        self._git("add", "scripts/ci/c.sh")
-        findings = shell_flake_policy.scan_pushed(
-            self.repo_root,
-            ["scripts/ci/a.sh", "scripts/ci/b.sh", "scripts/ci/gone.sh"],
-        )
-        self.assertTrue(
-            any(
-                f.rule == "scan-limit" and "divergence candidate count" in f.message
-                for f in findings
-            )
-        )
-
-    @patch.object(shell_flake_policy, "MAX_SCAN_FILES", 2)
-    def test_b7_overbound_non_ascii_path_scanned(self) -> None:
-        """B7: over-bound fallback scans non-ASCII paths when core.quotePath quotes listings."""
-        self._git("config", "core.quotePath", "true")
-        self._commit_paths(
-            {
-                "scripts/ci/a.sh": "echo ok\n",
-                "scripts/ci/café.sh": "echo x | head -1\n",
-            }
-        )
-        findings = shell_flake_policy.scan_pushed(
-            self.repo_root,
-            ["scripts/ci/a.sh", "scripts/ci/café.sh", "scripts/ci/gone.sh"],
-        )
-        self.assertTrue(
-            any(
-                f.rule == "early-exit-reader" and f.path == "scripts/ci/café.sh"
-                for f in findings
-            )
-        )
-
-    @patch.object(shell_flake_policy, "MAX_SCAN_FILES", 2)
-    def test_n7_overbound_non_ascii_uncommitted_blocks_scan(self) -> None:
-        """N7: over-bound fallback detects divergence on non-ASCII pushed paths."""
-        self._git("config", "core.quotePath", "true")
-        self._commit_paths(
-            {
-                "scripts/ci/a.sh": "echo ok\n",
-                "scripts/ci/café.sh": "echo ok\n",
-            }
-        )
-        (self.repo_root / "scripts/ci/café.sh").write_text(
-            "echo x | head -1\n", encoding="utf-8"
-        )
-        findings = shell_flake_policy.scan_pushed(
-            self.repo_root,
-            ["scripts/ci/a.sh", "scripts/ci/café.sh", "scripts/ci/gone.sh"],
-        )
-        self.assertEqual([f.rule for f in findings], ["uncommitted-change"])
-
-    def test_n8_pushed_ignores_uncommitted_exclusion(self) -> None:
-        """N8: pushed scan ignores uncommitted renovate.json exclusions."""
-        self._commit_paths(
-            {
-                "renovate.json": '{"packageRules": []}\n',
-                "scripts/ci/planted.sh": "echo x | head -1\n",
-            }
-        )
-        (self.repo_root / "renovate.json").write_text(
-            PLANTED_EXCLUSION, encoding="utf-8"
-        )
-        findings = shell_flake_policy.scan_pushed(
-            self.repo_root, ["scripts/ci/planted.sh"]
-        )
-        self.assertTrue(any(f.rule == "early-exit-reader" for f in findings))
-
-    def test_b8_pushed_honours_committed_exclusion(self) -> None:
-        """B8: pushed scan honours committed renovate.json exclusions."""
-        self._commit_paths(
-            {
-                "renovate.json": PLANTED_EXCLUSION + "\n",
-                "scripts/ci/planted.sh": "echo x | head -1\n",
-            }
-        )
-        findings = shell_flake_policy.scan_pushed(
-            self.repo_root, ["scripts/ci/planted.sh"]
-        )
-        self.assertEqual(findings, [])
-
-    @patch.object(shell_flake_policy, "MAX_SCAN_FILES", 2)
-    def test_n9_overbound_ignores_uncommitted_exclusion(self) -> None:
-        """N9: over-bound fallback ignores uncommitted renovate.json exclusions."""
-        self._commit_paths(
-            {
-                "renovate.json": '{"packageRules": []}\n',
-                "scripts/ci/planted.sh": "echo x | head -1\n",
-            }
-        )
-        (self.repo_root / "renovate.json").write_text(PLANTED_EXCLUSION, encoding="utf-8")
-        findings = shell_flake_policy.scan_pushed(
-            self.repo_root,
-            ["renovate.json", "scripts/ci/planted.sh", "scripts/ci/gone.sh"],
-        )
-        self.assertTrue(
-            any(
-                f.rule == "early-exit-reader" and f.path == "scripts/ci/planted.sh"
-                for f in findings
-            )
-        )
-
-    @unittest.skipIf(sys.platform == "win32", "Windows file names cannot contain a carriage return")
-    @patch.object(shell_flake_policy, "MAX_SCAN_FILES", 2)
-    def test_b9_overbound_carriage_return_path_scanned(self) -> None:
-        """B9: over-bound fallback scans paths whose names contain a carriage return."""
-        cr_path = "scripts/ci/a\rb.sh"
-        self._commit_paths(
-            {
-                "scripts/ci/a.sh": "echo ok\n",
-                cr_path: "echo x | head -1\n",
-            }
-        )
-        findings = shell_flake_policy.scan_pushed(
-            self.repo_root,
-            ["scripts/ci/a.sh", cr_path, "scripts/ci/gone.sh"],
-        )
-        self.assertTrue(
-            any(f.rule == "early-exit-reader" and f.path == cr_path for f in findings)
-        )
-
-    @unittest.skipIf(sys.platform == "win32", "Windows file names cannot contain a carriage return")
-    def test_n10_pushed_carriage_return_uncommitted_blocks_scan(self) -> None:
-        """N10: uncommitted change on a carriage-return path returns uncommitted-change."""
-        cr_path = "scripts/ci/a\rb.sh"
-        self._commit_paths({cr_path: "echo ok\n"})
-        (self.repo_root / cr_path).write_text("echo x | head -1\n", encoding="utf-8")
-        findings = shell_flake_policy.scan_pushed(self.repo_root, [cr_path])
-        self.assertEqual([f.rule for f in findings], ["uncommitted-change"])
-
     def test_w1_lefthook_prepush_wiring(self) -> None:
-        """W1: lefthook pre-push runs shell_flake_policy.py --pushed on push_files."""
+        """W1: lefthook pre-push runs shell_flake_policy.py --pre-push on stdin."""
         lefthook = Path(__file__).resolve().parents[2] / "lefthook.yml"
         text = lefthook.read_text(encoding="utf-8")
         lines = text.splitlines()
@@ -719,29 +670,47 @@ class ShellFlakePolicyPushedTest(unittest.TestCase):
         self.assertIn("    shell-flake-policy:", section)
         expected = (
             "      run: sh .config/lefthook/python.sh -B scripts/ci/shell_flake_policy.py "
-            "--pushed {push_files}"
+            "--pre-push"
         )
         self.assertIn(expected, section)
+        job_lines = block[block.index("    shell-flake-policy:") + 1 :]
+        job_end = next(
+            (i for i, line in enumerate(job_lines) if line[4:5].strip() and not line[:4].strip()),
+            len(job_lines),
+        )
+        self.assertIn("      use_stdin: true", job_lines[:job_end])
 
     @patch.object(shell_flake_policy, "scan_repository")
-    def test_m1_main_dispatches_pushed_mode(self, mock_scan: MagicMock) -> None:
-        """M1: main() routes --pushed through scan_pushed and maps findings to exit code."""
+    def test_m1_main_dispatches_pre_push_mode(self, mock_scan: MagicMock) -> None:
+        """M1: main() routes --pre-push through scan_pre_push and maps exit codes."""
         finding = shell_flake_policy.Finding("a.sh", 1, "early-exit-reader", "x")
         repo = Path(__file__).resolve().parents[2]
-        argv = ["shell_flake_policy.py", "--pushed", "a.sh"]
+        argv = ["shell_flake_policy.py", "--pre-push"]
         out = io.StringIO()
         with (
-            patch.object(shell_flake_policy, "scan_pushed") as mock_pushed,
+            patch.object(shell_flake_policy, "scan_pre_push") as mock_pre,
             patch.object(sys, "argv", argv),
             contextlib.redirect_stdout(out),
         ):
-            mock_pushed.return_value = [finding]
+            mock_pre.return_value = [finding]
             self.assertEqual(shell_flake_policy.main(), 1)
-            mock_pushed.assert_called_with(repo, ["a.sh"])
-            mock_pushed.return_value = []
+            mock_pre.assert_called_with(repo, sys.stdin)
+            mock_pre.return_value = []
             self.assertEqual(shell_flake_policy.main(), 0)
         mock_scan.assert_not_called()
         self.assertEqual(out.getvalue(), "a.sh:1: early-exit-reader: x\n")
+
+    def test_m2_usage_errors(self) -> None:
+        """M2: removed --pushed and extra --pre-push args return exit code 3."""
+        cases = [
+            (["shell_flake_policy.py", "--pushed", "a.sh"], "unknown option"),
+            (["shell_flake_policy.py", "--pre-push", "x"], "takes no arguments"),
+        ]
+        for argv, needle in cases:
+            err = io.StringIO()
+            with patch.object(sys, "argv", argv), contextlib.redirect_stderr(err):
+                self.assertEqual(shell_flake_policy.main(), 3)
+            self.assertIn(needle, err.getvalue())
 
 
 if __name__ == "__main__":
