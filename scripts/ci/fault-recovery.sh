@@ -18,6 +18,9 @@ readonly MARKER=GOLUSORIS_RECOVERED_FAULT
 readonly TEST_TIMEOUT="${GO_TEST_TIMEOUT:-10m}"
 readonly TEST_PARALLELISM="${GO_TEST_PARALLELISM:-4}"
 readonly MAX_MODULES=64
+readonly MAX_FAIL_OUTPUT_LINES=20
+readonly MAX_FAILED_TESTS=40
+readonly MAX_TRACKED_TESTS=256
 readonly SCRATCH_BASES=("$REPO_ROOT/.workingdir/cache" /var/tmp)
 
 # Creates scratch outside /tmp, where pact-go's -L/tmp makes Go 1.27.4 reject copied GOROOT testdata.
@@ -87,21 +90,15 @@ open(path, "w", encoding="utf-8").write(text)
 PY
 }
 
+# Summarizes recovered faults or failed tests from a go test -json stream on stdin.
+summarize_events() {
+	python3 -I "$SCRIPT_DIR/go_test_events.py" \
+		"$1" "$MARKER" "$MAX_FAIL_OUTPUT_LINES" "$MAX_FAILED_TESTS" "$MAX_TRACKED_TESTS"
+}
+
 # Prints "package (seen in test)" for every marker line in the go test -json stream on stdin.
 report_faults() {
-	python3 -I -c '
-import json, sys
-marker, hits = sys.argv[1], set()
-for line in sys.stdin:
-    try:
-        event = json.loads(line)
-    except ValueError:
-        continue
-    if event.get("Action") == "output" and marker in event.get("Output", ""):
-        hits.add((event.get("Package", "?"), event.get("Test", "<package>")))
-for package, test in sorted(hits):
-    print(f"{package} (seen in {test})")
-' "$MARKER"
+	summarize_events faults
 }
 
 # Lists scoped modules or fails before GOROOT is copied.
@@ -143,7 +140,7 @@ run_modules() {
 
 # Runs module tests with the marked runtime and reports recovered faults.
 main() {
-	local listing tests_status=0 faults
+	local listing tests_status=0 faults failures
 	local -a modules=()
 	listing="$(select_scan_modules)" || return 1
 	mapfile -t modules <<<"$listing"
@@ -163,6 +160,12 @@ main() {
 		return 1
 	fi
 	if ((tests_status != 0)); then
+		failures="$(summarize_events failures <"$scratch/events.jsonl")"
+		printf '::group::fault-recovery failed tests\n' >&2
+		if [[ -n "$failures" ]]; then
+			printf '%s\n' "$failures" >&2
+		fi
+		printf '::endgroup::\n' >&2
 		printf '::error::short tests failed under the marked runtime\n' >&2
 		return 1
 	fi
