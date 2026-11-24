@@ -111,7 +111,7 @@ own evidence.
 | **praetor HISS-21 lattice** | `AGENTS.md` names each invariant and its repository gate; `praetorctl audit` and `make verify-all` run the declared checks | Engineering policy, not a certification |
 | **SLSA provenance model** | release workflows produce SBOMs, cosign signatures, and build-provenance attestations with `actions/attest-build-provenance` | No SLSA level or independent conformance is claimed |
 | **OWASP ASVS** | auth, input-validation, upload-safety, and HTTP-security modules provide reusable controls; CI runs gosec, govulncheck, Semgrep, and CodeQL | No ASVS verification or ZAP scan is bundled; applications own control mapping and dynamic testing |
-| **NIST SSDF / OpenSSF Scorecard** | reviewed changes, dependency automation, secret scanning, signed releases, and an on-demand/reusable Scorecard workflow | Scorecard is not automatic and does not establish SSDF conformance |
+| **NIST SSDF / OpenSSF Scorecard** | reviewed changes, dependency automation, secret scanning, signed releases, required Scorecard analysis on PRs, and OpenSSF publication on pushes to main and weekly ([ADR-0029](adr/0029-scorecard-publication-workflow.md)) | SSDF conformance requires a separate assessment |
 | **EU CRA and coordinated disclosure** | release SBOMs and `SECURITY.md` provide technical inputs for vulnerability handling | Product classification, reporting duties, and legal compliance remain with the distributor |
 | **NIS2, BSI, NCSC, ENISA, GDPR, EU AI Act** | framework modules can support app-specific controls such as structured logs, tenancy, audit events, secrets, and model access | No mappings or compliance guarantees ship. Logs do not automatically redact PII; AI modules do not provide prompt/output audit or human override |
 

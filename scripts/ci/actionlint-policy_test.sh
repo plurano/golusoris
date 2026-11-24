@@ -46,39 +46,39 @@ check_rebuild_trigger_contract() {
 	fi
 }
 
+check_yq() {
+	local bin="$1" version
+	if [[ ! -x "$bin" ]] || ! version="$("$bin" --version)" ||
+		[[ "$version" != "yq (https://github.com/mikefarah/yq/) version $YQ_VERSION" ]]; then
+		printf 'pinned yq %s is required (got %s); run make tools-bootstrap\n' \
+			"$YQ_VERSION" "${version:-unavailable}" >&2
+		return 1
+	fi
+}
+
 check_scorecard_policy_contract() {
-	local workflow="$1"
-	local ruleset="$2"
-	python3 - "$workflow" "$ruleset" <<'PY'
+	local workflow="$1" ruleset="$2"
+	"$yq_bin" -o=json '.' "$workflow" >"$suite_root/scorecard-analysis.json" || return
+	python3 - "$suite_root/scorecard-analysis.json" "$ruleset" <<'PY'
 import json
 import pathlib
-import re
 import sys
 
-workflow = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
-ruleset = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
-
-match = re.search(r"(?ms)^on:\n(?P<body>.*?)(?=^permissions:)", workflow)
-if match is None:
-    raise SystemExit("scorecard workflow lacks bounded on block")
-triggers = match.group("body")
-if re.search(r"(?m)^  pull_request:\n    branches: \[main\]$", triggers) is None:
+workflow, ruleset = (json.loads(pathlib.Path(p).read_text(encoding="utf-8")) for p in sys.argv[1:])
+events = workflow["on"]
+if (events.get("pull_request") or {}).get("branches") != ["main"]:
     raise SystemExit("scorecard workflow lacks pull_request main trigger")
-if re.search(r"(?m)^  push:\n    branches: \[main\]$", triggers) is None:
-    raise SystemExit("scorecard workflow lacks push main trigger")
-if re.search(r"(?m)^  schedule:$", triggers) is None:
-    raise SystemExit("scorecard workflow lacks schedule trigger")
-if "publish_results: ${{ github.event_name != 'pull_request' }}" not in workflow:
-    raise SystemExit("scorecard PR trigger lacks publish guard")
-
-job = re.search(
-    r"(?ms)^  analysis:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)", workflow
-)
-if job is None:
-    raise SystemExit("scorecard workflow lacks analysis job")
-name = re.search(r"(?m)^    name: (?P<name>[^\n]+)$", job.group("body"))
-if name is None or name.group("name") != "Scorecard Analysis":
+if set(events) != {"pull_request", "merge_group", "workflow_dispatch", "workflow_call"}:
+    raise SystemExit("scorecard analysis triggers changed")
+job = workflow["jobs"].get("analysis", {})
+if job.get("name") != "Scorecard Analysis":
     raise SystemExit("scorecard workflow must emit Scorecard Analysis")
+settings = [
+    step.get("with", {}).get("publish_results") for step in job["steps"]
+    if step.get("uses", "").partition("@")[0] == "ossf/scorecard-action"
+]
+if len(settings) != 1 or settings[0] is not False:
+    raise SystemExit("scorecard analysis must disable publication")
 
 contexts = []
 for rule in ruleset.get("rules", []):
@@ -89,6 +89,100 @@ for rule in ruleset.get("rules", []):
 if contexts.count("Scorecard Analysis") != 1:
     raise SystemExit("ruleset must require Scorecard Analysis exactly once")
 PY
+}
+
+check_scorecard_publish_contract() {
+	python3 - "$1" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+workflow = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+events = workflow["on"]
+if (set(events) != {"push", "schedule", "workflow_call", "workflow_dispatch"}
+        or events["push"] != {"branches": ["main"]}
+        or events["schedule"] != [{"cron": "15 6 * * 1"}]):
+    raise SystemExit("scorecard publish triggers must cover main, the weekly scan and both invocations")
+if workflow["permissions"] != {"contents": "read"}:
+    raise SystemExit("scorecard workflow permissions must be contents: read")
+if workflow.keys() - {"name", "run-name", "on", "permissions", "concurrency", "jobs"}:
+    raise SystemExit("scorecard publish workflow fields must exclude env and defaults")
+if len(workflow["jobs"]) != 1:
+    raise SystemExit("scorecard publish workflow must contain exactly one job")
+job = next(iter(workflow["jobs"].values()))
+if job.get("name") == "Scorecard Analysis":
+    raise SystemExit("scorecard publish job must not emit the required context")
+if job.keys() - {"name", "runs-on", "timeout-minutes", "permissions", "steps"}:
+    raise SystemExit("scorecard publish job fields must describe only the runner, permissions and steps")
+if job["runs-on"] != "ubuntu-26.04":
+    raise SystemExit("scorecard publish job must use the literal runner ubuntu-26.04")
+if job["permissions"] != {"contents": "read", "security-events": "write", "id-token": "write"}:
+    raise SystemExit("scorecard publish job permissions must allow signing and SARIF upload")
+
+required = {"actions/checkout", "ossf/scorecard-action", "actions/upload-artifact",
+            "github/codeql-action/upload-sarif"}
+allowed = required | {"step-security/harden-runner"}
+actions = []
+for step in job["steps"]:
+    if "run" in step or "uses" not in step:
+        raise SystemExit("scorecard publish steps must use actions")
+    action, _, ref = step["uses"].partition("@")
+    if action not in allowed:
+        raise SystemExit(f"scorecard publish job has unallowed action: {step['uses']}")
+    if not re.fullmatch(r"[0-9a-f]{40}", ref):
+        raise SystemExit(f"scorecard publish job must pin {action} to a full commit SHA: {step['uses']}")
+    actions.append(action)
+    inputs = step.get("with", {})
+    if action == "ossf/scorecard-action" and inputs.get("publish_results") is not True:
+        raise SystemExit("scorecard action must enable publication")
+    if action == "actions/checkout" and inputs.get("persist-credentials") is not False:
+        raise SystemExit("scorecard checkout must disable persisted credentials")
+if any(actions.count(action) != 1 for action in required):
+    raise SystemExit("scorecard publish job must run its four required actions once each")
+PY
+}
+
+reject_publish_change() {
+	local mutation="$1" diagnostic="$2"
+	local fixture="$suite_root/scorecard-publish-mutated.json"
+	"$yq_bin" -o=json "$mutation" "$publish_workflow" >"$fixture" || return
+	expect_failure_matching "$diagnostic" check_scorecard_publish_contract "$fixture" || {
+		printf 'Scorecard mutation: %s\n' "$mutation" >&2
+		return 1
+	}
+}
+
+test_scorecard_publish_contract() {
+	local publish_workflow="$repo_root/.github/workflows/scorecard-publish.yml"
+	"$yq_bin" -o=json '.' "$publish_workflow" >"$suite_root/scorecard-publish.json"
+	check_scorecard_publish_contract "$suite_root/scorecard-publish.json"
+	local failed=0 key draft_step ref
+	draft_step="$("$yq_bin" -o=json -I=0 '.jobs.analysis.steps[0]' "$repo_root/.github/workflows/scorecard.yml")"
+	reject_publish_change ".jobs[].steps += [$draft_step]" 'unallowed action' || failed=1
+	for ref in v7 3d3c42e5aac5ba805825da76410c181273ba90b 3D3C42E5AAC5BA805825DA76410C181273BA90B1 ''; do
+		reject_publish_change "(.jobs[].steps[] | select(.uses | test(\"^actions/checkout@\"))).uses = \"actions/checkout@$ref\"" \
+			'must pin actions/checkout to a full commit SHA' || failed=1
+	done
+	reject_publish_change '.jobs[].steps += [{"run": "echo notice"}]' 'steps must use actions' || failed=1
+	reject_publish_change 'del(.jobs[].steps[] | select(.uses | test("^actions/upload-artifact@")))' 'required actions' || failed=1
+	reject_publish_change '(.jobs[].steps[] | select(.with | has("persist-credentials"))).with.persist-credentials = true' 'checkout must disable' || failed=1
+	reject_publish_change '(.jobs[].steps[] | select(.with | has("publish_results"))).with.publish_results = false' 'must enable publication' || failed=1
+	reject_publish_change '.on.push.branches = ["other"]' 'publish triggers' || failed=1
+	reject_publish_change 'del(.on.schedule)' 'publish triggers' || failed=1
+	reject_publish_change '.on.pull_request = {}' 'publish triggers' || failed=1
+	reject_publish_change '.permissions.contents = "write"' 'workflow permissions' || failed=1
+	for key in env defaults; do
+		reject_publish_change ".$key = {}" 'workflow fields' || failed=1
+	done
+	for key in env defaults container services; do
+		reject_publish_change ".jobs[].$key = {}" 'job fields' || failed=1
+	done
+	reject_publish_change '.jobs.extra = .jobs.publish' 'exactly one job' || failed=1
+	reject_publish_change '.jobs[].name = "Scorecard Analysis"' 'required context' || failed=1
+	reject_publish_change '.jobs[].runs-on = ["ubuntu-26.04"]' 'literal runner' || failed=1
+	reject_publish_change 'del(.jobs[].permissions.id-token)' 'job permissions' || failed=1
+	(( failed == 0 ))
 }
 
 check_required_contexts_label_free() {
@@ -465,6 +559,22 @@ if [[ "${1:-}" == --ryuk-only ]]; then
 	exit 0
 fi
 
+# shellcheck source=tools/tool-versions.env
+. "$repo_root/tools/tool-versions.env"
+# shellcheck source=scripts/ci/lib/lint-tools.sh
+. "$repo_root/scripts/ci/lib/lint-tools.sh"
+yq_bin="$(locate_tool "${YQ_BIN:-}" yq)"
+readonly yq_bin
+check_yq "$yq_bin"
+
+cat >"$suite_root/yq-wrong" <<'EOF'
+#!/usr/bin/env bash
+printf 'yq (https://github.com/mikefarah/yq/) version v0.0.0\n'
+EOF
+chmod +x "$suite_root/yq-wrong"
+expect_failure_matching 'run make tools-bootstrap' check_yq "$suite_root/yq-wrong"
+expect_failure_matching 'run make tools-bootstrap' check_yq "$suite_root/yq-missing"
+
 clean_root="$(new_repo clean)"
 write_clean_workflow "$clean_root/.github/workflows/clean.yml"
 write_clean_workflow "$clean_root/.gitea/workflows/clean.yml"
@@ -542,6 +652,8 @@ expect_failure_matching 'must only expose workflow_call inputs' \
 check_scorecard_policy_contract "$repo_root/.github/workflows/scorecard.yml" \
 	"$repo_root/.github/rulesets/main.json"
 
+test_scorecard_publish_contract
+
 check_required_contexts_label_free "$repo_root/.github/rulesets/main.json"
 required_label_negative="$suite_root/ruleset-runner-label.json"
 python3 - "$repo_root/.github/rulesets/main.json" "$required_label_negative" <<'PY'
@@ -561,25 +673,20 @@ expect_failure_matching 'required context contains runner label' \
 	check_required_contexts_label_free "$required_label_negative"
 
 scorecard_pr_negative="$suite_root/scorecard-no-pr.yml"
-python3 - "$repo_root/.github/workflows/scorecard.yml" "$scorecard_pr_negative" <<'PY'
-import pathlib
-import re
-import sys
-
-source = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
-mutated, count = re.subn(
-    r"(?m)^  pull_request:\n    branches: \[main\]\n",
-    "",
-    source,
-    count=1,
-)
-if count != 1:
-    raise SystemExit("scorecard pull_request mutation failed")
-pathlib.Path(sys.argv[2]).write_text(mutated, encoding="utf-8")
-PY
+"$yq_bin" 'del(.on.pull_request)' "$repo_root/.github/workflows/scorecard.yml" >"$scorecard_pr_negative"
 expect_failure_matching 'scorecard workflow lacks pull_request main trigger' \
 	check_scorecard_policy_contract "$scorecard_pr_negative" \
 	"$repo_root/.github/rulesets/main.json"
+
+scorecard_push_negative="$suite_root/scorecard-analysis-push.yml"
+"$yq_bin" '.on.push = {"branches": ["main"]}' "$repo_root/.github/workflows/scorecard.yml" >"$scorecard_push_negative"
+expect_failure_matching 'scorecard analysis triggers changed' \
+	check_scorecard_policy_contract "$scorecard_push_negative" "$repo_root/.github/rulesets/main.json"
+
+scorecard_guard_negative="$suite_root/scorecard-analysis-publish.yml"
+sed 's/publish_results: false/publish_results: true/' "$repo_root/.github/workflows/scorecard.yml" >"$scorecard_guard_negative"
+expect_failure_matching 'scorecard analysis must disable publication' \
+	check_scorecard_policy_contract "$scorecard_guard_negative" "$repo_root/.github/rulesets/main.json"
 
 scorecard_name_negative="$suite_root/scorecard-renamed-job.yml"
 sed 's/^    name: Scorecard Analysis$/    name: Scorecard Security/' \
