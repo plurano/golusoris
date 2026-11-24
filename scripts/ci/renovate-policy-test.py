@@ -80,6 +80,7 @@ EXPECTED = {
     ("tools/tool-versions.env", "koalaman/shellcheck", "github-releases"),
     ("tools/tool-versions.env", "mstorsjo/llvm-mingw", "github-release-attachments"),
     ("tools/tool-versions.env", "github.com/rhysd/actionlint", "go"),
+    ("tools/tool-versions.env", "mvdan.cc/sh/v3", "go"),
     ("tools/tool-versions.env", "github.com/mikefarah/yq/v4", "go"),
     ("tools/tool-versions.env", "github.com/daveshanley/vacuum", "go"),
     ("tools/tool-versions.env", "docker/buildx", "github-releases"),

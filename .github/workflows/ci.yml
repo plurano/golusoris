@@ -215,6 +215,13 @@ jobs:
         uses: ./.github/actions/docker-hub-mirror
       - uses: ./.github/actions/setup-go
         if: env.CI_GATED != 'skip'
+      - name: Install pinned shfmt for the docstring policy suite
+        if: env.CI_GATED != 'skip'
+        run: |
+          set -euo pipefail
+          . tools/tool-versions.env
+          bash "$GITHUB_WORKSPACE/scripts/ci/retry.sh" go install "mvdan.cc/sh/v3/cmd/shfmt@${SHFMT_VERSION}"
+          test "$(shfmt --version)" = "${SHFMT_VERSION}"
       - name: Run repository Python regression suites
         if: env.CI_GATED != 'skip'
         run: bash scripts/ci/python-tests.sh

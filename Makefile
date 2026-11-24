@@ -104,6 +104,7 @@ tools-bootstrap: ## install repository-managed developer tools at exact versions
 	bash scripts/ci/retry.sh $(GO) install helm.sh/helm/v4/cmd/helm@$(HELM_VERSION)
 	bash scripts/ci/retry.sh $(GO) install github.com/bufbuild/buf/cmd/buf@$(BUF_VERSION)
 	bash scripts/ci/retry.sh $(GO) install github.com/rhysd/actionlint/cmd/actionlint@$(ACTIONLINT_VERSION)
+	bash scripts/ci/retry.sh $(GO) install mvdan.cc/sh/v3/cmd/shfmt@$(SHFMT_VERSION)
 	bash scripts/ci/retry.sh $(GO) install github.com/mikefarah/yq/v4@$(YQ_VERSION)
 
 .PHONY: lefthook-validate
