@@ -106,9 +106,12 @@ class DocstringCoveragePolicyTest(unittest.TestCase):
     """Exercise planted positive, boundary, negative, wiring, and self-check cases."""
 
     def setUp(self) -> None:
-        """Allocate one isolated git fixture per test."""
+        """Isolate git environment and allocate one git fixture per test."""
         self.fx = GitFixture()
         self.addCleanup(self.fx.close)
+        env_patch = patch.dict(os.environ, self.fx._env(), clear=True)
+        env_patch.start()
+        self.addCleanup(env_patch.stop)
 
     def findings(self, *paths: str, base: str = "origin/main") -> list[policy.Finding]:
         """Run the policy check API against the fixture repository."""
@@ -350,15 +353,25 @@ class DocstringCoveragePolicyTest(unittest.TestCase):
         self.assertEqual(len(self.findings("scripts/ci/x.sh")), 1)
 
     def test_b15_path_overflow_note(self) -> None:
-        """B15: overflow paths beyond MAX_FILES emit a truncation note on stderr."""
+        """B15: overflow paths beyond MAX_FILES fail closed; exact cap exits zero."""
         self.start_topic()
         self.fx.write("scripts/ci/a.py", "def f():\n    return 1\n")
         self.fx.write("scripts/ci/b.py", "def g():\n    return 1\n")
         self.fx.commit("topic")
-        with patch.object(policy, "MAX_FILES", 1):
+        with self.subTest(mode="pushed", cap=1), patch.object(policy, "MAX_FILES", 1):
             code, _, err = self.run_main(["--pushed", "scripts/ci/a.py", "scripts/ci/b.py"])
-        self.assertEqual(code, 0)
-        self.assertIn("1 paths not checked", err)
+            self.assertEqual(code, 3)
+            self.assertIn("1 paths not checked", err)
+        with self.subTest(mode="pushed", cap=2), patch.object(policy, "MAX_FILES", 2):
+            code, _, err = self.run_main(["--pushed", "scripts/ci/a.py", "scripts/ci/b.py"])
+            self.assertEqual(code, 0)
+            self.assertEqual(err, "")
+        oid = self.fx.rev_parse("topic")
+        stdin = f"refs/heads/topic {oid} refs/heads/topic {'0' * 40}\n"
+        with self.subTest(mode="pre-push", cap=1), patch.object(policy, "MAX_FILES", 1):
+            code, _, err = self.run_main(["--pre-push"], stdin=stdin)
+            self.assertEqual(code, 3)
+            self.assertIn("1 paths not checked", err)
 
     def test_b16_long_hunk_reaches_late_function(self) -> None:
         """B16: a function past line 16385 of one added hunk still counts as touched."""
@@ -372,7 +385,8 @@ class DocstringCoveragePolicyTest(unittest.TestCase):
     def test_b17_hunk_overflow_checks_every_function(self) -> None:
         """B17: past MAX_HUNKS every function counts as touched, never fewer."""
         body = "def {0}():\n    if True:\n        return 1\n    return 2\n"
-        base = body.format("f") + "x = 0\n" * 5 + body.format("g")
+        untouched = "def h():\n    if True:\n        return 4\n    return 5\n"
+        base = body.format("f") + "x = 0\n" * 5 + body.format("g") + "x = 0\n" * 5 + untouched
         self.fx.write("scripts/ci/x.py", base)
         self.fx.commit("base")
         self.fx.mark_origin()
@@ -380,9 +394,11 @@ class DocstringCoveragePolicyTest(unittest.TestCase):
         topic = base.replace("return 1", "return 3")
         self.fx.write("scripts/ci/x.py", topic)
         self.fx.commit("topic")
+        normal = self.findings("scripts/ci/x.py")
+        self.assertEqual(sorted(item.message.split()[1] for item in normal), ["f", "g"])
         with patch.object(policy, "MAX_HUNKS", 1):
             found = self.findings("scripts/ci/x.py")
-        self.assertEqual(sorted(item.message.split()[1] for item in found), ["f", "g"])
+        self.assertEqual(sorted(item.message.split()[1] for item in found), ["f", "g", "h"])
 
     def test_b18_long_span_late_touch(self) -> None:
         """B18: a touch past line 16385 of a long function counts as touched."""
@@ -540,9 +556,9 @@ class DocstringCoveragePolicyTest(unittest.TestCase):
 
     def test_n12_head_blob_read_failure_fails_closed(self) -> None:
         """N12: git show failure after ls-tree must exit 3, not skip the path."""
-        real = policy._run_git_text
+        real = policy._run_git_bytes
 
-        def boom(repo_root: Path, args: list[str]) -> str:
+        def boom(repo_root: Path, args: list[str]) -> bytes:
             """Fail git show; pass every other git call through."""
             if args and args[0] == "show":
                 raise subprocess.CalledProcessError(128, ["show"], "", "fatal: bad object")
@@ -551,7 +567,7 @@ class DocstringCoveragePolicyTest(unittest.TestCase):
         self.start_topic()
         self.fx.write("scripts/ci/x.py", "def f():\n    return 1\n")
         self.fx.commit("topic")
-        with patch.object(policy, "_run_git_text", side_effect=boom):
+        with patch.object(policy, "_run_git_bytes", side_effect=boom):
             code, _, err = self.run_main(["--pushed", "scripts/ci/x.py"])
         self.assertEqual(code, 3)
         self.assertIn("git show failed", err)
@@ -1138,9 +1154,10 @@ class DocstringCoveragePolicyTest(unittest.TestCase):
 
     def test_b63_brace_redirect_closer(self) -> None:
         """B63: a redirect after } still closes the function body on that line."""
-        text = "f() {\n  echo x\n} >out\n# doc\ng() {\n  if a; then b; fi\n}\n"
+        text = "f() {\n  if a; then b; fi\n} >out\n# doc\ng() {\n  if a; then b; fi\n}\n"
         self.assertEqual(policy.check_source("scripts/ci/x.sh", text, {6}), [])
-        self.assertEqual(policy.check_source("scripts/ci/x.sh", text, {2}), [])
+        found = policy.check_source("scripts/ci/x.sh", text, {2})
+        self.assertEqual([(item.line, item.rule) for item in found], [(1, "missing-docstring")])
 
     def test_b64_nested_group_same_indent(self) -> None:
         """B64: an inner brace group must not end the outer function early."""
@@ -1477,6 +1494,122 @@ class DocstringCoveragePolicyTest(unittest.TestCase):
         y_hits = [line for line in lines if line.startswith("scripts/ci/y.py:1:")]
         self.assertEqual(len(x_hits), 1)
         self.assertEqual(len(y_hits), 1)
+
+    def test_b83_shell_select_loop(self) -> None:
+        """B83: shell select loops count toward cyclomatic complexity unless documented."""
+        text = "f() {\n  select x in a b; do break; done\n}\n"
+        found = policy.check_source("scripts/ci/x.sh", text, {2})
+        self.assertEqual([(item.line, item.rule) for item in found], [(1, "missing-docstring")])
+        self.assertEqual(policy.check_source("scripts/ci/x.sh", "# doc\n" + text, {3}), [])
+
+    def test_b84_shell_detached_doc_comment(self) -> None:
+        """B84: inserting a blank line under a shell doc comment marks the function touched."""
+        base = "# Explain f\nf() {\n  if a; then b; fi\n}\n"
+        detached = "# Explain f\n\nf() {\n  if a; then b; fi\n}\n"
+        found = self.branch_fixture("scripts/ci/x.sh", base, detached)
+        self.assertEqual([(item.line, item.rule) for item in found], [(3, "missing-docstring")])
+        self.assertEqual(self.branch_fixture("scripts/ci/x.sh", base, "\n" + base), [])
+
+    def test_b85_symlink_entry_skipped(self) -> None:
+        """B85: committed symlinks to Python files are skipped rather than parsed as source."""
+        doc = 'def f(a):\n    """Doc."""\n    if a:\n        return 1\n    return 2\n'
+        self.start_topic()
+        self.fx.write("scripts/ci/x.py", doc)
+        alias = self.fx.root / "scripts/ci/alias.py"
+        rel_alias = self.fx.root / "scripts/ci/rel_alias.py"
+        try:
+            os.symlink("x.py", alias)
+            os.symlink("./x.py", rel_alias)
+        except OSError as exc:
+            self.skipTest(f"symlink creation unavailable: {exc}")
+        self.fx.commit("topic")
+        self.assertIsNone(policy.blob_text(self.fx.root, "HEAD", "scripts/ci/alias.py"))
+        self.assertEqual(
+            self.findings("scripts/ci/alias.py", "scripts/ci/rel_alias.py", "scripts/ci/x.py"),
+            [],
+        )
+
+    def test_b86_python_source_encodings(self) -> None:
+        """B86: committed Python blobs honor UTF-8 BOMs and PEP 263 coding cookies."""
+        bom_doc = (
+            b'\xef\xbb\xbfdef f(a):\n    """Doc."""\n'
+            b"    if a:\n        return 1\n    return 2\n"
+        )
+        bom_undoc = b"\xef\xbb\xbfdef f(a):\n    if a:\n        return 1\n    return 2\n"
+        latin1_doc = (
+            b'# -*- coding: latin-1 -*-\ndef f(a):\n    """Doc."""\n'
+            b'    if a:\n        return "caf\xe9"\n    return ""\n'
+        )
+        cases = (
+            ("bom-documented", b"", bom_doc, []),
+            ("bom-undocumented", b"", bom_undoc, [(1, "missing-docstring")]),
+            ("bom-base-deletion", bom_undoc + b"x = 1\n", bom_undoc, []),
+            ("latin1-documented", b"", latin1_doc, []),
+            (
+                "unknown-cookie",
+                b"",
+                b"# -*- coding: nope -*-\ndef f():\n    return 1\n",
+                [(1, "parse-error")],
+            ),
+        )
+        for label, base_raw, topic_raw, expected in cases:
+            with self.subTest(case=label):
+                fx = GitFixture()
+                self.addCleanup(fx.close)
+                if base_raw:
+                    fx.write_bytes("scripts/ci/x.py", base_raw)
+                else:
+                    fx.write(".gitkeep", "")
+                fx.commit("base")
+                fx.mark_origin()
+                fx.branch()
+                fx.write_bytes("scripts/ci/x.py", topic_raw)
+                fx.commit("topic")
+                base_sha = policy.merge_base_sha(fx.root, "refs/remotes/origin/main")
+                found = policy.check(fx.root, base_sha, ["scripts/ci/x.py"])
+                self.assertEqual([(item.line, item.rule) for item in found], expected)
+
+    def test_b87_diff_ignores_textconv(self) -> None:
+        """B87: textconv filters cannot hide edits below the converted prefix."""
+        self.fx._run(["config", "diff.first.textconv", "head -n 1"])
+        self.fx.write(".gitattributes", "*.py diff=first\n")
+        base = "# header\ndef f(a):\n    if a:\n        return 1\n    return 2\n"
+        self.fx.write("scripts/ci/x.py", base)
+        self.fx.commit("base")
+        self.fx.mark_origin()
+        self.fx.branch()
+        self.fx.write("scripts/ci/x.py", base.replace("return 1", "return 9"))
+        self.fx.commit("topic")
+        found = self.findings("scripts/ci/x.py")
+        self.assertEqual([(item.line, item.rule) for item in found], [(2, "missing-docstring")])
+
+    def test_b88_pre_push_literal_backslash_path(self) -> None:
+        """B88: pre-push preserves literal backslashes in Unix filenames."""
+        if os.name == "nt":
+            self.skipTest("literal backslash filenames require POSIX paths")
+        self.start_topic()
+        self.fx.write(
+            "tools\\demo.py",
+            "def f(a):\n    if a:\n        return 1\n    return 2\n",
+        )
+        self.fx.commit("topic")
+        oid = self.fx.rev_parse("topic")
+        stdin = f"refs/heads/topic {oid} refs/heads/topic {'0' * 40}\n"
+        code, out, _ = self.run_main(["--pre-push"], stdin=stdin)
+        self.assertEqual(code, 1)
+        self.assertIn("tools\\demo.py:1: missing-docstring", out)
+
+    def test_n21_git_timeout_exits_three(self) -> None:
+        """N21: git subprocess timeouts exit 3 with a short diagnostic and no traceback."""
+        self.start_topic()
+        self.fx.write("scripts/ci/x.py", "def f():\n    return 1\n")
+        self.fx.commit("topic")
+        timeout = subprocess.TimeoutExpired(["git", "diff"], 60)
+        with patch.object(policy, "diff_touched_lines", side_effect=timeout):
+            code, _, err = self.run_main(["--pushed", "scripts/ci/x.py"])
+        self.assertEqual(code, 3)
+        self.assertIn("git diff timed out", err)
+        self.assertNotIn("Traceback", err)
 
 
 if __name__ == "__main__":

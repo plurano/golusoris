@@ -6,12 +6,14 @@
 from __future__ import annotations
 
 import ast
+import io
 import itertools
 import json
 import os
 import re
 import subprocess  # Runs only fixed git and shfmt invocations below. # nosec B404
 import sys
+import tokenize
 from collections.abc import Iterable
 from pathlib import Path
 from typing import NamedTuple
@@ -72,12 +74,14 @@ def usage() -> None:
     print(msg, file=sys.stderr)
 
 
-def normalize_paths(raw: list[str]) -> tuple[list[str], int]:
+def normalize_paths(
+    raw: list[str], windows_input: bool = True
+) -> tuple[list[str], int]:
     """Keep deduped .py and .sh paths, returning overflow count beyond MAX_FILES."""
     kept: list[str] = []
     seen: set[str] = set()
     for item in raw[:MAX_RAW_PATHS]:
-        norm = item.replace("\\", "/")
+        norm = item.replace("\\", "/") if windows_input else item
         if not (norm.endswith(".py") or norm.endswith(".sh")):
             continue
         if norm in seen:
@@ -88,19 +92,24 @@ def normalize_paths(raw: list[str]) -> tuple[list[str], int]:
     return kept[:MAX_FILES], overflow
 
 
-def _run_git_text(repo_root: Path, args: list[str]) -> str:
-    """Run git in repo_root and return decoded stdout."""
+def _run_git_bytes(repo_root: Path, args: list[str]) -> bytes:
+    """Run git in repo_root and return raw stdout bytes."""
     proc = subprocess.run(  # noqa: S603 - fixed git argv, no shell. # nosec B603
         ["git", "-C", str(repo_root), "--literal-pathspecs", *args],  # noqa: S607 - git on PATH. # nosec B607
         capture_output=True,
         timeout=GIT_TIMEOUT_SECONDS,
         check=False,
     )
-    stdout = proc.stdout.decode("utf-8", "replace")
-    stderr = proc.stderr.decode("utf-8", "replace")
     if proc.returncode != 0:
+        stdout = proc.stdout.decode("utf-8", "replace")
+        stderr = proc.stderr.decode("utf-8", "replace")
         raise subprocess.CalledProcessError(proc.returncode, args, stdout, stderr)
-    return stdout
+    return proc.stdout
+
+
+def _run_git_text(repo_root: Path, args: list[str]) -> str:
+    """Run git in repo_root and return decoded stdout."""
+    return _run_git_bytes(repo_root, args).decode("utf-8", "replace")
 
 
 def merge_base_sha(repo_root: Path, base_ref: str, rev: str = "HEAD") -> str:
@@ -108,8 +117,8 @@ def merge_base_sha(repo_root: Path, base_ref: str, rev: str = "HEAD") -> str:
     return _run_git_text(repo_root, ["merge-base", base_ref, rev]).strip()
 
 
-def blob_text(repo_root: Path, rev: str, path: str) -> str | None:
-    """Return blob text at rev for path, or None when the path is absent."""
+def blob_bytes(repo_root: Path, rev: str, path: str) -> bytes | None:
+    """Return raw blob bytes at rev for a regular file path, or None when absent."""
     ls_out = _run_git_text(repo_root, ["ls-tree", "-z", rev, "--", path])
     if not ls_out:
         return None
@@ -120,9 +129,25 @@ def blob_text(repo_root: Path, rev: str, path: str) -> str | None:
     if not found:
         return None
     fields = meta.split()
-    if len(fields) < 2 or fields[1] != "blob":
+    if len(fields) < 2 or fields[0] == "120000" or fields[1] != "blob":
         return None
-    return _run_git_text(repo_root, ["show", f"{rev}:{path}"])
+    return _run_git_bytes(repo_root, ["show", f"{rev}:{path}"])
+
+
+def blob_text(repo_root: Path, rev: str, path: str) -> str | None:
+    """Return blob text at rev for path, or None when absent or a symlink."""
+    raw = blob_bytes(repo_root, rev, path)
+    if raw is None:
+        return None
+    return raw.decode("utf-8", "replace")
+
+
+def _decode_blob(path: str, raw: bytes) -> str:
+    """Decode committed blob bytes using PEP 263 rules for Python and UTF-8 for shell."""
+    if not path.endswith(".py"):
+        return raw.decode("utf-8", "replace")
+    encoding, _lines = tokenize.detect_encoding(io.BytesIO(raw).readline)
+    return raw.decode(encoding)
 
 
 def _parse_hunk_header(line: str) -> tuple[int, int, int, int] | None:
@@ -185,6 +210,7 @@ def diff_touched_lines(
             "--text",
             "--no-color",
             "--no-ext-diff",
+            "--no-textconv",
             base_sha,
             rev,
             "--",
@@ -328,10 +354,24 @@ def _range_intersects(span: tuple[int, int], lo: int, hi: int) -> bool:
 
 def _ranges_hit_span(span: tuple[int, int], ranges: list[tuple[int, int]]) -> bool:
     """Return whether any deletion range intersects span."""
-    for lo, hi in ranges:
+    for lo, hi in ranges[:MAX_HUNKS]:
         if _range_intersects(span, lo, hi):
             return True
     return False
+
+
+def _insertion_old_starts(hunks: list[tuple[int, int, int, int]]) -> list[int]:
+    """Return old_start positions for insertion-only hunks within MAX_HUNKS."""
+    return [
+        old_start
+        for old_start, old_count, _new_start, _new_count in hunks[:MAX_HUNKS]
+        if old_count == 0
+    ]
+
+
+def _shell_doc_detached(doc_start: int, def_line: int, insertions: list[int]) -> bool:
+    """Return whether any insertion hunk splits a base doc block from def_line."""
+    return any(doc_start <= old_start < def_line for old_start in insertions[:MAX_HUNKS])
 
 
 def _surviving_new_line(
@@ -364,13 +404,14 @@ def deleted_owner_lines(
     ranges: list[tuple[int, int]],
     hunks: list[tuple[int, int, int, int]],
 ) -> set[int] | None:
-    """Return new-side owner lines for base functions hit by old-side deletion ranges."""
-    if not ranges:
-        return set()
-    norm = path.replace("\\", "/")
-    if norm.endswith(".py"):
+    """Return new-side owner lines for base functions hit by deletions or doc splits."""
+    if path.endswith(".py"):
+        if not ranges:
+            return set()
         return _python_deleted_owner_lines(path, base, ranges, hunks)
-    if norm.endswith(".sh"):
+    if path.endswith(".sh"):
+        if not ranges and not _insertion_old_starts(hunks):
+            return set()
         return _shell_deleted_owner_lines(base, ranges, hunks)
     return set()
 
@@ -400,12 +441,26 @@ def _python_deleted_owner_lines(
     return owners
 
 
+def _shell_fn_hit_by_diff(
+    lines: list[str],
+    comments: set[int],
+    fn: ShellFunction,
+    ranges: list[tuple[int, int]],
+    insertions: list[int],
+) -> bool:
+    """Return whether deletion ranges or doc-detaching insertions hit fn."""
+    doc_start = _shell_doc_block_start(lines, comments, fn.start)
+    if _ranges_hit_span((doc_start, fn.end), ranges):
+        return True
+    return _shell_doc_detached(doc_start, fn.start, insertions)
+
+
 def _shell_deleted_owner_lines(
     base: str,
     ranges: list[tuple[int, int]],
     hunks: list[tuple[int, int, int, int]],
 ) -> set[int] | None:
-    """Collect new-side owner lines for shell functions intersecting deletion ranges."""
+    """Collect new-side owner lines for shell functions hit by deletions or doc splits."""
     lines = lf_lines(base)
     if len(lines) > MAX_SOURCE_LINES:
         return None
@@ -416,10 +471,10 @@ def _shell_deleted_owner_lines(
     if found is None:
         return None
     funcs, comments = found
+    insertions = _insertion_old_starts(hunks)
     owners: set[int] = set()
     for fn in funcs:
-        span = (_shell_doc_block_start(lines, comments, fn.start), fn.end)
-        if not _ranges_hit_span(span, ranges):
+        if not _shell_fn_hit_by_diff(lines, comments, fn, ranges, insertions):
             continue
         surv = _surviving_new_line((fn.start, fn.end), hunks)
         if surv is not None:
@@ -427,16 +482,32 @@ def _shell_deleted_owner_lines(
     return owners
 
 
+def _needs_base_owner_scan(path: str, diff: DiffTouch) -> bool:
+    """Return whether diff requires base-side function or doc-block attribution."""
+    if diff.deleted:
+        return True
+    return path.endswith(".sh") and bool(_insertion_old_starts(diff.hunks))
+
+
+def _decoded_base_owners(path: str, raw: bytes, diff: DiffTouch) -> set[int] | None:
+    """Decode raw base blob and compute owner lines, or None when unparseable."""
+    try:
+        base = _decode_blob(path, raw)
+    except (SyntaxError, LookupError, UnicodeDecodeError):
+        return None
+    return deleted_owner_lines(path, base, diff.deleted, diff.hunks)
+
+
 def deleted_owner_touch(
     repo_root: Path, base_sha: str, path: str, diff: DiffTouch
 ) -> set[int]:
-    """Map deletion-only hunks to surviving owner lines or anchor fallback lines."""
-    if not diff.deleted:
+    """Map deletion or doc-detaching hunks to surviving owner or anchor lines."""
+    if not _needs_base_owner_scan(path, diff):
         return set()
-    base = blob_text(repo_root, base_sha, path)
-    if base is None:
+    raw = blob_bytes(repo_root, base_sha, path)
+    if raw is None:
         return set()
-    owners = deleted_owner_lines(path, base, diff.deleted, diff.hunks)
+    owners = _decoded_base_owners(path, raw, diff)
     if owners is None:
         return set(diff.anchors)
     return owners
@@ -543,12 +614,10 @@ def parse_shell(source: str) -> ShellAst:
 
 def _shell_node_cost(node: dict[str, object], kind: object, key: str) -> int:
     """Return the cyclomatic complexity increment for one shell AST dict."""
-    if kind in {"IfClause", "WhileClause"}:
+    if kind in {"IfClause", "WhileClause", "ForClause"}:
         return 1
     if kind is None:
         return int(key == "Else" and bool(node.get("Cond")))
-    if kind == "ForClause":
-        return int(not node.get("Select"))
     if kind == "CaseClause":
         items = node.get("Items")
         return len(items) if isinstance(items, list) else 0
@@ -737,13 +806,26 @@ def check_source(path: str, text: str, touched: set[int] | None = None) -> list[
     return []
 
 
+def _read_blob_or_finding(
+    repo_root: Path, rev: str, path: str
+) -> tuple[str | None, list[Finding]]:
+    """Read and decode committed blob at rev, returning (text, encoding_findings)."""
+    raw = blob_bytes(repo_root, rev, path)
+    if raw is None:
+        return None, []
+    try:
+        return _decode_blob(path, raw), []
+    except (SyntaxError, LookupError, UnicodeDecodeError) as err:
+        return None, [Finding(path, 1, "parse-error", f"source encoding: {err}")]
+
+
 def check_path(
     repo_root: Path, base_sha: str, path: str, rev: str = "HEAD"
 ) -> list[Finding]:
     """Check one repository path using committed rev content and branch diff."""
-    blob = blob_text(repo_root, rev, path)
+    blob, enc_findings = _read_blob_or_finding(repo_root, rev, path)
     if blob is None:
-        return []
+        return enc_findings
     diff = diff_touched_lines(repo_root, base_sha, path, rev)
     if diff is None:
         return check_source(path, blob, None)
@@ -755,10 +837,14 @@ def check_path(
 
 
 def check(
-    repo_root: Path, base_sha: str, paths: list[str], rev: str = "HEAD"
+    repo_root: Path,
+    base_sha: str,
+    paths: list[str],
+    rev: str = "HEAD",
+    windows_input: bool = True,
 ) -> list[Finding]:
     """Check pushed paths against merge-base diff using committed rev blobs."""
-    norm_paths, _overflow = normalize_paths(paths)
+    norm_paths, _overflow = normalize_paths(paths, windows_input=windows_input)
     findings: list[Finding] = []
     for path in norm_paths:
         findings.extend(check_path(repo_root, base_sha, path, rev))
@@ -795,12 +881,32 @@ def parse_args(argv: list[str]) -> tuple[str, str, list[str]] | None:
     return None
 
 
+def _git_op_name(cmd: object) -> str:
+    """Extract the git subcommand name after any fixed invocation prefix."""
+    if not isinstance(cmd, (list, tuple)):
+        return "git"
+    parts = list(cmd[:6])
+    if parts[:1] == ["git"]:
+        parts = parts[1:]
+    if parts[:1] == ["-C"]:
+        parts = parts[2:]
+    if parts[:1] == ["--literal-pathspecs"]:
+        parts = parts[1:]
+    return str(parts[0]) if parts else "git"
+
+
 def _git_failure_stderr(exc: subprocess.CalledProcessError) -> str:
     """Format a short stderr tail for a failed git invocation."""
-    cmd = exc.cmd[0] if exc.cmd else "git"
+    cmd = _git_op_name(exc.cmd)
     stderr = exc.stderr or ""
     tail = stderr.strip().splitlines()[-1] if stderr.strip() else ""
     return f"docstring-coverage: git {cmd} failed: {tail}"
+
+
+def _git_timeout_stderr(exc: subprocess.TimeoutExpired) -> str:
+    """Format a short stderr diagnostic for a timed-out git invocation."""
+    op = _git_op_name(exc.cmd)
+    return f"docstring-coverage: git {op} timed out after {GIT_TIMEOUT_SECONDS}s"
 
 
 def _resolve_merge_base(repo: Path, base_ref: str, rev: str = "HEAD") -> str | None:
@@ -815,20 +921,25 @@ def _resolve_merge_base(repo: Path, base_ref: str, rev: str = "HEAD") -> str | N
         return None
 
 
-def _normalize_with_note(raw_paths: list[str]) -> list[str]:
-    """Normalize paths and print any truncation warning to stderr."""
-    paths, overflow = normalize_paths(raw_paths)
+def _normalize_with_note(
+    raw_paths: list[str], windows_input: bool = True
+) -> list[str] | None:
+    """Normalize paths; print an error and return None when truncated."""
+    paths, overflow = normalize_paths(raw_paths, windows_input=windows_input)
     if overflow:
         print(
-            f"docstring-coverage: path list truncated; {overflow} paths not checked",
+            f"docstring-coverage: path list truncated; {overflow} paths not checked; split the push",
             file=sys.stderr,
         )
+        return None
     return paths
 
 
 def _run_pushed(repo: Path, base_ref: str, raw_paths: list[str]) -> tuple[int, list[Finding]]:
     """Resolve HEAD merge-base and check explicit --pushed paths."""
     paths = _normalize_with_note(raw_paths)
+    if paths is None:
+        return 3, []
     if not paths:
         print("docstring-coverage: no pushed Python or shell files, skipping")
         return 0, []
@@ -853,13 +964,36 @@ def _run_pre_push(repo: Path, base_ref: str) -> tuple[int, list[Finding]]:
         base_sha = _resolve_merge_base(repo, base_ref, oid)
         if base_sha is None:
             return 3, []
-        paths = _normalize_with_note(pushed_paths(repo, base_sha, oid))
-        findings.extend(check(repo, base_sha, paths, oid))
+        paths = _normalize_with_note(
+            pushed_paths(repo, base_sha, oid), windows_input=False
+        )
+        if paths is None:
+            return 3, []
+        findings.extend(check(repo, base_sha, paths, oid, windows_input=False))
     unique = sorted(
         set(findings),
         key=lambda item: (item.path, item.line, item.rule, item.message),
     )
     return 0, unique
+
+
+def _run_mode(
+    repo: Path, base_ref: str, mode: str, raw_paths: list[str]
+) -> tuple[int, list[Finding]]:
+    """Dispatch --pre-push or --pushed execution inside the subprocess error boundary."""
+    try:
+        if mode == "pre-push":
+            return _run_pre_push(repo, base_ref)
+        return _run_pushed(repo, base_ref, raw_paths)
+    except subprocess.CalledProcessError as exc:
+        print(_git_failure_stderr(exc), file=sys.stderr)
+        return 3, []
+    except subprocess.TimeoutExpired as exc:
+        print(_git_timeout_stderr(exc), file=sys.stderr)
+        return 3, []
+    except ShellParserUnavailable as exc:
+        print(str(exc), file=sys.stderr)
+        return 3, []
 
 
 def main() -> int:
@@ -869,18 +1003,7 @@ def main() -> int:
         usage()
         return 3
     base_ref, mode, raw_paths = parsed
-    repo = policy_repo_root()
-    try:
-        if mode == "pre-push":
-            rc, findings = _run_pre_push(repo, base_ref)
-        else:
-            rc, findings = _run_pushed(repo, base_ref, raw_paths)
-    except subprocess.CalledProcessError as exc:
-        print(_git_failure_stderr(exc), file=sys.stderr)
-        return 3
-    except ShellParserUnavailable as exc:
-        print(str(exc), file=sys.stderr)
-        return 3
+    rc, findings = _run_mode(policy_repo_root(), base_ref, mode, raw_paths)
     if rc != 0:
         return rc
     emit(findings)
