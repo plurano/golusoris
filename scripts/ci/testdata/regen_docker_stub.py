@@ -42,6 +42,7 @@ class StubError(Exception):
     """Raised when CLI shape (exit 2) or package resolution (exit 1) fails."""
 
     def __init__(self, message: str, code: int) -> None:
+        """Record the failure message and process exit code on the error."""
         super().__init__(message)
         self.code = code
 
@@ -58,10 +59,12 @@ class CompileRequest(NamedTuple):
 
 
 def normalize_name(name: str) -> str:
+    """Return the canonical PEP 503 name for a Python distribution."""
     return re.sub(r"[-_.]+", "-", name).lower()
 
 
 def parse_timestamp(value: str) -> datetime:
+    """Return a parsed UTC timestamp or refuse malformed cutoff strings."""
     try:
         return datetime.strptime(value, CUTOFF_FORMAT)
     except ValueError as error:
@@ -69,6 +72,7 @@ def parse_timestamp(value: str) -> datetime:
 
 
 def parse_mount_src(mount: str) -> Path:
+    """Return the bind-mounted host directory for /src or refuse bad mounts."""
     parts = mount.split(",")
     if len(parts) > MAX_MOUNT_FIELDS:
         raise StubError("too many --mount fields", 2)
@@ -87,6 +91,7 @@ def parse_mount_src(mount: str) -> Path:
 
 
 def consume_run_option(args: list[str], idx: int) -> tuple[int, str | None]:
+    """Return the next argument index and mount spec, or refuse unknown flags."""
     arg = args[idx]
     if arg == "--rm":
         return idx + 1, None
@@ -96,6 +101,7 @@ def consume_run_option(args: list[str], idx: int) -> tuple[int, str | None]:
 
 
 def parse_run_segment(args: list[str]) -> tuple[str, list[str]]:
+    """Return the mount spec and inner command tail or refuse invalid run args."""
     if len(args) > MAX_ARGS or args[:1] != ["run"]:
         raise StubError("expected: docker run ... <image> uv pip compile ...", 2)
     mount = ""
@@ -116,6 +122,7 @@ def parse_run_segment(args: list[str]) -> tuple[str, list[str]]:
 def consume_compile_option(
     tail: list[str], idx: int, options: dict[str, str]
 ) -> int:
+    """Record one uv pip compile flag and return the next index, or refuse it."""
     arg = tail[idx]
     if arg in COMPILE_FLAGS:
         return idx + 1
@@ -126,6 +133,7 @@ def consume_compile_option(
 
 
 def parse_compile_segment(mount: str, tail: list[str]) -> CompileRequest:
+    """Return a validated CompileRequest or refuse incomplete compile flags."""
     if len(tail) > MAX_ARGS or tail[:3] != ["uv", "pip", "compile"]:
         raise StubError("expected uv pip compile after image", 2)
     options: dict[str, str] = {}
@@ -154,6 +162,7 @@ def parse_compile_segment(mount: str, tail: list[str]) -> CompileRequest:
 def parse_index_versions(
     versions: object,
 ) -> list[tuple[str, datetime, list[str]]]:
+    """Return parsed version-upload-dependency tuples or refuse bad entries."""
     if not isinstance(versions, list) or len(versions) > MAX_VERSIONS:
         raise StubError("invalid version list in REGEN_STUB_INDEX", 2)
     parsed: list[tuple[str, datetime, list[str]]] = []
@@ -174,6 +183,7 @@ def parse_index_versions(
 
 
 def load_index() -> dict[str, list[tuple[str, datetime, list[str]]]]:
+    """Return the stub package index from REGEN_STUB_INDEX or refuse bad JSON."""
     index_file = os.environ.get("REGEN_STUB_INDEX", "")
     if not index_file:
         raise StubError("REGEN_STUB_INDEX is not set", 2)
@@ -192,6 +202,7 @@ def load_index() -> dict[str, list[tuple[str, datetime, list[str]]]]:
 
 
 def safe_src_child(src_dir: Path, rel: str) -> Path:
+    """Return a child path under src_dir or refuse traversal and absolute paths."""
     rel_path = Path(rel)
     if rel_path.is_absolute() or rel_path.anchor or ".." in rel_path.parts:
         raise StubError(f"unsafe path {rel!r}", 2)
@@ -199,6 +210,7 @@ def safe_src_child(src_dir: Path, rel: str) -> Path:
 
 
 def read_direct_requirements(path: Path) -> list[tuple[str, str]]:
+    """Return exact requirement pins from path or refuse unpinned lines."""
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except OSError as error:
@@ -223,6 +235,7 @@ def find_direct_entry(
     cutoff: datetime,
     entries: list[tuple[str, datetime, list[str]]],
 ) -> list[str]:
+    """Return dependencies of a pinned release at or before cutoff, or refuse."""
     for i in range(min(len(entries), MAX_VERSIONS)):
         ver, uploaded, reqs = entries[i]
         if ver == version and uploaded <= cutoff:
@@ -235,6 +248,7 @@ def pick_transitive_version(
     cutoff: datetime,
     entries: list[tuple[str, datetime, list[str]]],
 ) -> str:
+    """Return the last version uploaded at or before cutoff, or refuse."""
     chosen: str | None = None
     for i in range(min(len(entries), MAX_VERSIONS)):
         ver, uploaded, _reqs = entries[i]
@@ -250,6 +264,7 @@ def resolve_packages(
     cutoff: datetime,
     index: dict[str, list[tuple[str, datetime, list[str]]]],
 ) -> dict[str, str]:
+    """Return resolved direct and first-hop transitive package versions."""
     resolved = dict(direct)
     transitive: dict[str, None] = {}
     for i in range(min(len(direct), MAX_LINES)):
@@ -268,12 +283,14 @@ def resolve_packages(
 
 
 def format_locked_package(name: str, version: str) -> str:
+    """Return a uv-formatted locked requirement stanza with a sha256 hash."""
     pin = f"{name}=={version}"
     digest = hashlib.sha256(pin.encode("utf-8")).hexdigest()
     return f"{pin} \\\n    --hash=sha256:{digest}\n"
 
 
 def write_lock_output(req: CompileRequest, resolved: dict[str, str]) -> None:
+    """Write the compiled lockfile header and hashed pins to the output path."""
     out_path = safe_src_child(req.src_dir, req.output_file)
     header = (
         "# This file was autogenerated by uv via the following command:\n"
@@ -291,6 +308,7 @@ def write_lock_output(req: CompileRequest, resolved: dict[str, str]) -> None:
 
 
 def main() -> int:
+    """Run the Docker uv pip compile stub and return its process exit code."""
     try:
         mount, tail = parse_run_segment(sys.argv[1:])
         req = parse_compile_segment(mount, tail)

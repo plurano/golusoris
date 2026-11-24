@@ -187,6 +187,7 @@ def upstream_paths(root: Path) -> list[str]:
 
 
 def get_generated_files(root: Path) -> list[str]:
+    """Return the sorted repository-relative paths of all generated files."""
     modules = discover_modules(root)
     paths: list[str] = []
     bound = min(len(modules), MAX_MODULES)
@@ -591,6 +592,7 @@ def regenerate_module_sums(
 
 
 def fetch_preset(url: str) -> bytes:
+    """Return raw Renovate preset bytes from GitHub or refuse invalid URLs."""
     if not url.startswith("https://raw.githubusercontent.com/"):
         raise CheckError(f"unexpected Renovate preset URL: {url}")
     try:
@@ -606,6 +608,7 @@ def fetch_preset(url: str) -> bytes:
 
 
 def load_json_object(data: bytes | str, source: str) -> dict[str, Any]:
+    """Return a parsed JSON object or refuse malformed or non-dict payloads."""
     try:
         parsed = json.loads(data)
     except ValueError as error:
@@ -616,6 +619,7 @@ def load_json_object(data: bytes | str, source: str) -> dict[str, Any]:
 
 
 def parse_release_age(value: object, source: str) -> timedelta:
+    """Return the minimumReleaseAge duration or refuse unsupported strings."""
     msg = (
         f"{source}: minimumReleaseAge {value!r} is not "
         "'<n> minutes|hours|days|weeks'"
@@ -635,6 +639,7 @@ def parse_release_age(value: object, source: str) -> timedelta:
 def preset_config(
     config: dict[str, Any], fetch: Callable[[str], bytes]
 ) -> tuple[dict[str, Any], str]:
+    """Return the extended preset defining minimumReleaseAge or raise CheckError."""
     extends = config.get("extends", [])
     if not isinstance(extends, list) or len(extends) > MAX_EXTENDS:
         raise CheckError(f"{RENOVATE_CONFIG}: invalid or oversized extends list")
@@ -656,6 +661,7 @@ def preset_config(
 
 
 def check_pypi_package_rule(rule: object, source: str, base: timedelta) -> None:
+    """Refuse a PyPI packageRule whose minimumReleaseAge differs from base."""
     if not isinstance(rule, dict) or "minimumReleaseAge" not in rule:
         return
     datasources = rule.get("matchDatasources")
@@ -671,6 +677,7 @@ def check_pypi_package_rule(rule: object, source: str, base: timedelta) -> None:
 def check_pypi_overrides(
     configs: list[tuple[dict[str, Any], str]], base: timedelta
 ) -> None:
+    """Refuse oversized packageRules lists or conflicting PyPI release ages."""
     for i in range(min(len(configs), MAX_EXTENDS)):
         cfg, source = configs[i]
         rules = cfg.get("packageRules", [])
@@ -683,6 +690,7 @@ def check_pypi_overrides(
 def renovate_min_release_age(
     root: Path, fetch: Callable[[str], bytes]
 ) -> timedelta:
+    """Return the validated PyPI minimumReleaseAge from Renovate config."""
     try:
         raw = (root / RENOVATE_CONFIG).read_text(encoding="utf-8")
     except (OSError, UnicodeError) as error:
@@ -700,10 +708,12 @@ def renovate_min_release_age(
 
 
 def normalize_name(name: str) -> str:
+    """Return the PEP 503 canonical lowercase hyphenated package name."""
     return re.sub(r"[-_.]+", "-", name).lower()
 
 
 def direct_pins(text: str, source: str) -> dict[str, str]:
+    """Return normalized exact requirement pins or refuse unpinned entries."""
     lines = text.splitlines()
     if len(lines) > MAX_REQUIREMENT_LINES:
         raise CheckError(f"{source} exceeds {MAX_REQUIREMENT_LINES} lines")
@@ -721,6 +731,7 @@ def direct_pins(text: str, source: str) -> dict[str, str]:
 
 
 def lock_pins(text: str, source: str) -> dict[str, str]:
+    """Return locked package versions by name or refuse oversized lockfiles."""
     lines = text.splitlines()
     if len(lines) > MAX_LOCK_LINES:
         raise CheckError(f"{source} exceeds {MAX_LOCK_LINES} lines")
@@ -733,6 +744,7 @@ def lock_pins(text: str, source: str) -> dict[str, str]:
 
 
 def parse_context_row(line: str) -> tuple[str, str, str, str]:
+    """Return a validated lock-context tuple or refuse malformed rows."""
     match = CONTEXT_ROW.fullmatch(line)
     if match is None:
         raise CheckError(f"invalid lock context row: {line!r}")
@@ -754,6 +766,7 @@ def parse_context_row(line: str) -> tuple[str, str, str, str]:
 def lock_contexts(
     root: Path, env: dict[str, str] | None
 ) -> tuple[list[tuple[str, str, str, str]], list[str]]:
+    """Return parsed trainer lock contexts and the discovery command."""
     cmd = ["bash", TRAINER_LOCK_SCRIPT, "--contexts"]
     stdout = run_update_command(cmd, root, DEFAULT_TIMEOUT_SECONDS, env)
     lines = [line for line in stdout.splitlines() if line]
@@ -767,6 +780,7 @@ def lock_contexts(
 
 
 def read_repo_text(root: Path, rel_path: str) -> str:
+    """Return UTF-8 file contents under root or refuse unreadable paths."""
     try:
         return (root / rel_path).read_text(encoding="utf-8")
     except (OSError, UnicodeError) as error:
@@ -774,6 +788,7 @@ def read_repo_text(root: Path, rel_path: str) -> str:
 
 
 def context_stale(root: Path, row: tuple[str, str, str, str]) -> bool:
+    """Return True when any direct pin disagrees with its compiled lockfile."""
     var, lock, kind, source = row
     if kind == "file":
         pins = direct_pins(read_repo_text(root, source), source)
@@ -789,6 +804,7 @@ def context_stale(root: Path, row: tuple[str, str, str, str]) -> bool:
 
 
 def parse_cutoff(value: str, label: str) -> datetime:
+    """Return a parsed UTC cutoff timestamp or refuse malformed values."""
     if CUTOFF_VALUE.fullmatch(value) is None:
         raise CheckError(f"{label}: invalid cutoff {value!r}")
     try:
@@ -798,6 +814,7 @@ def parse_cutoff(value: str, label: str) -> datetime:
 
 
 def move_cutoffs(text: str, names: list[str], cutoff: str) -> str:
+    """Return script text with named lock cutoffs advanced when newer."""
     cutoff_dt = parse_cutoff(cutoff, "cutoff")
     for i in range(min(len(names), MAX_LOCK_CONTEXTS)):
         name = names[i]
@@ -821,6 +838,7 @@ def move_cutoffs(text: str, names: list[str], cutoff: str) -> str:
 def regenerate_trainer_locks(
     root: Path, hooks: LockHooks | None = None
 ) -> list[list[str]]:
+    """Re-lock stale trainer contexts and return the executed commands."""
     script_path = root / TRAINER_LOCK_SCRIPT
     if not script_path.is_file():
         return []
@@ -924,6 +942,7 @@ def write_regenerated(
     module_env: dict[str, str] | None = None,
     lock_hooks: LockHooks | None = None,
 ) -> tuple[list[str], str | None]:
+    """Run regeneration steps, stage artifacts, and return failures or status."""
     head = run_git(["rev-parse", "HEAD"], root).strip()
     if len(head) != 40 or not all(c in "0123456789abcdefABCDEF" for c in head):
         raise CheckError(f"git rev-parse HEAD returned invalid commit: {head!r}")
@@ -1510,6 +1529,7 @@ def run_module_sum_cases(repo: Path, temp_dir: Path) -> tuple[list[str], int, in
 
 
 def write_trainer_target_fixtures(repo: Path) -> None:
+    """Write minimal trainer Dockerfiles, requirements, and Renovate config."""
     dockerfile_text = (
         f'ARG PYTHON_IMAGE="python:3.11.16-slim-bookworm@sha256:{"0" * 64}"\n'
         "FROM ${PYTHON_IMAGE}\n"
@@ -1536,6 +1556,7 @@ def write_trainer_target_fixtures(repo: Path) -> None:
 def build_trainer_lock_hooks(
     temp_dir: Path, source_root: Path, pip_audit_version: str
 ) -> LockHooks:
+    """Return offline LockHooks wired to the local Docker compile stub."""
     index_path = temp_dir / "stub-index.json"
     index_data = {
         "pkg-a": [
@@ -1567,6 +1588,7 @@ def build_trainer_lock_hooks(
     preset_url = "https://raw.githubusercontent.com/example/preset/HEAD/default.json"
 
     def fake_fetch(url: str) -> bytes:
+        """Return the canned Renovate preset JSON or refuse unknown URLs."""
         if url == preset_url:
             return b'{"minimumReleaseAge": "3 days"}'
         raise CheckError(f"unexpected preset URL: {url}")
@@ -1577,6 +1599,7 @@ def build_trainer_lock_hooks(
 def setup_trainer_lock_fixture(
     repo: Path, temp_dir: Path, source_root: Path
 ) -> tuple[list[str], LockHooks | None]:
+    """Commit initial trainer locks and return any setup failures with hooks."""
     repo_script = repo / TRAINER_LOCK_SCRIPT
     repo_script.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source_root / TRAINER_LOCK_SCRIPT, repo_script)
@@ -1605,6 +1628,7 @@ def setup_trainer_lock_fixture(
 
 
 def verify_renovate_shape_files(out: Path) -> list[str]:
+    """Return verification failures for regenerated Renovate-bump artifacts."""
     failures: list[str] = []
     copied_script = out / "files" / TRAINER_LOCK_SCRIPT
     expected_cutoffs = (
@@ -1633,13 +1657,16 @@ def verify_renovate_shape_files(out: Path) -> list[str]:
         "ai/tiny/serve/tflite/sidecar/requirements.lock",
         "scripts/ci/tiny-trainer-pip-audit.lock",
     )
-    for rel in unchanged:
-        if (out / "files" / rel).exists():
-            failures.append(f"case renovate-shape: unchanged lock written: {rel}")
+    failures.extend(
+        f"case renovate-shape: unchanged lock written: {rel}"
+        for rel in unchanged
+        if (out / "files" / rel).exists()
+    )
     return failures
 
 
 def verify_young_transitive(out: Path) -> tuple[list[str], int]:
+    """Return failures and accepted count for transitive release-age filtering."""
     gemma_lock = out / "files" / "ai/tiny/trainers/gemma/requirements.lock"
     lines = (
         set(gemma_lock.read_text(encoding="utf-8").splitlines())
@@ -1655,6 +1682,7 @@ def verify_young_transitive(out: Path) -> tuple[list[str], int]:
 def run_trainer_lock_repo_cases(
     repo: Path, temp_dir: Path, source_root: Path
 ) -> tuple[list[str], int]:
+    """Return failures and accepted count for trainer lock regeneration cases."""
     reset_fixture_repo(repo)
     original_head = run_git(["rev-parse", "HEAD"], repo).strip()
     accepted = 0
@@ -1689,10 +1717,14 @@ def run_trainer_lock_repo_cases(
 
 
 def run_release_age_refusal_cases(temp_dir: Path) -> tuple[list[str], int]:
+    """Return failures and refused count for invalid release-age inputs."""
+
     def fail_fetch(url: str) -> bytes:
+        """Refuse every preset fetch attempt with CheckError."""
         raise CheckError(f"fetch failed: {url}")
 
     def empty_fetch(_url: str) -> bytes:
+        """Return an empty JSON object preset body."""
         return b"{}"
 
     cases: tuple[tuple[str, dict[str, Any] | None, Callable[[str], bytes]], ...] = (
@@ -1743,11 +1775,13 @@ def run_release_age_refusal_cases(temp_dir: Path) -> tuple[list[str], int]:
 
 
 def run_release_age_accepted_cases(temp_dir: Path) -> tuple[list[str], int]:
+    """Return failures and accepted count for valid release-age configs."""
     failures: list[str] = []
     accepted = 0
     fetched = False
 
     def preset_three_days(_url: str) -> bytes:
+        """Record a preset fetch and return a three-day minimumReleaseAge."""
         nonlocal fetched
         fetched = True
         return b'{"minimumReleaseAge": "3 days"}'
@@ -1780,6 +1814,7 @@ def run_release_age_accepted_cases(temp_dir: Path) -> tuple[list[str], int]:
 def run_trainer_lock_cases(
     repo: Path, temp_dir: Path, source_root: Path | None = None
 ) -> tuple[list[str], int, int]:
+    """Return combined failures, refusals, and acceptances for trainer locks."""
     actual_root = (
         source_root
         if source_root is not None
@@ -1972,6 +2007,7 @@ def run_declared_cases(repo: Path, generated: list[str]) -> tuple[list[str], int
 
 
 def selftest(root: Path | None = None) -> tuple[list[str], int, int]:
+    """Run all fixture selftests and return failures, refusals, and acceptances."""
     if root is None:
         root = Path(__file__).resolve().parents[2]
     with tempfile.TemporaryDirectory(

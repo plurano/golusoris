@@ -158,6 +158,15 @@ extract_dockerfile_python_version() {
 	printf '%s\n' "$version"
 }
 
+# Return 0 when the mode flag names a supported subcommand, or 1 otherwise.
+lock_mode_valid() {
+	case "$1" in
+		--check | --write | --audit | --contexts) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+# Print tab-separated cutoff variable, lockfile, and input source rows.
 print_lock_contexts() {
 	local index
 	for index in "${!LOCK_TARGETS[@]}"; do
@@ -172,9 +181,10 @@ print_lock_contexts() {
 		"pin:pip-audit==$PIP_AUDIT_VERSION"
 }
 
+# Validate the CLI mode and check, write, audit, or list lock contexts.
 main() {
 	local mode="${1:---check}"
-	if [[ "$mode" != --check && "$mode" != --write && "$mode" != --audit && "$mode" != --contexts ]]; then
+	if ! lock_mode_valid "$mode"; then
 		printf 'usage: %s [--check|--write|--audit|--contexts]\n' "${0##*/}" >&2
 		return 2
 	fi
