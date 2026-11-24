@@ -7,11 +7,11 @@ from __future__ import annotations
 
 import json
 import re
-import subprocess  # Runs only the fixed git ls-files command below. # nosec B404
+import subprocess  # Runs only fixed git commands without a shell. # nosec B404
 import sys
 from fnmatch import fnmatch
 from pathlib import Path
-from typing import NamedTuple
+from typing import NamedTuple, TextIO
 
 BARE_DOWNLOAD_RE = re.compile(
     r"(?:^|[;&|({]|(?:\$\()|\b(?:then|do|run:))\s*"
@@ -36,7 +36,14 @@ EXCLUDED_EXACT = {
 
 YAML_BLOCK_SCALAR_RE = re.compile(r"^\s*(?:-\s+)?(?:[a-zA-Z0-9_-]+:\s*)?[|>][-+0-9]*\s*$")
 MAX_SCAN_FILES = 20000
+MAX_LISTED_PATHS = 1_000_000  # Scalar bound on one raw git listing before scope filtering.
 MAX_FILE_LINES = 10000
+MAX_PUSH_REFS = 4096  # Matches merge-comments.sh max_refs.
+# Finding rules indicating the scan itself failed and must exit with code 3.
+OPERATIONAL_RULES = frozenset({"git-error", "pre-push-input", "read-error"})
+OID_RE = re.compile(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}")
+# Git and lefthook give "/" paths; only Windows argv may carry "\" separators.
+WINDOWS_PATHS = sys.platform == "win32"
 
 
 class Finding(NamedTuple):
@@ -48,14 +55,11 @@ class Finding(NamedTuple):
     message: str
 
 
-def get_praetor_files(repo_root: Path) -> set[str]:
-    """Read praetor-managed files from renovate.json packageRules."""
-    renovate_path = repo_root / "renovate.json"
-    if not renovate_path.is_file():
-        return set()
+def parse_praetor_files(text: str) -> set[str]:
+    """Extract praetor-managed paths from renovate.json packageRules JSON."""
     try:
-        data = json.loads(renovate_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
+        data = json.loads(text)
+    except json.JSONDecodeError:
         return set()
     praetor_paths: set[str] = set()
     for rule in data.get("packageRules", [])[:64]:
@@ -65,17 +69,50 @@ def get_praetor_files(repo_root: Path) -> set[str]:
     return praetor_paths
 
 
+def get_praetor_files(repo_root: Path) -> set[str]:
+    """Read praetor-managed files from worktree renovate.json packageRules."""
+    renovate_path = repo_root / "renovate.json"
+    if not renovate_path.is_file():
+        return set()
+    try:
+        text = renovate_path.read_text(encoding="utf-8")
+    except OSError:
+        return set()
+    return parse_praetor_files(text)
+
+
+def policy_path(path_str: str) -> str:
+    """Normalize path separators for policy matching when WINDOWS_PATHS is set."""
+    return path_str.replace("\\", "/") if WINDOWS_PATHS else path_str
+
+
+def get_committed_praetor_files(repo_root: Path, rev: str = "HEAD") -> set[str]:
+    """Read praetor-managed files from the given commit renovate.json packageRules."""
+    try:
+        out = subprocess.check_output(  # noqa: S603 - fixed git command without shell. # nosec B603
+            ["git", "-C", str(repo_root), "show", f"{rev}:renovate.json"],  # noqa: S607 - git executable on runner PATH. # nosec B607
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stderr=subprocess.DEVNULL,
+            timeout=60,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return set()
+    return parse_praetor_files(out)
+
+
 def is_in_repo_scope(path_str: str, praetor_files: set[str]) -> bool:
     """Check if a file path belongs to the general lint scope."""
-    if path_str in praetor_files or path_str in EXCLUDED_EXACT:
+    normalized = policy_path(path_str)
+    if normalized in praetor_files or normalized in EXCLUDED_EXACT:
         return False
-    normalized = path_str.replace("\\", "/")
     return any(fnmatch(normalized, pat) for pat in SCOPE_PATTERNS)
 
 
 def is_in_download_scope(path_str: str, praetor_files: set[str]) -> bool:
     """Check if a file path belongs to the bare module download check."""
-    normalized = path_str.replace("\\", "/")
+    normalized = policy_path(path_str)
     if normalized == "Makefile":
         return True
     if normalized.endswith(("_test.sh", "_test.py")) or "-test.py" in normalized:
@@ -331,17 +368,8 @@ def check_bare_module_download(path: str, raw_lines: list[str]) -> list[Finding]
     return findings
 
 
-def scan_file(
-    path_str: str, check_download: bool, root: Path | None = None
-) -> list[Finding]:
-    """Run applicable rules on one file path."""
-    target = root / path_str if root is not None else Path(path_str)
-    if not target.is_file():
-        return []
-    try:
-        raw_lines = target.read_text(encoding="utf-8", errors="ignore").splitlines()
-    except OSError as err:
-        return [Finding(path_str, 0, "read-error", f"cannot read file: {err}")]
+def scan_lines(path_str: str, raw_lines: list[str], check_download: bool) -> list[Finding]:
+    """Apply scan limits and content rules to already-read file lines."""
     findings: list[Finding] = []
     if len(raw_lines) > MAX_FILE_LINES:
         findings.append(
@@ -358,18 +386,51 @@ def scan_file(
     return findings
 
 
-def collect_repo_files(repo_root: Path) -> tuple[list[str], list[Finding]]:
-    """Collect tracked files via git ls-files."""
+def scan_file(
+    path_str: str, check_download: bool, root: Path | None = None
+) -> list[Finding]:
+    """Run applicable rules on one file path."""
+    target = root / path_str if root is not None else Path(path_str)
+    if not target.is_file():
+        return []
+    try:
+        raw_lines = target.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError as err:
+        return [Finding(path_str, 0, "read-error", f"cannot read file: {err}")]
+    return scan_lines(path_str, raw_lines, check_download)
+
+
+def split_nul_paths(raw: bytes) -> list[str]:
+    """Decode NUL-separated git path bytes; text mode would rewrite embedded carriage returns."""
+    return [entry.decode("utf-8", "surrogateescape") for entry in raw.split(b"\0") if entry]
+
+
+def list_git_paths(repo_root: Path, argv: list[str]) -> tuple[list[str], list[Finding]]:
+    """List paths from a fixed git file-listing command with a raw listing bound."""
     try:
         res = subprocess.check_output(  # noqa: S603 - fixed git command without shell. # nosec B603
-            ["git", "-C", str(repo_root), "ls-files"],  # noqa: S607 - git executable on runner PATH. # nosec B607
-            text=True,
+            ["git", "-C", str(repo_root), argv[0], "-z", *argv[1:]],  # noqa: S607 - git executable on runner PATH. # nosec B607
             timeout=60,
         )
     except (subprocess.SubprocessError, OSError) as err:
-        return [], [Finding(".", 0, "scan-limit", f"git ls-files failed: {err}")]
-    all_files = res.splitlines()
+        return [], [Finding(".", 0, "git-error", f"git {argv[0]} failed: {err}")]
+    paths = split_nul_paths(res)
     findings: list[Finding] = []
+    if len(paths) > MAX_LISTED_PATHS:
+        findings.append(
+            Finding(
+                ".",
+                0,
+                "scan-limit",
+                f"git {argv[0]} listing exceeds scan limit {MAX_LISTED_PATHS}: {len(paths)}",
+            )
+        )
+    return paths[:MAX_LISTED_PATHS], findings
+
+
+def collect_git_files(repo_root: Path, argv: list[str]) -> tuple[list[str], list[Finding]]:
+    """Run a fixed git file-listing command and return paths with scan-limit findings."""
+    all_files, findings = list_git_paths(repo_root, argv)
     if len(all_files) > MAX_SCAN_FILES:
         findings.append(
             Finding(
@@ -382,11 +443,16 @@ def collect_repo_files(repo_root: Path) -> tuple[list[str], list[Finding]]:
     return all_files[:MAX_SCAN_FILES], findings
 
 
+def collect_repo_files(repo_root: Path) -> tuple[list[str], list[Finding]]:
+    """Collect tracked files via git ls-files."""
+    return collect_git_files(repo_root, ["ls-files"])
+
+
 def scan_arguments(args: list[str]) -> list[Finding]:
     """Scan explicitly provided file paths."""
     findings: list[Finding] = []
     for arg in args:
-        norm = arg.replace("\\", "/")
+        norm = policy_path(arg)
         dl_scope = (
             not norm.endswith(("_test.sh", "_test.py"))
             and "-test.py" not in norm
@@ -396,22 +462,218 @@ def scan_arguments(args: list[str]) -> list[Finding]:
     return findings
 
 
-def scan_repository(repo_root: Path, praetor_files: set[str]) -> list[Finding]:
-    """Scan all in-scope repository files."""
+def select_repository_files(
+    repo_root: Path, praetor: set[str]
+) -> tuple[list[str], list[Finding]]:
+    """Return in-scope tracked paths and any collection findings."""
     files, findings = collect_repo_files(repo_root)
-    for rel in files:
-        reader_ok = is_in_repo_scope(rel, praetor_files)
-        dl_ok = is_in_download_scope(rel, praetor_files)
-        if reader_ok or dl_ok:
-            findings.extend(scan_file(rel, dl_ok, repo_root))
+    kept = [
+        rel
+        for rel in files
+        if is_in_repo_scope(rel, praetor) or is_in_download_scope(rel, praetor)
+    ]
+    return kept, findings
+
+
+def scan_selected(
+    repo_root: Path, selected: list[str], praetor: set[str]
+) -> list[Finding]:
+    """Scan a bounded list of in-scope relative paths."""
+    findings: list[Finding] = []
+    for rel in selected[:MAX_SCAN_FILES]:
+        dl_ok = is_in_download_scope(rel, praetor)
+        findings.extend(scan_file(rel, dl_ok, repo_root))
     return findings
 
 
+def scan_repository(repo_root: Path, praetor_files: set[str]) -> list[Finding]:
+    """Scan all in-scope repository files."""
+    files, findings = select_repository_files(repo_root, praetor_files)
+    findings.extend(scan_selected(repo_root, files, praetor_files))
+    return findings
+
+
+def git_output(repo_root: Path, args: list[str]) -> bytes:
+    """Run a fixed git command and return raw stdout bytes."""
+    return subprocess.check_output(  # noqa: S603 - fixed git command without shell. # nosec B603
+        ["git", "-C", str(repo_root), *args],  # noqa: S607 - git executable on runner PATH. # nosec B607
+        stderr=subprocess.PIPE,
+        timeout=60,
+    )
+
+
+def parse_push_line(line: str) -> str:
+    """Parse one pre-push stdin line and return the local oid, or empty for ref deletion."""
+    fields = line.split()
+    if len(fields) != 4:
+        msg = f"malformed pre-push line (expected 4 fields, got {len(fields)})"
+        raise ValueError(msg)
+    local_oid = fields[1]
+    if not OID_RE.fullmatch(local_oid):
+        raise ValueError(f"invalid local oid: {local_oid}")
+    if all(ch == "0" for ch in local_oid):
+        return ""
+    return local_oid.lower()
+
+
+def read_push_oids(stream: TextIO) -> list[str]:
+    """Read pre-push ref oids from stdin, deduplicated in first-seen order; every line read counts toward MAX_PUSH_REFS."""
+    oids: list[str] = []
+    seen: set[str] = set()
+    lines_read = 0
+    for _ in range(MAX_PUSH_REFS + 1):
+        line = stream.readline()
+        if line == "":
+            break
+        lines_read += 1
+        if lines_read > MAX_PUSH_REFS:
+            raise ValueError(f"pre-push ref count exceeds {MAX_PUSH_REFS}")
+        stripped = line.strip()
+        if not stripped:
+            continue
+        oid = parse_push_line(stripped)
+        if not oid or oid in seen:
+            continue
+        seen.add(oid)
+        oids.append(oid)
+    return oids
+
+
+def push_base(repo_root: Path, oid: str) -> str:
+    """Return merge-base between origin/main and the pushed commit."""
+    return git_output(repo_root, ["merge-base", "origin/main", oid]).decode("ascii").strip()
+
+
+def origin_main_present(repo_root: Path) -> bool:
+    """Return whether origin/main resolves to a commit."""
+    try:
+        git_output(repo_root, ["rev-parse", "--verify", "--quiet", "origin/main^{commit}"])
+    except subprocess.CalledProcessError as err:
+        if err.returncode == 1:
+            return False
+        raise
+    return True
+
+
+def parse_batch_blob(stdout: bytes, rel: str) -> bytes:
+    """Extract blob bytes from git cat-file --batch --follow-symlinks -Z output."""
+    raw_header, sep, rest = stdout.partition(b"\0")
+    fields = raw_header.split()
+    if sep and len(fields) == 3 and fields[1] == b"blob" and fields[2].isdigit():
+        size = int(fields[2])
+        if len(rest) >= size:
+            return rest[:size]
+    header = raw_header.decode("utf-8", errors="replace")[:200]
+    raise ValueError(f"unsupported blob target for {rel}: {header}")
+
+
+def read_blob_lines(repo_root: Path, oid: str, rel: str) -> list[str]:
+    """Read one committed file at a commit, following in-tree symlinks, as UTF-8 lines."""
+    proc = subprocess.run(  # noqa: S603 - fixed git command without shell. # nosec B603
+        ["git", "-C", str(repo_root), "cat-file", "--batch", "--follow-symlinks", "-Z"],  # noqa: S607 - git executable on runner PATH. # nosec B607
+        input=f"{oid}:{rel}\0".encode("utf-8", "surrogateescape"),
+        capture_output=True,
+        timeout=60,
+        check=True,
+    )
+    content = parse_batch_blob(proc.stdout, rel)
+    return content.decode("utf-8", "ignore").splitlines()
+
+
+def filter_in_scope(
+    paths: list[str], praetor: set[str], *, bound: int | None = None
+) -> list[str]:
+    """Keep paths that fall in reader or download scan scope."""
+    limit = MAX_SCAN_FILES if bound is None else bound
+    selected: list[str] = []
+    for rel in paths[:limit]:
+        in_reader = is_in_repo_scope(rel, praetor)
+        in_dl = is_in_download_scope(rel, praetor)
+        if in_reader or in_dl:
+            selected.append(rel)
+    return selected
+
+
+def scan_pushed_ref(repo_root: Path, oid: str) -> list[Finding]:
+    """Scan in-scope files changed between origin/main merge-base and one pushed oid."""
+    base = push_base(repo_root, oid)
+    argv = [
+        "diff",
+        "--name-only",
+        "--no-renames",
+        "--no-relative",
+        "--diff-filter=d",
+        base,
+        oid,
+        "--",
+    ]
+    paths, findings = list_git_paths(repo_root, argv)
+    praetor = get_committed_praetor_files(repo_root, oid)
+    selected = filter_in_scope(paths, praetor, bound=MAX_LISTED_PATHS)
+    if len(selected) > MAX_SCAN_FILES:
+        msg = f"pushed in-scope file count exceeds scan limit {MAX_SCAN_FILES}: {len(selected)}"
+        findings.append(Finding(".", 0, "scan-limit", msg))
+    for rel in selected[:MAX_SCAN_FILES]:
+        try:
+            lines = read_blob_lines(repo_root, oid, rel)
+        except (subprocess.SubprocessError, OSError, ValueError) as err:
+            blob = f"cannot read {oid[:12]}:{rel}: {err}"
+            findings.append(Finding(rel, 0, "read-error", blob))
+            continue
+        dl_ok = is_in_download_scope(rel, praetor)
+        findings.extend(scan_lines(rel, lines, dl_ok))
+    return findings
+
+
+def scan_pre_push(repo_root: Path, stream: TextIO) -> list[Finding]:
+    """Scan every pushed ref from pre-push stdin against origin/main."""
+    try:
+        if not origin_main_present(repo_root):
+            print("shell-flake-policy: origin/main not found, skipping", file=sys.stderr)
+            return []
+    except (subprocess.SubprocessError, OSError) as err:
+        return [Finding(".", 0, "git-error", f"git failed for pushed ref: {err}")]
+    try:
+        oids = read_push_oids(stream)
+    except ValueError as err:
+        return [Finding(".", 0, "pre-push-input", str(err))]
+    if not oids:
+        print("shell-flake-policy: no pushed refs, skipping", file=sys.stderr)
+        return []
+    findings: list[Finding] = []
+    for oid in oids:
+        try:
+            findings.extend(scan_pushed_ref(repo_root, oid))
+        except (subprocess.SubprocessError, OSError) as err:
+            msg = f"git failed for pushed ref {oid[:12]}: {err}"
+            findings.append(Finding(".", 0, "git-error", msg))
+    return findings
+
+
+def exit_code_for(findings: list[Finding]) -> int:
+    """Return 3 on operational errors, 1 on policy violations, or 0 when clean."""
+    if not findings:
+        return 0
+    if any(f.rule in OPERATIONAL_RULES for f in findings):
+        return 3
+    return 1
+
+
 def main() -> int:
-    """Run flake policy checks on specified paths or repository files."""
+    """Run flake policy checks and return 0 ok, 1 policy finding, or 3 error."""
     repo_root = Path(__file__).resolve().parent.parent.parent
-    if len(sys.argv) > 1:
-        findings = scan_arguments(sys.argv[1:])
+    argv = sys.argv[1:]
+    if argv and argv[0].startswith("--"):
+        if argv[0] == "--pre-push":
+            if len(argv) != 1:
+                print("shell-flake-policy: --pre-push takes no arguments", file=sys.stderr)
+                return 3
+            findings = scan_pre_push(repo_root, sys.stdin)
+        else:
+            print(f"shell-flake-policy: unknown option {argv[0]}", file=sys.stderr)
+            return 3
+    elif argv:
+        findings = scan_arguments(argv)
     else:
         findings = scan_repository(repo_root, get_praetor_files(repo_root))
 
@@ -419,7 +681,7 @@ def main() -> int:
     for f in findings:
         print(f"{f.path}:{f.line}: {f.rule}: {f.message}")
 
-    return 1 if findings else 0
+    return exit_code_for(findings)
 
 
 if __name__ == "__main__":
