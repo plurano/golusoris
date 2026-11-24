@@ -282,14 +282,17 @@ def resolve_packages(
     return resolved
 
 
-def format_locked_package(name: str, version: str) -> str:
+def format_locked_package(name: str, version: str, *, is_direct: bool) -> str:
     """Return a uv-formatted locked requirement stanza with a sha256 hash."""
     pin = f"{name}=={version}"
     digest = hashlib.sha256(pin.encode("utf-8")).hexdigest()
-    return f"{pin} \\\n    --hash=sha256:{digest}\n"
+    via = "    # via -r requirements.in\n" if is_direct else ""
+    return f"{pin} \\\n    --hash=sha256:{digest}\n{via}"
 
 
-def write_lock_output(req: CompileRequest, resolved: dict[str, str]) -> None:
+def write_lock_output(
+    req: CompileRequest, resolved: dict[str, str], direct_names: set[str]
+) -> None:
     """Write the compiled lockfile header and hashed pins to the output path."""
     out_path = safe_src_child(req.src_dir, req.output_file)
     header = (
@@ -301,7 +304,7 @@ def write_lock_output(req: CompileRequest, resolved: dict[str, str]) -> None:
         f"--output-file {req.output_file} {req.input_file}\n"
     )
     body = "".join(
-        format_locked_package(name, resolved[name])
+        format_locked_package(name, resolved[name], is_direct=name in direct_names)
         for name in sorted(resolved)[:MAX_PACKAGES]
     )
     out_path.write_text(header + body, encoding="utf-8")
@@ -317,7 +320,8 @@ def main() -> int:
         input_path = safe_src_child(req.src_dir, req.input_file)
         direct = read_direct_requirements(input_path)
         resolved = resolve_packages(direct, cutoff_dt, index)
-        write_lock_output(req, resolved)
+        direct_names = {direct[i][0] for i in range(min(len(direct), MAX_LINES))}
+        write_lock_output(req, resolved, direct_names)
     except StubError as error:
         print(error, file=sys.stderr)
         return error.code

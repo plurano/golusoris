@@ -111,6 +111,7 @@ MAX_EXTENDS = 32
 # check_pypi_overrides inspects renovate.json plus every extended preset.
 MAX_RENOVATE_CONFIGS = MAX_EXTENDS + 1
 MAX_PACKAGE_RULES = 256
+MAX_DATASOURCES = 64
 PRESET_REF = re.compile(r"github>(?P<owner>[A-Za-z0-9-]+)/(?P<repo>[A-Za-z0-9._-]+)")
 RELEASE_AGE = re.compile(
     r"(?P<count>[0-9]{1,4}) (?P<unit>minutes?|hours?|days?|weeks?)"
@@ -127,6 +128,8 @@ REQUIREMENT_PIN_PATTERN = (
 )
 REQUIREMENT_PIN = re.compile(REQUIREMENT_PIN_PATTERN)
 LOCK_PIN = re.compile(r"(?P<name>[a-z0-9][a-z0-9._-]*)==(?P<version>\S+) \\")
+DATASOURCE_NAME = re.compile(r"[a-z0-9][a-z0-9-]*")
+LOCK_DIRECT_VIA = frozenset({"# via -r requirements.in", "#   -r requirements.in"})
 CUTOFF_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 CUTOFF_VALUE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
 
@@ -717,18 +720,31 @@ def release_age_source(
     raise CheckError(msg)
 
 
+def _applies_to_pypi(datasources: object, source: str) -> bool:
+    """Validate matchDatasources plain names and report whether pypi is listed."""
+    if datasources is None:
+        return True
+    if not isinstance(datasources, list) or len(datasources) > MAX_DATASOURCES:
+        raise CheckError(f"{source}: invalid packageRule matchDatasources")
+    for i in range(min(len(datasources), MAX_DATASOURCES)):
+        entry = datasources[i]
+        if not isinstance(entry, str) or DATASOURCE_NAME.fullmatch(entry) is None:
+            msg = (
+                f"{source}: packageRule matchDatasources entry {entry!r} "
+                "is not a plain datasource name"
+            )
+            raise CheckError(msg)
+    return "pypi" in datasources
+
+
 def check_pypi_package_rule(rule: object, source: str, base: timedelta) -> None:
     """Refuse a non-object packageRule or conflicting PyPI minimumReleaseAge."""
     if not isinstance(rule, dict):
         raise CheckError(f"{source}: packageRule is not a JSON object")
     if "minimumReleaseAge" not in rule:
         return
-    datasources = rule.get("matchDatasources")
-    if datasources is not None:
-        if not isinstance(datasources, list):
-            raise CheckError(f"{source}: invalid packageRule matchDatasources")
-        if "pypi" not in datasources:
-            return
+    if not _applies_to_pypi(rule.get("matchDatasources"), source):
+        return
     if parse_release_age(rule["minimumReleaseAge"], source) != base:
         raise CheckError(f"{source}: packageRule minimumReleaseAge differs for pypi")
 
@@ -800,6 +816,22 @@ def lock_pins(text: str, source: str) -> dict[str, str]:
     return pins
 
 
+def lock_direct_names(text: str, source: str) -> set[str]:
+    """Return normalized package names annotated as direct requirements in text."""
+    lines = text.splitlines()
+    if len(lines) > MAX_LOCK_LINES:
+        raise CheckError(f"{source} exceeds {MAX_LOCK_LINES} lines")
+    direct: set[str] = set()
+    current = ""
+    for i in range(min(len(lines), MAX_LOCK_LINES)):
+        match = LOCK_PIN.fullmatch(lines[i])
+        if match is not None:
+            current = normalize_name(match["name"])
+        elif current and lines[i].strip() in LOCK_DIRECT_VIA:
+            direct.add(current)
+    return direct
+
+
 def parse_context_row(line: str) -> tuple[str, str, str, str]:
     """Return a validated lock-context tuple or refuse malformed rows."""
     match = CONTEXT_ROW.fullmatch(line)
@@ -845,13 +877,16 @@ def read_repo_text(root: Path, rel_path: str) -> str:
 
 
 def context_stale(root: Path, row: tuple[str, str, str, str]) -> bool:
-    """Return True when any direct pin disagrees with its compiled lockfile."""
+    """Return True when direct pins or direct lock entries disagree."""
     var, lock, kind, source = row
     if kind == "file":
         pins = direct_pins(read_repo_text(root, source), source)
     else:
         pins = direct_pins(source, var)
-    locked = lock_pins(read_repo_text(root, lock), lock)
+    lock_text = read_repo_text(root, lock)
+    locked = lock_pins(lock_text, lock)
+    if lock_direct_names(lock_text, lock) - pins.keys():
+        return True
     items = list(pins.items())
     for i in range(min(len(items), MAX_REQUIREMENT_LINES)):
         name, version = items[i]
@@ -871,8 +906,8 @@ def parse_cutoff(value: str, label: str) -> datetime:
 
 
 def move_cutoffs(text: str, names: list[str], cutoff: str) -> str:
-    """Return script text with named lock cutoffs advanced when newer."""
-    cutoff_dt = parse_cutoff(cutoff, "cutoff")
+    """Return script text with named lock cutoffs set to the candidate cutoff."""
+    parse_cutoff(cutoff, "cutoff")
     for i in range(min(len(names), MAX_LOCK_CONTEXTS)):
         name = names[i]
         pattern = re.compile(rf"^{re.escape(name)}=(?P<value>\S*)$", re.MULTILINE)
@@ -884,11 +919,9 @@ def move_cutoffs(text: str, names: list[str], cutoff: str) -> str:
             )
             raise CheckError(msg)
         match = matches[0]
-        old_value = match["value"]
-        old_dt = parse_cutoff(old_value, f"{TRAINER_LOCK_SCRIPT}:{name}")
-        new_value = cutoff if cutoff_dt > old_dt else old_value
+        parse_cutoff(match["value"], f"{TRAINER_LOCK_SCRIPT}:{name}")
         start, end = match.span("value")
-        text = text[:start] + new_value + text[end:]
+        text = text[:start] + cutoff + text[end:]
     return text
 
 
@@ -1735,8 +1768,8 @@ def setup_trainer_lock_fixture(
     return [], hooks
 
 
-def verify_renovate_shape_files(out: Path) -> list[str]:
-    """Return verification failures for regenerated Renovate-bump artifacts."""
+def _verify_gemma_regen_scope(out: Path, case_name: str) -> list[str]:
+    """Verify gemma cutoff moved and litert, sidecar, and audit locks stayed clean."""
     failures: list[str] = []
     copied_script = out / "files" / TRAINER_LOCK_SCRIPT
     expected_cutoffs = (
@@ -1750,8 +1783,27 @@ def verify_renovate_shape_files(out: Path) -> list[str]:
         if copied_script.is_file()
         else set()
     )
-    if not all(line in script_lines for line in expected_cutoffs):
-        failures.append("case renovate-shape: unexpected cutoff lines in script")
+    if not all(
+        expected_cutoffs[i] in script_lines
+        for i in range(min(len(expected_cutoffs), MAX_LOCK_CONTEXTS))
+    ):
+        failures.append(f"case {case_name}: unexpected cutoff lines in script")
+    unchanged = (
+        "ai/tiny/trainers/litert/requirements.lock",
+        "ai/tiny/serve/tflite/sidecar/requirements.lock",
+        "scripts/ci/tiny-trainer-pip-audit.lock",
+    )
+    failures.extend(
+        f"case {case_name}: unchanged lock written: {unchanged[i]}"
+        for i in range(min(len(unchanged), MAX_LOCK_CONTEXTS))
+        if (out / "files" / unchanged[i]).exists()
+    )
+    return failures
+
+
+def verify_renovate_shape_files(out: Path) -> list[str]:
+    """Return verification failures for regenerated Renovate-bump artifacts."""
+    failures = _verify_gemma_regen_scope(out, "renovate-shape")
     gemma_lock = out / "files" / "ai/tiny/trainers/gemma/requirements.lock"
     gemma_lines = (
         set(gemma_lock.read_text(encoding="utf-8").splitlines())
@@ -1760,16 +1812,6 @@ def verify_renovate_shape_files(out: Path) -> list[str]:
     )
     if "pkg-a==2.0 \\" not in gemma_lines:
         failures.append("case renovate-shape: gemma lock missing pkg-a==2.0")
-    unchanged = (
-        "ai/tiny/trainers/litert/requirements.lock",
-        "ai/tiny/serve/tflite/sidecar/requirements.lock",
-        "scripts/ci/tiny-trainer-pip-audit.lock",
-    )
-    failures.extend(
-        f"case renovate-shape: unchanged lock written: {rel}"
-        for rel in unchanged
-        if (out / "files" / rel).exists()
-    )
     return failures
 
 
@@ -1990,6 +2032,141 @@ def run_preset_scheme_cases(temp_dir: Path) -> tuple[list[str], int]:
     return failures, refused
 
 
+def _verify_removed_requirement_files(out: Path) -> list[str]:
+    """Return verification failures when a removed direct requirement stays locked."""
+    failures = _verify_gemma_regen_scope(out, "removed-requirement")
+    gemma_lock = out / "files" / "ai/tiny/trainers/gemma/requirements.lock"
+    lines = (
+        gemma_lock.read_text(encoding="utf-8").splitlines()
+        if gemma_lock.is_file()
+        else []
+    )
+    if "pkg-c==1.0 \\" not in lines:
+        failures.append("case removed-requirement: gemma lock missing pkg-c==1.0")
+    if any(
+        lines[i].startswith("pkg-a==")
+        for i in range(min(len(lines), MAX_LOCK_LINES))
+    ):
+        failures.append("case removed-requirement: gemma lock kept removed pkg-a")
+    return failures
+
+
+def _check_lock_direct_names() -> tuple[list[str], int]:
+    """Verify lock_direct_names extracts single-line and multi-line direct stanzas."""
+    sample = (
+        "keras-hub==0.32.0 \\\n"
+        "    --hash=sha256:aaa\n"
+        "    # via -r requirements.in\n"
+        "tensorflow==2.21.0 \\\n"
+        "    --hash=sha256:bbb\n"
+        "    # via\n"
+        "    #   -r requirements.in\n"
+        "    #   tensorflow-text\n"
+        "keras==3.15.1 \\\n"
+        "    --hash=sha256:ccc\n"
+        "    # via\n"
+        "    #   keras-hub\n"
+        "    #   tensorflow\n"
+    )
+    if lock_direct_names(sample, "sample.lock") != {"keras-hub", "tensorflow"}:
+        return ["case lock-direct-names: expected keras-hub and tensorflow"], 0
+    return [], 1
+
+
+def run_removed_requirement_case(
+    repo: Path, temp_dir: Path, source_root: Path
+) -> tuple[list[str], int]:
+    """Return failures and accepted count when a direct requirement is removed."""
+    unit_failures, unit_accepted = _check_lock_direct_names()
+    case_dir = temp_dir / "removed-requirement"
+    case_dir.mkdir(parents=True, exist_ok=True)
+    reset_fixture_repo(repo)
+    original_head = run_git(["rev-parse", "HEAD"], repo).strip()
+    try:
+        setup_failures, hooks = setup_trainer_lock_fixture(repo, case_dir, source_root)
+        if setup_failures or hooks is None:
+            return [*unit_failures, *setup_failures], unit_accepted
+        (repo / "ai/tiny/trainers/gemma/requirements.in").write_text(
+            "pkg-c[extra]==1.0\n", encoding="utf-8"
+        )
+        run_git(["commit", "-am", "remove gemma pkg-a"], repo)
+        out = case_dir / "out-removed"
+        fails, _ = write_regenerated(out, repo, lock_hooks=hooks)
+        repo_failures = [
+            f"case removed-requirement failed: {fails[i]}"
+            for i in range(min(len(fails), MAX_CHANGED_FILES))
+        ]
+        repo_failures.extend(_verify_removed_requirement_files(out))
+        repo_accepted = 0 if repo_failures else 1
+        return [*unit_failures, *repo_failures], unit_accepted + repo_accepted
+    finally:
+        run_git(["reset", "--hard", original_head], repo)
+        reset_fixture_repo(repo)
+
+
+def _rule_age_config(datasources: list[Any]) -> dict[str, Any]:
+    """Return a Renovate config with a 7-day packageRule on datasources."""
+    rule = {"matchDatasources": datasources, "minimumReleaseAge": "7 days"}
+    return {"minimumReleaseAge": "3 days", "packageRules": [rule]}
+
+
+def run_datasource_pattern_cases(
+    temp_dir: Path,
+) -> tuple[list[str], int, int]:
+    """Return failures, refusals, and acceptances for matchDatasources patterns."""
+    pattern_dir = temp_dir / "datasource-patterns"
+
+    def preset_fetch(_url: str) -> bytes:
+        """Return a preset with a negated matchDatasources minimumReleaseAge."""
+        return json.dumps(_rule_age_config(["!npm"])).encode("utf-8")
+
+    bad: tuple[list[Any], ...] = (["*"], ["/^pypi$/"], ["!docker"], ["py*"], [1])
+    cases: list[tuple[str, dict[str, Any] | None, Callable[[str], bytes]]] = [
+        (f"datasource-pattern-{i}", _rule_age_config(bad[i]), preset_fetch)
+        for i in range(min(len(bad), MAX_DATASOURCES))
+    ]
+    preset_cfg: dict[str, Any] = {"extends": ["github>example/preset"]}
+    cases.append(("preset-negated-datasource", preset_cfg, preset_fetch))
+    failures: list[str] = []
+    refused = sum(
+        refuse_release_age_case(pattern_dir, i, cases[i], failures)
+        for i in range(min(len(cases), MAX_EXTENDS))
+    )
+    accept_dir = pattern_dir / "accept-github-releases"
+    accept_dir.mkdir(parents=True, exist_ok=True)
+    (accept_dir / RENOVATE_CONFIG).write_text(
+        json.dumps(_rule_age_config(["github-releases"])), encoding="utf-8"
+    )
+    accepted = 0
+    if renovate_min_release_age(accept_dir, preset_fetch) != timedelta(days=3):
+        failures.append("case github-releases-package-rule: expected 3 days")
+    else:
+        accepted = 1
+    return failures, refused, accepted
+
+
+def run_move_cutoff_cases() -> tuple[list[str], int]:
+    """Return failures and accepted count for move_cutoffs replacement."""
+    script_text = (
+        "GEMMA_LOCK_EXCLUDE_NEWER=2026-11-23T12:00:00Z\n"
+        "LITERT_LOCK_EXCLUDE_NEWER=2026-01-01T00:00:00Z\n"
+        "SIDECAR_LOCK_EXCLUDE_NEWER=2026-11-23T12:00:00Z\n"
+    )
+    expected = (
+        "GEMMA_LOCK_EXCLUDE_NEWER=2026-11-17T12:00:00Z\n"
+        "LITERT_LOCK_EXCLUDE_NEWER=2026-11-17T12:00:00Z\n"
+        "SIDECAR_LOCK_EXCLUDE_NEWER=2026-11-23T12:00:00Z\n"
+    )
+    updated = move_cutoffs(
+        script_text,
+        ["GEMMA_LOCK_EXCLUDE_NEWER", "LITERT_LOCK_EXCLUDE_NEWER"],
+        "2026-11-17T12:00:00Z",
+    )
+    if updated != expected:
+        return ["case move-cutoffs: unexpected script text after cutoff update"], 0
+    return [], 1
+
+
 def run_trainer_lock_cases(
     repo: Path, temp_dir: Path, source_root: Path | None = None
 ) -> tuple[list[str], int, int]:
@@ -2002,14 +2179,28 @@ def run_trainer_lock_cases(
     repo_failures, repo_accepted = run_trainer_lock_repo_cases(
         repo, temp_dir, actual_root
     )
+    rem_failures, rem_accepted = run_removed_requirement_case(
+        repo, temp_dir, actual_root
+    )
     ref_failures, refused = run_release_age_refusal_cases(temp_dir)
+    ds_failures, ds_refused, ds_accepted = run_datasource_pattern_cases(temp_dir)
     scheme_failures, scheme_refused = run_preset_scheme_cases(temp_dir)
     acc_failures, unit_accepted = run_release_age_accepted_cases(temp_dir)
-    return (
-        [*repo_failures, *ref_failures, *scheme_failures, *acc_failures],
-        refused + scheme_refused,
-        repo_accepted + unit_accepted,
+    cut_failures, cut_accepted = run_move_cutoff_cases()
+    failures = [
+        *repo_failures,
+        *rem_failures,
+        *ref_failures,
+        *ds_failures,
+        *scheme_failures,
+        *acc_failures,
+        *cut_failures,
+    ]
+    total_refused = refused + ds_refused + scheme_refused
+    total_accepted = (
+        repo_accepted + rem_accepted + ds_accepted + unit_accepted + cut_accepted
     )
+    return failures, total_refused, total_accepted
 
 
 def run_plant_case_c(repo: Path, temp_dir: Path) -> tuple[list[str], int]:
