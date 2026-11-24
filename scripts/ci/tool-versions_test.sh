@@ -701,7 +701,10 @@ for workflow in "${custom_semgrep_workflows[@]}"; do
 		exit 1
 	fi
 done
-if ! grep -Fq 'SEMGREP_IMAGE_DIGEST' "$repo_root/.github/workflows/security-scan.yml"; then
+if ! grep -Fq 'bash scripts/ci/semgrep-registry.sh' \
+	"$repo_root/.github/workflows/security-scan.yml" || \
+	! grep -Fq 'tools/tool-versions.env' "$repo_root/scripts/ci/semgrep-registry.sh" || \
+	! grep -Fq "@\${SEMGREP_IMAGE_DIGEST}" "$repo_root/scripts/ci/semgrep-registry.sh"; then
 	printf 'registry Semgrep workflow does not consume the image digest authority\n' >&2
 	exit 1
 fi
