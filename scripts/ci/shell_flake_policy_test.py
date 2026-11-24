@@ -791,6 +791,16 @@ class ShellFlakePolicyPushedTest(unittest.TestCase):
         self.assertEqual(rc, 3)
         self.assertIn("pre-push-input", out.getvalue())
 
+    def test_n15_symlink_to_directory_rejected(self) -> None:
+        """N15: symlink resolving to an in-tree directory emits read-error for the link path."""
+        self._base({"README.md": "x\n"})
+        self._commit_paths({"docs/clean.txt": "echo ok\n"})
+        self._commit_symlink("scripts/ci/dir.sh", "../../docs")
+        findings = self._push()
+        self.assertTrue(
+            any(f.rule == "read-error" and f.path == "scripts/ci/dir.sh" for f in findings)
+        )
+
     def test_p4_main_exit_1_violation_and_0_clean_push(self) -> None:
         """P4: main() returns 1 on a pushed policy violation and 0 on a clean push."""
         planted = [
