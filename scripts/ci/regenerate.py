@@ -636,16 +636,16 @@ def parse_release_age(value: object, source: str) -> timedelta:
     return timedelta(seconds=count * RELEASE_AGE_SECONDS[unit])
 
 
-def preset_config(
+def github_presets(
     config: dict[str, Any], fetch: Callable[[str], bytes]
-) -> tuple[dict[str, Any], str]:
-    """Return the extended preset defining minimumReleaseAge or raise CheckError."""
+) -> list[tuple[dict[str, Any], str]]:
+    """Return fetched GitHub Renovate presets in extends order."""
     extends = config.get("extends", [])
     if not isinstance(extends, list) or len(extends) > MAX_EXTENDS:
         raise CheckError(f"{RENOVATE_CONFIG}: invalid or oversized extends list")
-    reversed_extends = list(reversed(extends))
-    for i in range(min(len(reversed_extends), MAX_EXTENDS)):
-        entry = reversed_extends[i]
+    presets: list[tuple[dict[str, Any], str]] = []
+    for i in range(min(len(extends), MAX_EXTENDS)):
+        entry = extends[i]
         if not isinstance(entry, str) or not entry.startswith("github>"):
             continue
         ref = PRESET_REF.fullmatch(entry)
@@ -654,6 +654,19 @@ def preset_config(
             raise CheckError(msg)
         url = PRESET_URL.format(owner=ref["owner"], repo=ref["repo"])
         preset = load_json_object(fetch(url), entry)
+        presets.append((preset, entry))
+    return presets
+
+
+def release_age_source(
+    config: dict[str, Any], presets: list[tuple[dict[str, Any], str]]
+) -> tuple[dict[str, Any], str]:
+    """Return the config or last preset defining minimumReleaseAge."""
+    if "minimumReleaseAge" in config:
+        return config, RENOVATE_CONFIG
+    reversed_presets = list(reversed(presets))
+    for i in range(min(len(reversed_presets), MAX_EXTENDS)):
+        preset, entry = reversed_presets[i]
         if "minimumReleaseAge" in preset:
             return preset, entry
     msg = f"{RENOVATE_CONFIG}: no minimumReleaseAge in the file or its github presets"
@@ -661,8 +674,10 @@ def preset_config(
 
 
 def check_pypi_package_rule(rule: object, source: str, base: timedelta) -> None:
-    """Refuse a PyPI packageRule whose minimumReleaseAge differs from base."""
-    if not isinstance(rule, dict) or "minimumReleaseAge" not in rule:
+    """Refuse a non-object packageRule or conflicting PyPI minimumReleaseAge."""
+    if not isinstance(rule, dict):
+        raise CheckError(f"{source}: packageRule is not a JSON object")
+    if "minimumReleaseAge" not in rule:
         return
     datasources = rule.get("matchDatasources")
     if datasources is not None:
@@ -696,14 +711,10 @@ def renovate_min_release_age(
     except (OSError, UnicodeError) as error:
         raise CheckError(f"{RENOVATE_CONFIG}: could not read: {error}") from error
     config = load_json_object(raw, RENOVATE_CONFIG)
-    if "minimumReleaseAge" in config:
-        base_cfg, base_src = config, RENOVATE_CONFIG
-        configs = [(config, RENOVATE_CONFIG)]
-    else:
-        base_cfg, base_src = preset_config(config, fetch)
-        configs = [(config, RENOVATE_CONFIG), (base_cfg, base_src)]
+    presets = github_presets(config, fetch)
+    base_cfg, base_src = release_age_source(config, presets)
     age = parse_release_age(base_cfg["minimumReleaseAge"], base_src)
-    check_pypi_overrides(configs, age)
+    check_pypi_overrides([(config, RENOVATE_CONFIG), *presets], age)
     return age
 
 
@@ -1716,6 +1727,28 @@ def run_trainer_lock_repo_cases(
         reset_fixture_repo(repo)
 
 
+def refuse_release_age_case(
+    temp_dir: Path,
+    index: int,
+    case: tuple[str, dict[str, Any] | None, Callable[[str], bytes]],
+    failures: list[str],
+) -> int:
+    """Write one Renovate fixture and return 1 when release-age validation fails."""
+    label, payload, fetch_fn = case
+    scratch = temp_dir / f"renovate-refuse-{index}"
+    scratch.mkdir(parents=True, exist_ok=True)
+    if payload is not None:
+        (scratch / RENOVATE_CONFIG).write_text(
+            json.dumps(payload), encoding="utf-8"
+        )
+    try:
+        renovate_min_release_age(scratch, fetch_fn)
+    except CheckError:
+        return 1
+    failures.append(f"case {label}: expected CheckError")
+    return 0
+
+
 def run_release_age_refusal_cases(temp_dir: Path) -> tuple[list[str], int]:
     """Return failures and refused count for invalid release-age inputs."""
 
@@ -1727,44 +1760,43 @@ def run_release_age_refusal_cases(temp_dir: Path) -> tuple[list[str], int]:
         """Return an empty JSON object preset body."""
         return b"{}"
 
+    def pypi_override_fetch(_url: str) -> bytes:
+        """Return a preset body overriding PyPI minimumReleaseAge."""
+        body = (
+            b'{"packageRules": [{"matchDatasources": ["pypi"], '
+            b'"minimumReleaseAge": "7 days"}]}'
+        )
+        return body
+
+    def earlier_preset_fetch(url: str) -> bytes:
+        """Return a PyPI override for preset a and three days otherwise."""
+        if "/example/a/" in url:
+            return pypi_override_fetch(url)
+        return b'{"minimumReleaseAge": "3 days"}'
+
+    diff_rule = {"matchDatasources": ["pypi"], "minimumReleaseAge": "1 day"}
+    diff_cfg = {"minimumReleaseAge": "3 days", "packageRules": [diff_rule]}
+    bad_ref_cfg = {"extends": ["github>example/preset:other"]}
+    top_cfg = {"minimumReleaseAge": "2 days", "extends": ["github>example/preset"]}
+    ab_cfg = {"extends": ["github>example/a", "github>example/b"]}
+    non_obj_cfg = {"minimumReleaseAge": "3 days", "packageRules": ["not-a-dict"]}
     cases: tuple[tuple[str, dict[str, Any] | None, Callable[[str], bytes]], ...] = (
         ("missing-renovate-json", None, fail_fetch),
         ("null-release-age", {"minimumReleaseAge": None}, fail_fetch),
         ("bad-release-age-unit", {"minimumReleaseAge": "3 dayz"}, fail_fetch),
         ("preset-fetch-error", {"extends": ["github>example/preset"]}, fail_fetch),
         ("preset-missing-key", {"extends": ["github>example/preset"]}, empty_fetch),
-        (
-            "pypi-override-differs",
-            {
-                "minimumReleaseAge": "3 days",
-                "packageRules": [
-                    {"matchDatasources": ["pypi"], "minimumReleaseAge": "1 day"}
-                ],
-            },
-            fail_fetch,
-        ),
-        (
-            "unreadable-preset-ref",
-            {"extends": ["github>example/preset:other"]},
-            empty_fetch,
-        ),
+        ("pypi-override-differs", diff_cfg, fail_fetch),
+        ("unreadable-preset-ref", bad_ref_cfg, empty_fetch),
+        ("top-level-age-preset-pypi-override", top_cfg, pypi_override_fetch),
+        ("earlier-preset-pypi-override", ab_cfg, earlier_preset_fetch),
+        ("non-object-package-rule", non_obj_cfg, fail_fetch),
     )
     failures: list[str] = []
-    refused = 0
-    for i in range(min(len(cases), MAX_EXTENDS)):
-        label, payload, fetch_fn = cases[i]
-        scratch = temp_dir / f"renovate-refuse-{i}"
-        scratch.mkdir(parents=True, exist_ok=True)
-        if payload is not None:
-            (scratch / RENOVATE_CONFIG).write_text(
-                json.dumps(payload), encoding="utf-8"
-            )
-        try:
-            renovate_min_release_age(scratch, fetch_fn)
-        except CheckError:
-            refused += 1
-        else:
-            failures.append(f"case {label}: expected CheckError")
+    refused = sum(
+        refuse_release_age_case(temp_dir, i, cases[i], failures)
+        for i in range(min(len(cases), MAX_EXTENDS))
+    )
     try:
         direct_pins("pkg-a>=1.0\n", "x")
     except CheckError:
@@ -1792,8 +1824,10 @@ def run_release_age_accepted_cases(temp_dir: Path) -> tuple[list[str], int]:
     (top_dir / RENOVATE_CONFIG).write_text(json.dumps(top_cfg), encoding="utf-8")
     if renovate_min_release_age(top_dir, preset_three_days) != timedelta(days=2):
         failures.append("case top-level-release-age: expected 2 days")
-    elif fetched:
-        failures.append("case top-level-release-age: unexpectedly fetched preset")
+    elif not fetched:
+        failures.append(
+            "case top-level-release-age: preset not fetched for packageRules check"
+        )
     else:
         accepted += 1
 
