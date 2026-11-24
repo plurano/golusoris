@@ -528,7 +528,7 @@ class DocstringCoveragePolicyTest(unittest.TestCase):
         self.assertEqual(at, [])
 
     def test_n12_head_blob_read_failure_fails_closed(self) -> None:
-        """N12: git show failure after ls-tree must exit 2, not skip the path."""
+        """N12: git show failure after ls-tree must exit 3, not skip the path."""
         real = policy._run_git_text
 
         def boom(repo_root: Path, args: list[str]) -> str:
