@@ -39,6 +39,8 @@ MAX_SCAN_FILES = 20000
 MAX_LISTED_PATHS = 1_000_000  # Scalar bound on one raw git listing before scope filtering.
 MAX_FILE_LINES = 10000
 MAX_PUSH_REFS = 4096  # Matches merge-comments.sh max_refs.
+# Finding rules indicating the scan itself failed and must exit with code 3.
+OPERATIONAL_RULES = frozenset({"git-error", "pre-push-input", "read-error"})
 OID_RE = re.compile(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}")
 # Git and lefthook give "/" paths; only Windows argv may carry "\" separators.
 WINDOWS_PATHS = sys.platform == "win32"
@@ -411,7 +413,7 @@ def list_git_paths(repo_root: Path, argv: list[str]) -> tuple[list[str], list[Fi
             timeout=60,
         )
     except (subprocess.SubprocessError, OSError) as err:
-        return [], [Finding(".", 0, "scan-limit", f"git {argv[0]} failed: {err}")]
+        return [], [Finding(".", 0, "git-error", f"git {argv[0]} failed: {err}")]
     paths = split_nul_paths(res)
     findings: list[Finding] = []
     if len(paths) > MAX_LISTED_PATHS:
@@ -546,15 +548,36 @@ def origin_main_present(repo_root: Path) -> bool:
     """Return whether origin/main resolves to a commit."""
     try:
         git_output(repo_root, ["rev-parse", "--verify", "--quiet", "origin/main^{commit}"])
-    except subprocess.CalledProcessError:
-        return False
+    except subprocess.CalledProcessError as err:
+        if err.returncode == 1:
+            return False
+        raise
     return True
 
 
+def parse_batch_blob(stdout: bytes, rel: str) -> bytes:
+    """Extract blob bytes from git cat-file --batch --follow-symlinks -Z output."""
+    raw_header, sep, rest = stdout.partition(b"\0")
+    fields = raw_header.split()
+    if sep and len(fields) == 3 and fields[1] == b"blob" and fields[2].isdigit():
+        size = int(fields[2])
+        if len(rest) >= size:
+            return rest[:size]
+    header = raw_header.decode("utf-8", errors="replace")[:200]
+    raise ValueError(f"unsupported blob target for {rel}: {header}")
+
+
 def read_blob_lines(repo_root: Path, oid: str, rel: str) -> list[str]:
-    """Read one blob at a commit as UTF-8 text lines."""
-    raw = git_output(repo_root, ["cat-file", "blob", f"{oid}:{rel}"])
-    return raw.decode("utf-8", "ignore").splitlines()
+    """Read one committed file at a commit, following in-tree symlinks, as UTF-8 lines."""
+    proc = subprocess.run(  # noqa: S603 - fixed git command without shell. # nosec B603
+        ["git", "-C", str(repo_root), "cat-file", "--batch", "--follow-symlinks", "-Z"],  # noqa: S607 - git executable on runner PATH. # nosec B607
+        input=f"{oid}:{rel}\0".encode("utf-8", "surrogateescape"),
+        capture_output=True,
+        timeout=60,
+        check=True,
+    )
+    content = parse_batch_blob(proc.stdout, rel)
+    return content.decode("utf-8", "ignore").splitlines()
 
 
 def filter_in_scope(
@@ -593,7 +616,7 @@ def scan_pushed_ref(repo_root: Path, oid: str) -> list[Finding]:
     for rel in selected[:MAX_SCAN_FILES]:
         try:
             lines = read_blob_lines(repo_root, oid, rel)
-        except (subprocess.SubprocessError, OSError) as err:
+        except (subprocess.SubprocessError, OSError, ValueError) as err:
             blob = f"cannot read {oid[:12]}:{rel}: {err}"
             findings.append(Finding(rel, 0, "read-error", blob))
             continue
@@ -627,8 +650,17 @@ def scan_pre_push(repo_root: Path, stream: TextIO) -> list[Finding]:
     return findings
 
 
+def exit_code_for(findings: list[Finding]) -> int:
+    """Return 3 on operational errors, 1 on policy violations, or 0 when clean."""
+    if not findings:
+        return 0
+    if any(f.rule in OPERATIONAL_RULES for f in findings):
+        return 3
+    return 1
+
+
 def main() -> int:
-    """Run flake policy checks on specified paths or repository files."""
+    """Run flake policy checks and return 0 ok, 1 policy finding, or 3 error."""
     repo_root = Path(__file__).resolve().parent.parent.parent
     argv = sys.argv[1:]
     if argv and argv[0].startswith("--"):
@@ -649,7 +681,7 @@ def main() -> int:
     for f in findings:
         print(f"{f.path}:{f.line}: {f.rule}: {f.message}")
 
-    return 1 if findings else 0
+    return exit_code_for(findings)
 
 
 if __name__ == "__main__":

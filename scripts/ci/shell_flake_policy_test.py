@@ -220,10 +220,10 @@ class ShellFlakePolicyTest(unittest.TestCase):
 
     @patch("subprocess.check_output")
     def test_git_ls_files_failure_emits_finding(self, mock_ls: MagicMock) -> None:
-        """Verify git ls-files failure emits scan-limit finding and non-zero exit."""
+        """Verify git ls-files failure emits git-error finding."""
         mock_ls.side_effect = subprocess.SubprocessError("mock git error")
         findings = shell_flake_policy.scan_repository(self.temp_root, set())
-        self.assert_has_rule(findings, "scan-limit")
+        self.assert_has_rule(findings, "git-error")
 
     @patch("sys.stdout")
     @patch("subprocess.check_output")
@@ -231,10 +231,10 @@ class ShellFlakePolicyTest(unittest.TestCase):
     def test_main_exits_nonzero_on_ls_files_failure(
         self, mock_ls: MagicMock, mock_stdout: MagicMock
     ) -> None:
-        """Verify main() exits nonzero when git ls-files fails."""
+        """Verify main() exits with code 3 when git ls-files fails."""
         mock_ls.side_effect = subprocess.SubprocessError("mock git error")
         rc = shell_flake_policy.main()
-        self.assertEqual(rc, 1)
+        self.assertEqual(rc, 3)
 
     @patch.object(Path, "read_text", side_effect=OSError("mock read error"))
     def test_read_error_emits_finding(self, mock_read: MagicMock) -> None:
@@ -248,11 +248,11 @@ class ShellFlakePolicyTest(unittest.TestCase):
     def test_main_exits_nonzero_on_read_error(
         self, mock_read: MagicMock, mock_stdout: MagicMock
     ) -> None:
-        """Verify main() exits nonzero when a scanned file raises OSError."""
+        """Verify main() exits with code 3 when a scanned file raises OSError."""
         path = self.write_fixture("scripts/ci/unreadable.sh", "echo ok\n")
         with patch("sys.argv", ["shell_flake_policy.py", str(path)]):
             rc = shell_flake_policy.main()
-        self.assertEqual(rc, 1)
+        self.assertEqual(rc, 3)
 
     def test_boundary_yaml_list_item_block_scalar(self) -> None:
         """Verify list-item YAML block scalar headers are not joined with script lines."""
@@ -358,6 +358,21 @@ class ShellFlakePolicyPushedTest(unittest.TestCase):
             target.write_text(content, encoding="utf-8")
             self._git("add", rel)
         self._commit("fixture")
+
+    def _commit_symlink(self, rel: str, target: str) -> None:
+        """Stage and commit one git symlink entry without creating a filesystem link."""
+        proc = subprocess.run(  # noqa: S603 - fixed git argv in fixture, no shell. # nosec B603
+            ["git", "-C", str(self.repo_root), "hash-object", "-w", "--stdin"],  # noqa: S607 - git executable on runner PATH. # nosec B607
+            cwd=self.repo_root,
+            env=os.environ.copy(),
+            input=target.encode(),
+            capture_output=True,
+            check=True,
+            timeout=60,
+        )
+        blob = proc.stdout.decode("ascii").strip()
+        self._git("update-index", "--add", "--cacheinfo", f"120000,{blob},{rel}")
+        self._commit("symlink")
 
     def _base(self, mapping: dict[str, str]) -> None:
         """Seed origin/main at HEAD after one commit (empty mapping allowed)."""
@@ -711,6 +726,87 @@ class ShellFlakePolicyPushedTest(unittest.TestCase):
             with patch.object(sys, "argv", argv), contextlib.redirect_stderr(err):
                 self.assertEqual(shell_flake_policy.main(), 3)
             self.assertIn(needle, err.getvalue())
+
+    def test_p3_in_tree_symlink_follows_target(self) -> None:
+        """P3: in-scope symlink to an in-tree violation is flagged under the link path."""
+        self._base({"README.md": "x\n"})
+        self._commit_paths({"docs/payload.txt": "echo x | head -1\n"})
+        self._commit_symlink("scripts/ci/link.sh", "../../docs/payload.txt")
+        findings = self._push()
+        self.assertTrue(
+            any(
+                f.rule == "early-exit-reader" and f.path == "scripts/ci/link.sh"
+                for f in findings
+            )
+        )
+
+    def test_b12_in_tree_symlink_clean_target(self) -> None:
+        """B12: in-scope symlink to a clean in-tree target yields no findings."""
+        self._base({"README.md": "x\n"})
+        self._commit_paths({"docs/clean.txt": "echo ok\n"})
+        self._commit_symlink("scripts/ci/ok.sh", "../../docs/clean.txt")
+        self.assertEqual(self._push(), [])
+
+    def test_n11_out_of_tree_symlink_rejected(self) -> None:
+        """N11: symlink pointing outside the repository tree emits read-error."""
+        self._base({"README.md": "x\n"})
+        self._commit_symlink("scripts/ci/out.sh", "/etc/passwd")
+        findings = self._push()
+        self.assertTrue(
+            any(f.rule == "read-error" and f.path == "scripts/ci/out.sh" for f in findings)
+        )
+
+    def test_n12_dangling_symlink_rejected(self) -> None:
+        """N12: dangling in-tree symlink emits read-error for the link path."""
+        self._base({"README.md": "x\n"})
+        self._commit_symlink("scripts/ci/dang.sh", "missing.txt")
+        findings = self._push()
+        self.assertTrue(
+            any(f.rule == "read-error" and f.path == "scripts/ci/dang.sh" for f in findings)
+        )
+
+    def test_n13_origin_main_present_reraises_git_error(self) -> None:
+        """N13: non-ref git failure in origin_main_present emits git-error without skip notice."""
+        self._base({"README.md": "x\n"})
+        err = io.StringIO()
+        failure = subprocess.CalledProcessError(128, ["git"])
+        with (
+            patch.object(shell_flake_policy, "git_output", side_effect=failure),
+            contextlib.redirect_stderr(err),
+        ):
+            findings = self._push()
+        self.assertEqual([f.rule for f in findings], ["git-error"])
+        self.assertNotIn("origin/main not found", err.getvalue())
+
+    def test_n14_main_exit_3_on_malformed_stdin(self) -> None:
+        """N14: main() exits with code 3 and prints pre-push-input on malformed stdin."""
+        out = io.StringIO()
+        with (
+            patch.object(sys, "argv", ["shell_flake_policy.py", "--pre-push"]),
+            patch.object(sys, "stdin", io.StringIO("a b c\n")),
+            patch.object(sys, "stdout", out),
+            patch.object(shell_flake_policy, "origin_main_present", return_value=True),
+        ):
+            rc = shell_flake_policy.main()
+        self.assertEqual(rc, 3)
+        self.assertIn("pre-push-input", out.getvalue())
+
+    def test_p4_main_exit_1_violation_and_0_clean_push(self) -> None:
+        """P4: main() returns 1 on a pushed policy violation and 0 on a clean push."""
+        planted = [
+            shell_flake_policy.Finding("scripts/ci/p4.sh", 2, "early-exit-reader", "head -1")
+        ]
+        out = io.StringIO()
+        with (
+            patch.object(sys, "argv", ["shell_flake_policy.py", "--pre-push"]),
+            patch.object(sys, "stdin", io.StringIO("")),
+            patch.object(sys, "stdout", out),
+            patch.object(shell_flake_policy, "scan_pre_push", side_effect=[planted, []]),
+        ):
+            first_rc = shell_flake_policy.main()
+            second_rc = shell_flake_policy.main()
+        self.assertEqual((first_rc, second_rc), (1, 0))
+        self.assertIn("scripts/ci/p4.sh:2: early-exit-reader:", out.getvalue())
 
 
 if __name__ == "__main__":
