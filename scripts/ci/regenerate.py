@@ -38,6 +38,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.error
 import urllib.request
 import zipfile
 from collections.abc import Callable
@@ -593,14 +594,22 @@ def regenerate_module_sums(
     return commands
 
 
+def _https_opener() -> urllib.request.OpenerDirector:
+    """Return a redirect-free urllib opener restricted to HTTPS URLs."""
+    opener = urllib.request.OpenerDirector()
+    opener.add_handler(urllib.request.UnknownHandler())
+    opener.add_handler(urllib.request.HTTPSHandler())
+    opener.add_handler(urllib.request.HTTPDefaultErrorHandler())
+    opener.add_handler(urllib.request.HTTPErrorProcessor())
+    return opener
+
+
 def fetch_preset(url: str) -> bytes:
     """Return raw Renovate preset bytes from GitHub or refuse invalid URLs."""
     if not url.startswith("https://raw.githubusercontent.com/"):
         raise CheckError(f"unexpected Renovate preset URL: {url}")
     try:
-        with urllib.request.urlopen(  # noqa: S310 - https URL built from PRESET_URL in this file.
-            url, timeout=PRESET_TIMEOUT_SECONDS
-        ) as response:
+        with _https_opener().open(url, timeout=PRESET_TIMEOUT_SECONDS) as response:
             body: bytes = response.read(MAX_PRESET_BYTES + 1)
     except (OSError, ValueError) as error:
         raise CheckError(f"could not fetch Renovate preset {url}: {error}") from error
@@ -1853,6 +1862,50 @@ def run_release_age_accepted_cases(temp_dir: Path) -> tuple[list[str], int]:
     return failures, accepted
 
 
+def _refuse_opener_scheme(url: str, failures: list[str]) -> int:
+    """Return 1 when _https_opener refuses url before any scheme handler runs."""
+    try:
+        response = _https_opener().open(url, timeout=1)
+    except OSError as error:
+        if isinstance(error, urllib.error.HTTPError):
+            error.close()
+        if "unknown url type" in str(error):
+            return 1
+        failures.append(f"preset scheme {url} wrong OSError: {error}")
+        return 0
+    except AttributeError as error:
+        failures.append(f"preset scheme {url} returned None response: {error}")
+        return 0
+    if response is not None:
+        response.close()
+    failures.append(f"preset scheme {url} was not refused")
+    return 0
+
+
+def run_preset_scheme_cases(temp_dir: Path) -> tuple[list[str], int]:
+    """Return failures and refused count for non-HTTPS preset URL schemes."""
+    scheme_dir = temp_dir / "preset-scheme"
+    scheme_dir.mkdir(parents=True, exist_ok=True)
+    planted = scheme_dir / "default.json"
+    planted.write_text('{"minimumReleaseAge": "3 days"}\n', encoding="utf-8")
+    http_url = "http://raw.githubusercontent.com/example/preset/HEAD/default.json"
+    urls = (
+        planted.as_uri(),
+        http_url,
+        "ftp://example.invalid/default.json",
+        "data:,{}",
+    )
+    failures: list[str] = []
+    refused = sum(_refuse_opener_scheme(url, failures) for url in urls)
+    try:
+        fetch_preset(http_url)
+    except CheckError:
+        refused += 1
+    else:
+        failures.append(f"fetch_preset did not refuse {http_url}")
+    return failures, refused
+
+
 def run_trainer_lock_cases(
     repo: Path, temp_dir: Path, source_root: Path | None = None
 ) -> tuple[list[str], int, int]:
@@ -1866,10 +1919,11 @@ def run_trainer_lock_cases(
         repo, temp_dir, actual_root
     )
     ref_failures, refused = run_release_age_refusal_cases(temp_dir)
+    scheme_failures, scheme_refused = run_preset_scheme_cases(temp_dir)
     acc_failures, unit_accepted = run_release_age_accepted_cases(temp_dir)
     return (
-        [*repo_failures, *ref_failures, *acc_failures],
-        refused,
+        [*repo_failures, *ref_failures, *scheme_failures, *acc_failures],
+        refused + scheme_refused,
         repo_accepted + unit_accepted,
     )
 
