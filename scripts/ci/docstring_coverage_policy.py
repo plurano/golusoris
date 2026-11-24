@@ -16,6 +16,8 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import NamedTuple
 
+import shell_flake_policy
+
 MAX_FILES = 2000
 MAX_RAW_PATHS = 200_000
 MAX_SOURCE_LINES = 200_000
@@ -66,7 +68,8 @@ class DiffTouch(NamedTuple):
 def usage() -> None:
     """Print CLI usage to stderr."""
     prog = Path(sys.argv[0]).name
-    print(f"usage: {prog} [--base REF] --pushed [PATH...]", file=sys.stderr)
+    msg = f"usage: {prog} [--base REF] (--pushed [PATH...] | --pre-push)"
+    print(msg, file=sys.stderr)
 
 
 def normalize_paths(raw: list[str]) -> tuple[list[str], int]:
@@ -100,9 +103,9 @@ def _run_git_text(repo_root: Path, args: list[str]) -> str:
     return stdout
 
 
-def merge_base_sha(repo_root: Path, base_ref: str) -> str:
-    """Resolve merge-base between base_ref and HEAD."""
-    return _run_git_text(repo_root, ["merge-base", base_ref, "HEAD"]).strip()
+def merge_base_sha(repo_root: Path, base_ref: str, rev: str = "HEAD") -> str:
+    """Resolve merge-base between base_ref and rev."""
+    return _run_git_text(repo_root, ["merge-base", base_ref, rev]).strip()
 
 
 def blob_text(repo_root: Path, rev: str, path: str) -> str | None:
@@ -120,11 +123,6 @@ def blob_text(repo_root: Path, rev: str, path: str) -> str | None:
     if len(fields) < 2 or fields[1] != "blob":
         return None
     return _run_git_text(repo_root, ["show", f"{rev}:{path}"])
-
-
-def head_blob_text(repo_root: Path, path: str) -> str | None:
-    """Return committed blob at HEAD for path, or None when the path is absent."""
-    return blob_text(repo_root, "HEAD", path)
 
 
 def _parse_hunk_header(line: str) -> tuple[int, int, int, int] | None:
@@ -174,8 +172,10 @@ def parse_touched_lines(diff_text: str) -> set[int] | None:
     return parsed.lines
 
 
-def diff_touched_lines(repo_root: Path, base_sha: str, path: str) -> DiffTouch | None:
-    """Return diff touch metadata between base_sha and HEAD; None means every line."""
+def diff_touched_lines(
+    repo_root: Path, base_sha: str, path: str, rev: str = "HEAD"
+) -> DiffTouch | None:
+    """Return diff touch metadata between base_sha and rev; None means every line."""
     diff = _run_git_text(
         repo_root,
         [
@@ -186,12 +186,30 @@ def diff_touched_lines(repo_root: Path, base_sha: str, path: str) -> DiffTouch |
             "--no-color",
             "--no-ext-diff",
             base_sha,
-            "HEAD",
+            rev,
             "--",
             path,
         ],
     )
     return parse_diff(diff)
+
+
+def pushed_paths(repo_root: Path, base_sha: str, rev: str) -> list[str]:
+    """List non-deleted repository paths changed between base_sha and rev."""
+    out = _run_git_text(
+        repo_root,
+        [
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-renames",
+            "--no-relative",
+            "--diff-filter=d",
+            base_sha,
+            rev,
+        ],
+    )
+    return [item for item in out.split("\0") if item]
 
 
 def lf_lines(text: str) -> list[str]:
@@ -719,12 +737,14 @@ def check_source(path: str, text: str, touched: set[int] | None = None) -> list[
     return []
 
 
-def check_path(repo_root: Path, base_sha: str, path: str) -> list[Finding]:
-    """Check one repository path using committed HEAD content and branch diff."""
-    blob = head_blob_text(repo_root, path)
+def check_path(
+    repo_root: Path, base_sha: str, path: str, rev: str = "HEAD"
+) -> list[Finding]:
+    """Check one repository path using committed rev content and branch diff."""
+    blob = blob_text(repo_root, rev, path)
     if blob is None:
         return []
-    diff = diff_touched_lines(repo_root, base_sha, path)
+    diff = diff_touched_lines(repo_root, base_sha, path, rev)
     if diff is None:
         return check_source(path, blob, None)
     extra = deleted_owner_touch(repo_root, base_sha, path, diff)
@@ -734,12 +754,14 @@ def check_path(repo_root: Path, base_sha: str, path: str) -> list[Finding]:
     return check_source(path, blob, touched)
 
 
-def check(repo_root: Path, base_sha: str, paths: list[str]) -> list[Finding]:
-    """Check pushed paths against merge-base diff using committed HEAD blobs."""
+def check(
+    repo_root: Path, base_sha: str, paths: list[str], rev: str = "HEAD"
+) -> list[Finding]:
+    """Check pushed paths against merge-base diff using committed rev blobs."""
     norm_paths, _overflow = normalize_paths(paths)
     findings: list[Finding] = []
     for path in norm_paths:
-        findings.extend(check_path(repo_root, base_sha, path))
+        findings.extend(check_path(repo_root, base_sha, path, rev))
     findings.sort(key=lambda item: (item.path, item.line))
     return findings
 
@@ -755,10 +777,8 @@ def policy_repo_root() -> Path:
     return Path(__file__).resolve().parent.parent.parent
 
 
-def parse_args(argv: list[str]) -> tuple[str, list[str]] | None:
-    """Parse --base and --pushed; None means usage error."""
-    if argv and argv[0] not in ("--base", "--pushed"):
-        return None
+def parse_args(argv: list[str]) -> tuple[str, str, list[str]] | None:
+    """Parse --base with --pushed or --pre-push; None means usage error."""
     base_ref = "origin/main"
     rest = argv
     if rest and rest[0] == "--base":
@@ -766,9 +786,13 @@ def parse_args(argv: list[str]) -> tuple[str, list[str]] | None:
             return None
         base_ref = rest[1]
         rest = rest[2:]
-    if not rest or rest[0] != "--pushed":
+    if not rest:
         return None
-    return base_ref, rest[1:]
+    if rest[0] == "--pushed":
+        return base_ref, "pushed", rest[1:]
+    if rest[0] == "--pre-push" and len(rest) == 1:
+        return base_ref, "pre-push", []
+    return None
 
 
 def _git_failure_stderr(exc: subprocess.CalledProcessError) -> str:
@@ -779,39 +803,86 @@ def _git_failure_stderr(exc: subprocess.CalledProcessError) -> str:
     return f"docstring-coverage: git {cmd} failed: {tail}"
 
 
-def main() -> int:
-    """Parse argv, resolve merge base, and run docstring coverage checks."""
-    parsed = parse_args(sys.argv[1:])
-    if parsed is None:
-        usage()
-        return 3
-    base_ref, raw_paths = parsed
+def _resolve_merge_base(repo: Path, base_ref: str, rev: str = "HEAD") -> str | None:
+    """Resolve merge-base for rev or print a fetch hint to stderr."""
+    try:
+        return merge_base_sha(repo, base_ref, rev)
+    except subprocess.CalledProcessError:
+        print(
+            f"docstring-coverage: cannot resolve merge base with {base_ref}; fetch it",
+            file=sys.stderr,
+        )
+        return None
+
+
+def _normalize_with_note(raw_paths: list[str]) -> list[str]:
+    """Normalize paths and print any truncation warning to stderr."""
     paths, overflow = normalize_paths(raw_paths)
     if overflow:
         print(
             f"docstring-coverage: path list truncated; {overflow} paths not checked",
             file=sys.stderr,
         )
+    return paths
+
+
+def _run_pushed(repo: Path, base_ref: str, raw_paths: list[str]) -> tuple[int, list[Finding]]:
+    """Resolve HEAD merge-base and check explicit --pushed paths."""
+    paths = _normalize_with_note(raw_paths)
     if not paths:
         print("docstring-coverage: no pushed Python or shell files, skipping")
-        return 0
+        return 0, []
+    base_sha = _resolve_merge_base(repo, base_ref)
+    if base_sha is None:
+        return 3, []
+    return 0, check(repo, base_sha, paths)
+
+
+def _run_pre_push(repo: Path, base_ref: str) -> tuple[int, list[Finding]]:
+    """Read pushed refs from stdin and check each commit against base_ref."""
+    try:
+        oids = shell_flake_policy.read_push_oids(sys.stdin)
+    except ValueError as err:
+        print(f"docstring-coverage: pre-push input: {err}", file=sys.stderr)
+        return 3, []
+    if not oids:
+        print("docstring-coverage: no pushed refs, skipping")
+        return 0, []
+    findings: list[Finding] = []
+    for oid in oids[: shell_flake_policy.MAX_PUSH_REFS]:
+        base_sha = _resolve_merge_base(repo, base_ref, oid)
+        if base_sha is None:
+            return 3, []
+        paths = _normalize_with_note(pushed_paths(repo, base_sha, oid))
+        findings.extend(check(repo, base_sha, paths, oid))
+    unique = sorted(
+        set(findings),
+        key=lambda item: (item.path, item.line, item.rule, item.message),
+    )
+    return 0, unique
+
+
+def main() -> int:
+    """Parse argv and run docstring coverage checks in --pushed or --pre-push mode."""
+    parsed = parse_args(sys.argv[1:])
+    if parsed is None:
+        usage()
+        return 3
+    base_ref, mode, raw_paths = parsed
     repo = policy_repo_root()
     try:
-        base_sha = merge_base_sha(repo, base_ref)
-    except subprocess.CalledProcessError:
-        print(
-            f"docstring-coverage: cannot resolve merge base with {base_ref}; fetch it",
-            file=sys.stderr,
-        )
-        return 3
-    try:
-        findings = check(repo, base_sha, paths)
+        if mode == "pre-push":
+            rc, findings = _run_pre_push(repo, base_ref)
+        else:
+            rc, findings = _run_pushed(repo, base_ref, raw_paths)
     except subprocess.CalledProcessError as exc:
         print(_git_failure_stderr(exc), file=sys.stderr)
         return 3
     except ShellParserUnavailable as exc:
         print(str(exc), file=sys.stderr)
         return 3
+    if rc != 0:
+        return rc
     emit(findings)
     return 1 if findings else 0
 

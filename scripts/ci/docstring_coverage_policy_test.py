@@ -40,8 +40,8 @@ class GitFixture:
         env["GIT_CONFIG_NOSYSTEM"] = "1"
         return env
 
-    def _run(self, args: list[str]) -> None:
-        """Run one git command inside the fixture repository."""
+    def _run(self, args: list[str]) -> str:
+        """Run one git command inside the fixture repository and return stdout."""
         proc = subprocess.run(  # noqa: S603 - git argv only. # nosec B603
             ["git", *args],  # noqa: S607 - git on PATH. # nosec B607
             cwd=self.root,
@@ -53,6 +53,7 @@ class GitFixture:
         )
         if proc.returncode != 0:
             raise AssertionError(proc.stderr.strip() or proc.stdout.strip())
+        return proc.stdout
 
     def write(self, rel: str, text: str) -> None:
         """Write a tracked-path fixture file under the repository root."""
@@ -92,6 +93,14 @@ class GitFixture:
         """Create and switch to a topic branch."""
         self._run(["switch", "-q", "-c", name])
 
+    def rev_parse(self, name: str) -> str:
+        """Resolve a revision name to its full commit SHA."""
+        return self._run(["rev-parse", name]).strip()
+
+    def switch(self, name: str) -> None:
+        """Switch the working tree to an existing branch."""
+        self._run(["switch", "-q", name])
+
 
 class DocstringCoveragePolicyTest(unittest.TestCase):
     """Exercise planted positive, boundary, negative, wiring, and self-check cases."""
@@ -129,12 +138,13 @@ class DocstringCoveragePolicyTest(unittest.TestCase):
         base_sha = policy.merge_base_sha(fx.root, "refs/remotes/origin/main")
         return policy.check(fx.root, base_sha, [rel])
 
-    def run_main(self, argv: list[str]) -> tuple[int, str, str]:
+    def run_main(self, argv: list[str], stdin: str = "") -> tuple[int, str, str]:
         """Invoke main() with patched repository root and captured stdio."""
         out = io.StringIO()
         err = io.StringIO()
         with (
             patch.object(sys, "argv", ["docstring_coverage_policy.py", *argv]),
+            patch.object(sys, "stdin", io.StringIO(stdin)),
             patch.object(policy, "policy_repo_root", return_value=self.fx.root),
             redirect_stdout(out),
             redirect_stderr(err),
@@ -432,11 +442,12 @@ class DocstringCoveragePolicyTest(unittest.TestCase):
         root = Path(__file__).resolve().parents[2]
         hook = (root / "lefthook.yml").read_text(encoding="utf-8")
         block = hook.split("pre-push:")[1].split("\n\n", 1)[0]
-        self.assertIn("    docstring-coverage:", block)
-        run_line = (
-            "      run: sh .config/lefthook/python.sh -B scripts/ci/docstring_coverage_policy.py --pushed {push_files}"
+        stanza = (
+            "    docstring-coverage:\n"
+            "      run: sh .config/lefthook/python.sh -B scripts/ci/docstring_coverage_policy.py --pre-push\n"
+            "      use_stdin: true"
         )
-        self.assertIn(run_line, block)
+        self.assertIn(stanza, block)
         suite = (root / "scripts/ci/python-tests.sh").read_text(encoding="utf-8")
         self.assertIn("scripts/ci/docstring_coverage_policy_test.py", suite)
 
@@ -810,7 +821,7 @@ class DocstringCoveragePolicyTest(unittest.TestCase):
                 found = policy.check_source("scripts/ci/x.sh", text)
                 self.assertEqual([(item.line, item.rule) for item in found], [(4, "missing-docstring")])
                 self.assertIn("function g", found[0].message)
-        masked = 'f() {\n  x="$( (a) "if" )"\n}\n'
+        masked = 'f() {\n  x="$( (a); "if" )"\n}\n'
         self.assertEqual(policy.check_source("scripts/ci/x.sh", masked), [])
 
     def test_b46_shell_heredoc_in_substitution(self) -> None:
@@ -1164,20 +1175,28 @@ class DocstringCoveragePolicyTest(unittest.TestCase):
 
     def test_n15_shell_block_nesting_overflow(self) -> None:
         """N15: structural block nesting beyond the bound yields analysis-limit."""
-        text = "f() {\n" + "  {\n" * 5 + "  }\n" * 5 + "}\n"
+        text = "f() {\n" + "  {\n" * 5 + "  :\n" + "  }\n" * 5 + "}\n"
         with patch.object(policy, "MAX_SHELL_NESTING", 4):
             found = policy.check_source("scripts/ci/x.sh", text)
         self.assertEqual([item.rule for item in found], ["analysis-limit"])
         self.assertEqual(found[0].line, 1)
 
-
     def test_n16_usage_error_exits_three(self) -> None:
         """N16: malformed argv is a usage error with exit code three."""
-        for argv in ([], ["--bogus"], ["--base"], ["--base", "origin/main"]):
+        bad_argvs = (
+            [],
+            ["--bogus"],
+            ["--base"],
+            ["--base", "origin/main"],
+            ["--pre-push", "scripts/ci/x.py"],
+            ["--base", "origin/main", "--pre-push", "x"],
+        )
+        for argv in bad_argvs:
             with self.subTest(argv=argv):
-                code, out, _ = self.run_main(argv)
+                code, out, err = self.run_main(argv)
                 self.assertEqual(code, 3)
                 self.assertEqual(out, "")
+                self.assertIn("--pre-push", err)
 
     def test_b66_case_arm_paren_keeps_body_open(self) -> None:
         """B66: a case arm paren does not pop the case or the function block."""
@@ -1225,22 +1244,23 @@ class DocstringCoveragePolicyTest(unittest.TestCase):
                     self.assertEqual(found[0].line, 2)
 
     def test_b69_heredoc_dq_escape(self) -> None:
-        """B69: an escaped quote inside a double-quoted heredoc delimiter is removed like bash does."""
+        """B69: a double-quoted heredoc delimiter holding an escaped quote fails closed as parse-error under shfmt v3.14.1."""
         cases = (
+            # shfmt v3.14.1 reports unclosed here-document for this delimiter although bash accepts it.
             (
                 "escaped-quote",
                 'cat <<"E\\"OF"\ntext\nE"OF\ng() {\n  if true; then :; fi\n}\n',
-                [(4, "missing-docstring")],
+                [(1, "parse-error")],
+            ),
+            (
+                "masked-inside-heredoc",
+                'cat <<"E\\"OF"\ng() {\n  if true; then :; fi\n}\nE"OF\n',
+                [(1, "parse-error")],
             ),
             (
                 "literal-backslash",
                 'cat <<"E\\xOF"\ntext\nE\\xOF\ng() {\n  if true; then :; fi\n}\n',
                 [(4, "missing-docstring")],
-            ),
-            (
-                "masked-inside-heredoc",
-                'cat <<"E\\"OF"\ng() {\n  if true; then :; fi\n}\nE"OF\n',
-                [],
             ),
         )
         for label, text, expected in cases:
@@ -1402,6 +1422,61 @@ class DocstringCoveragePolicyTest(unittest.TestCase):
                     [(1, 1, 1, 1)],
                 )
             )
+
+    def test_p3_pre_push_checks_pushed_ref(self) -> None:
+        """P3: pre-push checks the pushed ref even when another branch is checked out."""
+        self.start_topic()
+        self.fx.write("scripts/ci/x.py", "def f(a):\n    if a:\n        return 1\n    return 2\n")
+        self.fx.commit("topic")
+        oid = self.fx.rev_parse("topic")
+        self.fx.switch("main")
+        stdin = f"refs/heads/topic {oid} refs/heads/topic {'0' * 40}\n"
+        code, out, _ = self.run_main(["--pre-push"], stdin=stdin)
+        self.assertEqual(code, 1)
+        self.assertIn("scripts/ci/x.py:1: missing-docstring", out)
+        head_code, _, _ = self.run_main(["--pushed", "scripts/ci/x.py"])
+        self.assertEqual(head_code, 0)
+
+    def test_n20_pre_push_input_errors(self) -> None:
+        """N20: malformed pre-push input exits 3; empty input and deletion-only pushes exit 0."""
+        deletion = f"refs/heads/x {'0' * 40} refs/heads/x {'1' * 40}\n"
+        cases = (
+            ("malformed", "bad line\n", 3, "", "pre-push input"),
+            ("empty", "", 0, "no pushed refs", ""),
+            ("deletion", deletion, 0, "no pushed refs", ""),
+        )
+        for label, stdin, expect_code, out_sub, err_sub in cases:
+            with self.subTest(case=label):
+                code, out, err = self.run_main(["--pre-push"], stdin=stdin)
+                self.assertEqual(code, expect_code)
+                if out_sub:
+                    self.assertIn(out_sub, out)
+                if err_sub:
+                    self.assertIn(err_sub, err)
+
+    def test_b82_pre_push_refs_share_commits(self) -> None:
+        """B82: two pushed refs sharing a commit report each finding once."""
+        body = "def f(a):\n    if a:\n        return 1\n    return 2\n"
+        self.start_topic()
+        self.fx.write("scripts/ci/x.py", body)
+        self.fx.commit("first")
+        oid1 = self.fx.rev_parse("topic")
+        self.fx.write("scripts/ci/y.py", body)
+        self.fx.commit("second")
+        oid2 = self.fx.rev_parse("topic")
+        self.fx.switch("main")
+        zeros = "0" * 40
+        stdin = (
+            f"refs/heads/a {oid1} refs/heads/a {zeros}\n"
+            f"refs/heads/b {oid2} refs/heads/b {zeros}\n"
+        )
+        code, out, _ = self.run_main(["--pre-push"], stdin=stdin)
+        self.assertEqual(code, 1)
+        lines = out.splitlines()
+        x_hits = [line for line in lines if line.startswith("scripts/ci/x.py:1:")]
+        y_hits = [line for line in lines if line.startswith("scripts/ci/y.py:1:")]
+        self.assertEqual(len(x_hits), 1)
+        self.assertEqual(len(y_hits), 1)
 
 
 if __name__ == "__main__":
