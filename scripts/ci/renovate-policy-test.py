@@ -80,6 +80,7 @@ EXPECTED = {
     ("tools/tool-versions.env", "koalaman/shellcheck", "github-releases"),
     ("tools/tool-versions.env", "mstorsjo/llvm-mingw", "github-release-attachments"),
     ("tools/tool-versions.env", "github.com/rhysd/actionlint", "go"),
+    ("tools/tool-versions.env", "github.com/mikefarah/yq/v4", "go"),
     ("tools/tool-versions.env", "github.com/daveshanley/vacuum", "go"),
     ("tools/tool-versions.env", "docker/buildx", "github-releases"),
     ("tools/tool-versions.env", "goreleaser/goreleaser", "github-releases"),
@@ -808,6 +809,59 @@ def test_chromedp_group(config: dict[str, object]) -> bool:
     return True
 
 
+def goenvoy_group_valid(config: dict[str, object]) -> bool:
+    """Require one active goenvoy package rule with the canonical goenvoy pattern."""
+    rules = config.get("packageRules")
+    if not isinstance(rules, list):
+        return False
+    matching = 0
+    for rule in rules:
+        if not isinstance(rule, dict) or rule.get("enabled") is False:
+            continue
+        if rule.get("matchDatasources") != ["go"] or rule.get("groupName") != "goenvoy modules":
+            continue
+        if rule.get("matchPackageNames") != ["github.com/golusoris/goenvoy/**"]:
+            return False
+        matching += 1
+    return matching == 1
+
+
+def test_goenvoy_group(config: dict[str, object]) -> bool:
+    """Report a missing goenvoy group; refuse removed, widened, renamed, external-added and single-star rules."""
+    if not goenvoy_group_valid(config):
+        print(
+            'renovate.json must group goenvoy module updates in one "goenvoy modules" branch',
+            file=sys.stderr,
+        )
+        return False
+    patches: tuple[tuple[str, dict[str, object] | None], ...] = (
+        ("removed", None),
+        ("widened", {"matchPackageNames": ["github.com/golusoris/**"]}),
+        ("renamed", {"groupName": "goenvoy"}),
+        (
+            "external added",
+            {"matchPackageNames": ["github.com/golusoris/goenvoy/**", "github.com/google/uuid"]},
+        ),
+        ("single star", {"matchPackageNames": ["github.com/golusoris/goenvoy/*"]}),
+    )
+    for name, patch in patches:
+        mutated = json.loads(json.dumps(config))
+        if patch is None:
+            mutated["packageRules"] = [
+                rule
+                for rule in mutated["packageRules"]
+                if rule.get("groupName") != "goenvoy modules"
+            ]
+        else:
+            for rule in mutated["packageRules"]:
+                if rule.get("groupName") == "goenvoy modules":
+                    rule.update(patch)
+        if goenvoy_group_valid(mutated):
+            print(f"goenvoy group negative control ({name}) was accepted", file=sys.stderr)
+            return False
+    return True
+
+
 def test_pin_inventory(found: list[dict[str, str]]) -> bool:
     """Require the exact declared nonstandard dependency inventory."""
     actual = identities(found)
@@ -985,7 +1039,7 @@ def core_indirect_rule_valid(config: dict[str, object], core_gomod: str) -> bool
     ]
     if len(rules) != 1 or rules[0].get("enabled") is not True:
         return False
-    if "gomodTidy" not in config.get("postUpdateOptions", []):
+    if "gomodTidyAll" not in config.get("postUpdateOptions", []):
         return False
     return sorted(rules[0].get("matchPackageNames", [])) == sorted(core_direct_requires(core_gomod))
 
@@ -994,7 +1048,7 @@ def test_core_indirect_rule(config: dict[str, object], core_gomod: str) -> bool:
     """Report drift between the core-indirect rule and core/go.mod, with negative controls."""
     if not core_indirect_rule_valid(config, core_gomod):
         print("renovate core-indirect rule differs from core/go.mod direct requirements "
-              "or gomodTidy is missing", file=sys.stderr)
+              "or gomodTidyAll is missing", file=sys.stderr)
         return False
     added_dependency = core_gomod.replace("require (\n", "require (\n\texample.com/new v1.0.0\n", 1)
     if core_indirect_rule_valid(config, added_dependency):
@@ -1003,7 +1057,12 @@ def test_core_indirect_rule(config: dict[str, object], core_gomod: str) -> bool:
     without_tidy = json.loads(json.dumps(config))
     without_tidy["postUpdateOptions"] = []
     if core_indirect_rule_valid(without_tidy, core_gomod):
-        print("negative control accepted the rule without gomodTidy", file=sys.stderr)
+        print("negative control accepted the rule without gomodTidyAll", file=sys.stderr)
+        return False
+    gomod_tidy_only = json.loads(json.dumps(config))
+    gomod_tidy_only["postUpdateOptions"] = ["gomodTidy"]
+    if core_indirect_rule_valid(gomod_tidy_only, core_gomod):
+        print("negative control accepted the rule with gomodTidy only", file=sys.stderr)
         return False
     return True
 
@@ -1426,6 +1485,7 @@ def main() -> int:
         test_trainer_python_cap(config),
         test_sidecar_python_cap(config),
         test_chromedp_group(config),
+        test_goenvoy_group(config),
         test_minimum_age(config),
         test_runner_hold(config),
         test_rate_limits(config),
