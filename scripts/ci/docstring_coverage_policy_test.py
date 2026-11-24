@@ -1194,6 +1194,36 @@ class DocstringCoveragePolicyTest(unittest.TestCase):
         self.assertEqual(found[0].line, 1)
         self.assertEqual(policy.check_source("scripts/ci/x.sh", text, {7}), [])
 
+    def test_b68_shell_doc_deletion_under_directive(self) -> None:
+        """B68: deleting a doc comment below a kept shellcheck directive still touches the function."""
+        cases = (
+            (
+                "directive-only-kept",
+                "# shellcheck disable=SC2034\n# Explain f\nf() {\n  if a; then b; fi\n}\n",
+                "# shellcheck disable=SC2034\nf() {\n  if a; then b; fi\n}\n",
+                1,
+            ),
+            (
+                "second-doc-kept",
+                "# shellcheck disable=SC2034\n# Explain f\n# more\nf() {\n  if a; then b; fi\n}\n",
+                "# shellcheck disable=SC2034\n# more\nf() {\n  if a; then b; fi\n}\n",
+                0,
+            ),
+            (
+                "unrelated-tail-append",
+                "# Explain f\nf() {\n  if a; then b; fi\n}\n",
+                "# Explain f\nf() {\n  if a; then b; fi\n}\n# tail\n",
+                0,
+            ),
+        )
+        for label, base, topic, expect_len in cases:
+            with self.subTest(case=label):
+                found = self.branch_fixture("scripts/ci/x.sh", base, topic)
+                self.assertEqual(len(found), expect_len)
+                if expect_len:
+                    self.assertEqual(found[0].rule, "missing-docstring")
+                    self.assertEqual(found[0].line, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

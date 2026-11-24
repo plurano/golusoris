@@ -408,7 +408,7 @@ def _shell_deleted_owner_lines(
         span = (span_lo, span_hi)
         if not _ranges_hit_span(span, ranges):
             continue
-        surv = _surviving_new_line(span, hunks)
+        surv = _surviving_new_line((def_line, span_hi), hunks)
         if surv is not None:
             owners.add(surv)
     return owners
