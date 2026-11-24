@@ -80,6 +80,7 @@ SCALAR_PATHS = [
 TOOL_VERSIONS = "tools/tool-versions.env"
 MAX_TOOL_VERSION_LINES = 256
 MODULE_SUM_LINE = re.compile(r"(?P<name>[A-Z][A-Z0-9_]*)_MODULE_SUM=(?P<sum>\S*)")
+MODULE_SUM_PREFIX = re.compile(r"[A-Z][A-Z0-9_]*_MODULE_SUM=")
 MODULE_SUM_VALUE = re.compile(r"h1:[A-Za-z0-9+/]{43}=")
 GO_PIN_COMMENT = re.compile(
     r"# renovate: datasource=go depName=(?P<module>\S+)(?: .*)?"
@@ -441,6 +442,12 @@ def module_sum_pins(text: str) -> list[tuple[str, str, int]]:
     for i in range(min(len(lines), MAX_TOOL_VERSION_LINES)):
         sum_match = MODULE_SUM_LINE.fullmatch(lines[i])
         if sum_match is None:
+            if MODULE_SUM_PREFIX.match(lines[i]) is not None:
+                msg = (
+                    f"{TOOL_VERSIONS}:{i + 1}: module sum pin must be "
+                    "NAME_MODULE_SUM=<sum> with no comment or trailing space"
+                )
+                raise CheckError(msg)
             continue
         name = sum_match["name"]
         prefix = f"{name}_VERSION="
@@ -1100,6 +1107,14 @@ def run_module_sum_refusal_cases(
                 f"# missing version\nTOOL_MODULE_SUM={sample_sum}\n"
             ),
         ),
+        ("trailing-comment", (
+            "# renovate: datasource=go depName=example.com/tool\n"
+            f"TOOL_VERSION=v0.1.0\nTOOL_MODULE_SUM={sample_sum} # checksum\n"
+        )),
+        ("trailing-space", (
+            "# renovate: datasource=go depName=example.com/tool\n"
+            f"TOOL_VERSION=v0.1.0\nTOOL_MODULE_SUM={sample_sum} \n"
+        )),
     )
     failures: list[str] = []
     refused = 0
