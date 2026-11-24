@@ -801,6 +801,77 @@ class ShellFlakePolicyPushedTest(unittest.TestCase):
             any(f.rule == "read-error" and f.path == "scripts/ci/dir.sh" for f in findings)
         )
 
+    @patch.object(shell_flake_policy, "MAX_PUSH_REFS", 2)
+    def test_n16_blank_lines_count_toward_ref_bound(self) -> None:
+        """N16: blank lines count toward MAX_PUSH_REFS, so no ref line is left unread."""
+        self._base({"README.md": "x\n"})
+        oid = self._out("rev-parse", "HEAD")
+        zeros = "0" * 40
+        stream = io.StringIO(
+            "\n"
+            f"refs/heads/r0 {oid} refs/heads/r0 {zeros}\n"
+            f"refs/heads/r1 {oid} refs/heads/r1 {zeros}\n"
+        )
+        findings = shell_flake_policy.scan_pre_push(self.repo_root, stream)
+        self.assertTrue(
+            any(
+                f.rule == "pre-push-input" and "ref count exceeds 2" in f.message
+                for f in findings
+            )
+        )
+
+    def test_b13_duplicate_oid_scanned_once(self) -> None:
+        """B13: two refs at one oid scan that commit once."""
+        self._base({"README.md": "x\n"})
+        self._commit_paths({"scripts/ci/dup.sh": "echo x | head -1\n"})
+        oid = self._out("rev-parse", "HEAD")
+        zeros = "0" * 40
+        stream = io.StringIO(
+            f"refs/heads/a {oid} refs/heads/a {zeros}\n"
+            f"refs/heads/b {oid} refs/heads/b {zeros}\n"
+        )
+        findings = shell_flake_policy.scan_pre_push(self.repo_root, stream)
+        readers = [f for f in findings if f.rule == "early-exit-reader"]
+        self.assertEqual(len(readers), 1)
+
+    def test_b14_empty_stdin_skips_with_message(self) -> None:
+        """B14: empty pre-push stdin returns no findings and says why."""
+        self._base({"README.md": "x\n"})
+        err = io.StringIO()
+        with patch.object(sys, "stderr", err):
+            findings = shell_flake_policy.scan_pre_push(
+                self.repo_root, io.StringIO("")
+            )
+        self.assertEqual(findings, [])
+        self.assertIn("no pushed refs, skipping", err.getvalue())
+
+    def test_n17_git_error_ref_keeps_scanning_later_refs(self) -> None:
+        """N17: a ref whose merge base fails still lets later refs be scanned."""
+        self._base({"README.md": "x\n"})
+        self._commit_paths({"scripts/ci/late.sh": "echo x | head -1\n"})
+        good = self._out("rev-parse", "HEAD")
+        bogus = "1" * 40
+        zeros = "0" * 40
+        stream = io.StringIO(
+            f"refs/heads/bogus {bogus} refs/heads/bogus {zeros}\n"
+            f"refs/heads/topic {good} refs/heads/topic {zeros}\n"
+        )
+        findings = shell_flake_policy.scan_pre_push(self.repo_root, stream)
+        self.assertTrue(any(f.rule == "git-error" for f in findings))
+        self.assertTrue(
+            any(
+                f.rule == "early-exit-reader" and f.path == "scripts/ci/late.sh"
+                for f in findings
+            )
+        )
+
+    def test_n18_truncated_blob_body_rejected(self) -> None:
+        """N18: a blob answer shorter than its header size is rejected."""
+        with self.assertRaises(ValueError):
+            shell_flake_policy.parse_batch_blob(
+                b"a" * 40 + b" blob 10\0abc", "scripts/ci/t.sh"
+            )
+
     def test_p4_main_exit_1_violation_and_0_clean_push(self) -> None:
         """P4: main() returns 1 on a pushed policy violation and 0 on a clean push."""
         planted = [

@@ -517,20 +517,20 @@ def parse_push_line(line: str) -> str:
 
 
 def read_push_oids(stream: TextIO) -> list[str]:
-    """Read bounded pre-push ref oids from stdin, deduplicated in first-seen order."""
+    """Read pre-push ref oids from stdin, deduplicated in first-seen order; every line read counts toward MAX_PUSH_REFS."""
     oids: list[str] = []
     seen: set[str] = set()
-    nonempty = 0
+    lines_read = 0
     for _ in range(MAX_PUSH_REFS + 1):
         line = stream.readline()
         if line == "":
             break
+        lines_read += 1
+        if lines_read > MAX_PUSH_REFS:
+            raise ValueError(f"pre-push ref count exceeds {MAX_PUSH_REFS}")
         stripped = line.strip()
         if not stripped:
             continue
-        nonempty += 1
-        if nonempty > MAX_PUSH_REFS:
-            raise ValueError(f"pre-push ref count exceeds {MAX_PUSH_REFS}")
         oid = parse_push_line(stripped)
         if not oid or oid in seen:
             continue
