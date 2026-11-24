@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import ast
 import itertools
+import json
+import os
 import re
-import subprocess  # Runs only fixed git invocations below. # nosec B404
+import subprocess  # Runs only fixed git and shfmt invocations below. # nosec B404
 import sys
 from collections.abc import Iterable
 from pathlib import Path
@@ -20,19 +22,26 @@ MAX_SOURCE_LINES = 200_000
 MAX_HUNKS = 5000
 MAX_SHELL_BODY_LINES = 10000
 MAX_SHELL_NESTING = 64
+MAX_SHELL_AST_NODES = 5_000_000
 GIT_TIMEOUT_SECONDS = 60
+SHFMT_TIMEOUT_SECONDS = 60
 HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
-SHELL_DEF_LINE_RE = re.compile(
-    r"^\s*(?:function\s+([A-Za-z_][A-Za-z0-9_:-]*)\s*(?:\(\s*\))?|"
-    r"([A-Za-z_][A-Za-z0-9_:-]*)\s*\(\s*\))\s*(.*)$"
+SHFMT_ERROR_RE = re.compile(r"^(?:<standard input>:)?(\d+):(\d+): (.*)$")
+_SH_NEST_TYPES = frozenset(
+    {
+        "Block",
+        "Subshell",
+        "IfClause",
+        "WhileClause",
+        "ForClause",
+        "CaseClause",
+        "CmdSubst",
+        "ProcSubst",
+        "FuncDecl",
+    }
 )
-SH_TOKEN_RE = re.compile(r";;&|;;|;&|&&|\|\||\|&|&>>|&>|>>|[<>]&|[;&|()<>]|[^\s;&|()<>]+")
-_SH_SEPARATORS = frozenset({";", "&", "&&", "|", "||", "|&", ";;", ";&", ";;&", "(", ")"})
-_SH_REDIRECTS = frozenset({"<", ">", ">>", "<&", ">&", "&>", "&>>"})
-_SH_KEEP_CMD = frozenset({"if", "elif", "while", "until", "then", "do", "else", "!", "{", "}", "time", "fi", "done", "esac"})
-_SH_DECISIONS = frozenset({"if", "elif", "for", "while", "until"})
-_SH_LOOP_OPEN = frozenset({"for", "while", "until", "select"})
-_SH_COMMENT_BEFORE = frozenset("&;|()<>")
+_SH_SHORT_CIRCUIT = frozenset({"&&", "||"})
+_SH_BINARY_TYPES = frozenset({"BinaryCmd", "BinaryTest", "BinaryArithm"})
 PY_NEWLINE_RE = re.compile(r"\r\n|\r|\n")
 
 
@@ -46,7 +55,7 @@ class Finding(NamedTuple):
 
 
 class DiffTouch(NamedTuple):
-    """New-side touched lines plus old-side deletion hunk metadata."""
+    """New-side touched lines plus old-side replaced or deleted hunk metadata."""
 
     lines: set[int]
     deleted: list[tuple[int, int]]
@@ -118,6 +127,18 @@ def head_blob_text(repo_root: Path, path: str) -> str | None:
     return blob_text(repo_root, "HEAD", path)
 
 
+def _parse_hunk_header(line: str) -> tuple[int, int, int, int] | None:
+    """Parse one unified diff @@ header into (old_start, old_count, new_start, new_count)."""
+    match = HUNK_RE.match(line)
+    if not match:
+        return None
+    old_start = int(match.group(1))
+    old_count = int(match.group(2)) if match.group(2) is not None else 1
+    new_start = int(match.group(3))
+    new_count = int(match.group(4)) if match.group(4) is not None else 1
+    return (old_start, old_count, new_start, new_count)
+
+
 def parse_diff(diff_text: str) -> DiffTouch | None:
     """Parse unified diff hunks into touch and deletion metadata; None means every line."""
     lines: set[int] = set()
@@ -131,21 +152,16 @@ def parse_diff(diff_text: str) -> DiffTouch | None:
         hunks += 1
         if hunks > MAX_HUNKS:
             return None
-        match = HUNK_RE.match(line)
-        if not match:
+        parsed = _parse_hunk_header(line)
+        if parsed is None:
             return None
-        old_start = int(match.group(1))
-        old_count = int(match.group(2)) if match.group(2) is not None else 1
-        new_start = int(match.group(3))
-        new_count = int(match.group(4)) if match.group(4) is not None else 1
-        hunks_list.append((old_start, old_count, new_start, new_count))
+        old_start, old_count, new_start, new_count = parsed
+        hunks_list.append(parsed)
         if new_count > 0:
             end_line = new_start + new_count - 1
-            for num in range(new_start, min(end_line, MAX_SOURCE_LINES) + 1):
-                lines.add(num)
-        else:
-            old_end = old_start + old_count - 1
-            deleted.append((old_start, old_end))
+            lines.update(range(new_start, min(end_line, MAX_SOURCE_LINES) + 1))
+        if old_count > 0:
+            deleted.append((old_start, old_start + old_count - 1))
             anchors.append(max(new_start, 1))
     return DiffTouch(lines, deleted, anchors, hunks_list)
 
@@ -348,12 +364,12 @@ def _python_deleted_owner_lines(
     hunks: list[tuple[int, int, int, int]],
 ) -> set[int] | None:
     """Collect new-side owner lines for Python functions intersecting deletion ranges."""
+    if len(lf_lines(base)) + base.count("\r") - base.count("\r\n") > MAX_SOURCE_LINES:
+        return None
     line_map = python_git_lines(base)
     try:
         tree = ast.parse(base, filename=path)
     except (SyntaxError, ValueError):
-        return None
-    if len(lf_lines(base)) > MAX_SOURCE_LINES:
         return None
     owners: set[int] = set()
     for _qual, fn in iter_named_functions(tree):
@@ -366,26 +382,6 @@ def _python_deleted_owner_lines(
     return owners
 
 
-def _shell_function_span(def_line: int, def_idx: int, body_end: int) -> tuple[int, int]:
-    """Return inclusive shell function span through the body closer line."""
-    return (def_line, max(body_end, def_idx) + 1)
-
-
-def _shell_doc_block_start(lines: list[str], def_idx: int) -> int:
-    """Return 1-based line at the top of contiguous shell doc comments above def_idx."""
-    idx = def_idx - 1
-    start = def_idx + 1
-    while idx >= 0:
-        text = lines[idx].lstrip()
-        if not text.startswith("#"):
-            break
-        if text.startswith("#!"):
-            break
-        start = idx + 1
-        idx -= 1
-    return start
-
-
 def _shell_deleted_owner_lines(
     base: str,
     ranges: list[tuple[int, int]],
@@ -395,20 +391,19 @@ def _shell_deleted_owner_lines(
     lines = lf_lines(base)
     if len(lines) > MAX_SOURCE_LINES:
         return None
-    code = _shell_code_lines(lines)
-    if code is None:
+    parsed = parse_shell(base)
+    if parsed.tree is None:
         return None
+    found = shell_functions(parsed.tree)
+    if found is None:
+        return None
+    funcs, comments = found
     owners: set[int] = set()
-    defs = _shell_function_defs(lines, code)
-    if defs is None:
-        return None
-    for def_line, _name, def_idx, _bs, body_end, _tail, _over in defs:
-        span_lo = _shell_doc_block_start(lines, def_idx)
-        _, span_hi = _shell_function_span(def_line, def_idx, body_end)
-        span = (span_lo, span_hi)
+    for fn in funcs:
+        span = (_shell_doc_block_start(lines, comments, fn.start), fn.end)
         if not _ranges_hit_span(span, ranges):
             continue
-        surv = _surviving_new_line((def_line, span_hi), hunks)
+        surv = _surviving_new_line((fn.start, fn.end), hunks)
         if surv is not None:
             owners.add(surv)
     return owners
@@ -460,506 +455,241 @@ def check_python_source(path: str, source: str, touched: set[int]) -> list[Findi
     return findings
 
 
-_SH_DQ_ESCAPABLE = frozenset({'"', "\\", "$", "`"})
+class ShellParserUnavailable(RuntimeError):
+    """shfmt could not run, so shell files cannot be checked."""
 
 
-def _sh_heredoc_quoted(line: str, pos: int, quote: str) -> tuple[str, str, int]:
-    """Consume one character or double-quote escape inside a quoted heredoc part."""
-    ch = line[pos]
-    if ch == quote:
-        return "", "", pos + 1
-    if quote == '"' and ch == "\\" and pos + 1 < len(line) and line[pos + 1] in _SH_DQ_ESCAPABLE:
-        return line[pos + 1], quote, pos + 2
-    return ch, quote, pos + 1
+class ShellAst(NamedTuple):
+    """Parsed shell AST, or the finding that replaces it."""
+
+    tree: dict[str, object] | None
+    line: int
+    rule: str
+    message: str
 
 
-def _sh_heredoc_word(line: str, pos: int) -> tuple[str, int]:
-    """Return one shell word starting at pos as a heredoc delimiter."""
-    out: list[str] = []
-    quote = ""
-    while pos < len(line):
-        ch = line[pos]
-        if quote:
-            piece, quote, pos = _sh_heredoc_quoted(line, pos, quote)
-            out.append(piece)
-            continue
-        if ch.isspace() or ch in ";&|<>()":
-            break
-        if ch in "'\"":
-            quote = ch
-        elif ch == "\\" and pos + 1 < len(line):
-            pos += 1
-            out.append(line[pos])
-        else:
-            out.append(ch)
-        pos += 1
-    return "".join(out), pos
+class ShellFunction(NamedTuple):
+    """One shell function with its git line span and complexity."""
+
+    name: str
+    start: int
+    end: int
+    complexity: int
 
 
-def _sh_comment_hash(line: str, pos: int) -> bool:
-    """Return whether # at pos begins a comment in shell code context."""
-    if pos >= len(line) or line[pos] != "#":
-        return False
-    if pos == 0:
-        return True
-    prev = line[pos - 1]
-    return prev.isspace() or prev in _SH_COMMENT_BEFORE
+def shfmt_bin() -> str:
+    """Return the configured shfmt executable path or name."""
+    return os.environ.get("SHFMT_BIN") or "shfmt"
 
 
-_SH_QUOTE_OPEN = {"'": "sq", '"': "dq", "`": "bkt"}
-_SH_CLOSER = {"sq": "'", "ansic": "'", "dq": '"', "bkt": "`", "cmd": ")", "paren": ")", "param": "}"}
-_SH_LITERAL = frozenset({"sq", "ansic"})
-_SH_QUOTED = frozenset({"dq", "param"})
+def _shfmt_parse_error(stderr: bytes) -> ShellAst:
+    """Build a parse-error ShellAst from shfmt stderr bytes."""
+    first = stderr.decode("utf-8", "replace").partition("\n")[0].rstrip("\r")
+    match = SHFMT_ERROR_RE.match(first)
+    if match:
+        return ShellAst(None, int(match.group(1)), "parse-error", match.group(3))
+    return ShellAst(None, 1, "parse-error", first or "shfmt failed")
 
 
-class _ShCodeScan:
-    """Quote-aware shell code view built one source line at a time."""
-
-    def __init__(self) -> None:
-        """Initialize the context stack and heredoc queues."""
-        self._ctx: list[str] = ["code"]
-        self._overflow = False
-        self._next_hd: list[tuple[str, bool]] = []
-        self._active_hd: tuple[str, bool] | None = None
-
-    def _push(self, label: str) -> None:
-        """Enter a nested context; flag overflow past MAX_SHELL_NESTING."""
-        self._ctx.append(label)
-        if len(self._ctx) > MAX_SHELL_NESTING:
-            self._overflow = True
-
-    def _queue_heredoc(self, line: str, pos: int) -> int:
-        """Parse <<[-]WORD and queue a pending heredoc; return new index."""
-        pos += 2
-        strip_tabs = False
-        if pos < len(line) and line[pos] == "-":
-            strip_tabs = True
-            pos += 1
-        while pos < len(line) and line[pos].isspace():
-            pos += 1
-        word, pos = _sh_heredoc_word(line, pos)
-        if word:
-            self._next_hd.append((word, strip_tabs))
-        return pos
-
-    def _close(self, line: str, pos: int) -> tuple[str, int] | None:
-        """Leave the active context when pos holds its closer."""
-        top = self._ctx[-1]
-        if top == "arith" and line.startswith("))", pos):
-            self._ctx.pop()
-            return "", pos + 2
-        if _SH_CLOSER.get(top) != line[pos]:
-            return None
-        self._ctx.pop()
-        closer = ")" if top in ("paren", "cmd", "bkt") else ""
-        return closer, pos + 1
-
-    def _open_dollar(self, line: str, pos: int, ansic: bool) -> tuple[str, int] | None:
-        """Enter $'...', $((...)), $(...) or ${...} when pos opens one."""
-        if line[pos] != "$":
-            return None
-        nxt = line[pos + 1 : pos + 3]
-        if ansic and nxt.startswith("'"):
-            self._push("ansic")
-            return "", pos + 2
-        if nxt == "((":
-            self._push("arith")
-            return "", pos + 3
-        if nxt.startswith("("):
-            self._push("cmd")
-            return "$(", pos + 2
-        if nxt.startswith("{"):
-            self._push("param")
-            return "__", pos + 2
-        return None
-
-    def _step_quoted(self, line: str, pos: int, top: str) -> tuple[str, int]:
-        """Step inside double quotes or ${...}: expansions nest, other text masks."""
-        opened = self._open_dollar(line, pos, ansic=False)
-        if opened is not None:
-            return opened
-        ch = line[pos]
-        if ch == "`":
-            self._push("bkt")
-            return "$(", pos + 1
-        if top == "param" and ch in "'\"":
-            self._push(_SH_QUOTE_OPEN[ch])
-            return "", pos + 1
-        return ("_" if not ch.isspace() else ch), pos + 1
-
-    def _step_code(self, line: str, pos: int, top: str) -> tuple[str, int]:
-        """Step inside code, $(...), (...), backticks or $((...))."""
-        opened = self._open_dollar(line, pos, ansic=True)
-        if opened is not None:
-            return opened
-        ch = line[pos]
-        if ch == "`":
-            self._push("bkt")
-            return "$(", pos + 1
-        if ch in _SH_QUOTE_OPEN:
-            self._push(_SH_QUOTE_OPEN[ch])
-            return "", pos + 1
-        if ch == "(":
-            self._push("paren")
-            return ch, pos + 1
-        if top == "arith":
-            return ch, pos + 1
-        if line.startswith("<<<", pos):
-            return "<<<", pos + 3
-        if line.startswith("<<", pos):
-            return "", self._queue_heredoc(line, pos)
-        if _sh_comment_hash(line, pos):
-            return "", len(line)
-        return ch, pos + 1
-
-    def _step(self, line: str, pos: int) -> tuple[str, int]:
-        """Consume one lexer step for the active context."""
-        top = self._ctx[-1]
-        if top != "sq" and line[pos] == "\\" and pos + 1 < len(line):
-            return "__", pos + 2
-        closed = self._close(line, pos)
-        if closed is not None:
-            return closed
-        if top in _SH_LITERAL:
-            return ("_" if not line[pos].isspace() else line[pos]), pos + 1
-        if top in _SH_QUOTED:
-            return self._step_quoted(line, pos, top)
-        return self._step_code(line, pos, top)
-
-    def _heredoc_line(self, raw: str) -> None:
-        """Consume one heredoc body line; advance the queue when the delimiter closes."""
-        if self._active_hd is None:
-            return
-        delim, strip_tabs = self._active_hd
-        line = raw.lstrip("\t") if strip_tabs else raw
-        if line == delim:
-            self._active_hd = self._next_hd.pop(0) if self._next_hd else None
-
-    def line(self, raw: str) -> str | None:
-        """Return the code view for one physical line, or None when nesting overflows."""
-        if self._active_hd is not None:
-            self._heredoc_line(raw)
-            return ""
-        out: list[str] = []
-        pos = 0
-        while pos < len(raw):
-            chunk, pos = self._step(raw, pos)
-            if self._overflow:
-                return None
-            out.append(chunk)
-        if self._next_hd:
-            self._active_hd = self._next_hd.pop(0)
-        return "".join(out)
+def parse_shell(source: str) -> ShellAst:
+    """Parse bash source into a shfmt JSON AST or a fail-closed finding."""
+    binary = shfmt_bin()
+    try:
+        proc = subprocess.run(  # noqa: S603 - fixed shfmt argv, no shell. # nosec B603
+            [binary, "-ln", "bash", "--to-json"],  # nosec B607
+            input=source.encode("utf-8"),
+            capture_output=True,
+            timeout=SHFMT_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except OSError as err:
+        raise ShellParserUnavailable(
+            f"docstring-coverage: cannot run {binary}: run make tools-bootstrap or set SHFMT_BIN"
+        ) from err
+    except subprocess.TimeoutExpired as err:
+        raise ShellParserUnavailable(
+            f"docstring-coverage: shfmt timed out after {SHFMT_TIMEOUT_SECONDS}s"
+        ) from err
+    if proc.returncode != 0:
+        return _shfmt_parse_error(proc.stderr)
+    try:
+        tree = json.loads(proc.stdout)
+    except RecursionError:
+        return ShellAst(None, 1, "analysis-limit", f"shell nesting deeper than {MAX_SHELL_NESTING}")
+    except ValueError:
+        return ShellAst(None, 1, "parse-error", "shfmt output is not a JSON object")
+    if not isinstance(tree, dict):
+        return ShellAst(None, 1, "parse-error", "shfmt output is not a JSON object")
+    return ShellAst(tree, 0, "", "")
 
 
-def _shell_code_lines(lines: list[str]) -> list[str] | None:
-    """Return per-line shell code views or None when nesting overflows."""
-    scanner = _ShCodeScan()
-    out: list[str] = []
-    for raw in lines:
-        view = scanner.line(raw)
-        if view is None:
-            return None
-        out.append(view)
-    return out
+def _shell_node_cost(node: dict[str, object], kind: object, key: str) -> int:
+    """Return the cyclomatic complexity increment for one shell AST dict."""
+    if kind in {"IfClause", "WhileClause"}:
+        return 1
+    if kind is None:
+        return int(key == "Else" and bool(node.get("Cond")))
+    if kind == "ForClause":
+        return int(not node.get("Select"))
+    if kind == "CaseClause":
+        items = node.get("Items")
+        return len(items) if isinstance(items, list) else 0
+    if kind in _SH_BINARY_TYPES:
+        return int(node.get("Op") in _SH_SHORT_CIRCUIT)
+    return 0
 
 
-def _sh_command_tokens(chunk: str) -> list[tuple[str, bool]]:
-    """Tokenize one code-view chunk into (token, is_command_word) pairs."""
-    raw = SH_TOKEN_RE.findall(chunk)
-    out: list[tuple[str, bool]] = []
-    cmd_pos = True
-    name_next = False
-    idx = 0
-    while idx < len(raw):
-        tok = raw[idx]
-        if tok == "(" and idx + 1 < len(raw) and raw[idx + 1] == ")":
-            out.append(("()", False))
-            idx += 2
-            cmd_pos = True
-            continue
-        if tok in _SH_SEPARATORS:
-            out.append((tok, False))
-            cmd_pos = True
-            idx += 1
-            continue
-        if tok in _SH_REDIRECTS:
-            out.append((tok, False))
-            cmd_pos = False
-            idx += 1
-            continue
-        if name_next:
-            out.append((tok, False))
-            name_next = False
-            cmd_pos = True
-            idx += 1
-            continue
-        is_cmd = cmd_pos
-        out.append((tok, is_cmd))
-        name_next = cmd_pos and tok == "function"
-        cmd_pos = cmd_pos and tok in _SH_KEEP_CMD
-        idx += 1
-    return out
+def _shell_pos_line(pos: object, default: int = 1) -> int:
+    """Extract a 1-based Line integer from a shfmt Pos or End dict."""
+    if isinstance(pos, dict):
+        line = pos.get("Line")
+        if isinstance(line, int):
+            return line
+    return default
 
 
-def _shell_complexity_chunk(chunk: str) -> int:
-    """Count decision points in one code-view chunk."""
-    score = 0
-    for tok, is_cmd in _sh_command_tokens(chunk):
-        if is_cmd and tok in _SH_DECISIONS:
-            score += 1
-        elif tok in {"&&", "||", ";;"}:
-            score += 1
-    return score
+def _shell_func_header(node: dict[str, object]) -> tuple[str, int, int]:
+    """Extract (name, start_line, end_line) from a FuncDecl AST node."""
+    name_node = node.get("Name")
+    raw_name = name_node.get("Value") if isinstance(name_node, dict) else None
+    name = raw_name if isinstance(raw_name, str) else "<anonymous>"
+    start = _shell_pos_line(node.get("Pos"), 1)
+    end = max(start, _shell_pos_line(node.get("End"), start))
+    return name, start, end
 
 
-def _shell_one_line_brace(rest: str) -> str | None:
-    """Return inner code after { when rest is a one-line brace body."""
-    text = rest.lstrip()
-    if not text.startswith("{"):
-        return None
-    body = text[1:].rstrip()
-    if not body.endswith("}"):
-        return None
-    inner = body[:-1].rstrip()
-    if not inner:
-        return ""
-    trimmed = inner.rstrip()
-    if not (trimmed.endswith(";") or trimmed.endswith("&")):
-        return None
-    return inner
-
-
-def _shell_one_line_paren(rest: str) -> str | None:
-    """Return inner code after ( when rest is a balanced one-line subshell body."""
-    text = rest.lstrip()
-    if not text.startswith("("):
-        return None
-    depth = 0
-    for pos, ch in enumerate(text):
-        if ch == "(":
-            depth += 1
-        elif ch == ")":
-            depth -= 1
-            if depth == 0:
-                return text[1:pos]
-    return None
-
-
-def _sh_block_open_kind(tok: str, is_cmd: bool) -> str | None:
-    """Map one token to a structural block opener kind when applicable."""
-    if tok == "(":
-        return "("
-    if not is_cmd:
-        return None
-    if tok == "{":
-        return "{"
-    if tok == "[[":
-        return "[["
-    if tok == "if":
-        return "if"
-    if tok == "case":
-        return "case"
-    if tok in _SH_LOOP_OPEN:
-        return "loop"
-    return None
-
-
-def _sh_block_close_kind(tok: str, is_cmd: bool) -> str | None:
-    """Map one token to a structural block closer kind when applicable."""
-    if tok == ")":
-        return "("
-    if tok == "]]":
-        return "[["
-    if not is_cmd:
-        return None
-    if tok == "}":
-        return "{"
-    if tok == "fi":
-        return "if"
-    if tok == "esac":
-        return "case"
-    if tok == "done":
-        return "loop"
-    return None
-
-
-def _sh_block_apply_token(
-    stack: list[tuple[str, int, bool]],
-    closes: list[int],
-    line_idx: int,
-    tok: str,
-    is_cmd: bool,
-) -> bool:
-    """Apply one token to the block stack; return False when nesting overflows."""
-    close_kind = _sh_block_close_kind(tok, is_cmd)
-    if close_kind is not None:
-        if stack and stack[-1][0] == close_kind:
-            _, open_idx, first_on = stack.pop()
-            if first_on:
-                closes[open_idx] = line_idx
-        return True
-    open_kind = _sh_block_open_kind(tok, is_cmd)
-    if open_kind is None:
-        return True
-    first_on = closes[line_idx] == -2
-    if first_on:
-        closes[line_idx] = -1
-    stack.append((open_kind, line_idx, first_on))
-    return len(stack) <= MAX_SHELL_NESTING
-
-
-def _shell_block_closes(code: list[str]) -> list[int] | None:
-    """Return per-line block close indices or None when nesting overflows."""
-    closes = [-2] * len(code)
-    stack: list[tuple[str, int, bool]] = []
-    for line_idx in range(len(code)):
-        tokens = _sh_command_tokens(code[line_idx])
-        for tok, is_cmd in tokens:
-            if not _sh_block_apply_token(stack, closes, line_idx, tok, is_cmd):
-                return None
-    return closes
-
-
-def _shell_block_end(closes: list[int], idx: int, has_tail: bool) -> int:
-    """Resolve the body end line index for a function definition at idx."""
-    close = closes[idx]
-    if close == -2 and not has_tail and idx + 1 < len(closes):
-        close = closes[idx + 1]
-    if close == -1:
-        return len(closes) - 1
-    if close == -2:
-        return idx
-    return close
-
-
-def _shell_def_accept(rest: str) -> bool:
-    """Return whether captured definition tail opens an analyzable body."""
-    stripped = rest.strip()
-    if not stripped:
-        return True
-    if stripped[0] in "{(":
-        return True
-    tokens = SH_TOKEN_RE.findall(stripped)
-    if not tokens:
-        return False
-    first = tokens[0]
-    return first in {"if", "case", "for", "while", "until", "select", "[["}
-
-
-def _shell_body_layout(
-    code: list[str], closes: list[int], idx: int, rest: str
-) -> tuple[int, int, str]:
-    """Return body_start index, body_end index, and opener-tail complexity text."""
-    one_br = _shell_one_line_brace(rest)
-    if one_br is not None:
-        return idx + 1, idx, one_br
-    one_par = _shell_one_line_paren(rest)
-    if one_par is not None:
-        return idx + 1, idx, one_par
-    stripped = rest.strip()
-    end = _shell_block_end(closes, idx, bool(stripped))
-    if stripped.startswith("{") or stripped.startswith("("):
-        opener = stripped[1:].strip()
-    else:
-        opener = stripped
-    return idx + 1, end, opener
-
-
-def _shell_function_defs(
-    lines: list[str], code: list[str]
-) -> list[tuple[int, str, int, int, int, str, bool]] | None:
-    """Return shell def rows with body bounds and over-span flag."""
-    closes = _shell_block_closes(code)
-    if closes is None:
-        return None
-    defs: list[tuple[int, str, int, int, int, str, bool]] = []
-    for idx in range(len(lines)):
-        match = SHELL_DEF_LINE_RE.match(code[idx])
-        if not match:
-            continue
-        name = match.group(1) or match.group(2)
-        tail = match.group(3) or ""
-        if not _shell_def_accept(tail):
-            continue
-        b_start, b_end, opener = _shell_body_layout(code, closes, idx, tail)
-        over = b_end - idx > MAX_SHELL_BODY_LINES + 1
-        defs.append((idx + 1, name, idx, b_start, b_end, opener, over))
-    return defs
-
-
-def _shell_has_docstring(lines: list[str], def_idx: int) -> bool:
-    """Return whether contiguous # comment lines above the def qualify as a docstring."""
-    idx = def_idx - 1
-    while idx >= 0 and lines[idx].lstrip().startswith("#"):
-        text = lines[idx].lstrip()
-        if not text.startswith("#!") and not text.lower().startswith("# shellcheck"):
-            return True
-        idx -= 1
-    return False
-
-
-def _shell_body_complexity(
-    code: list[str], def_idx: int, body_start: int, body_end: int, opener_tail: str
+def _visit_shell_node(
+    node: dict[str, object],
+    key: str,
+    owner: int,
+    funcs: list[tuple[str, int, int]],
+    scores: list[int],
+    comments: set[int],
 ) -> int:
-    """Count shell cyclomatic complexity inside a function body."""
-    score = 1 + _shell_complexity_chunk(opener_tail)
-    if body_end < body_start:
-        return score
-    for idx in range(body_start, body_end + 1):
-        score += _shell_complexity_chunk(code[idx])
-    return score
+    """Record comments, FuncDecl headers, or decision costs; return child owner."""
+    if "Hash" in node and "Text" in node:
+        line = _shell_pos_line(node.get("Hash"), 0)
+        if line > 0:
+            comments.add(line)
+    kind = node.get("Type")
+    if kind == "FuncDecl":
+        funcs.append(_shell_func_header(node))
+        scores.append(1)
+        return len(funcs) - 1
+    if owner >= 0:
+        scores[owner] += _shell_node_cost(node, kind, key)
+    return owner
+
+
+def _push_shell_children(
+    stack: list[tuple[dict[str, object], str, int, int]],
+    node: dict[str, object],
+    depth: int,
+    owner: int,
+) -> None:
+    """Push child AST dicts and list-contained AST dicts onto the traversal stack."""
+    for child_key, val in itertools.islice(node.items(), 64):
+        if isinstance(val, dict):
+            stack.append((val, child_key, depth, owner))
+        elif isinstance(val, list):
+            stack.extend(
+                (item, child_key, depth, owner)
+                for item in reversed(val[: MAX_SHELL_AST_NODES + 1])
+                if isinstance(item, dict)
+            )
+
+
+def shell_functions(
+    tree: dict[str, object],
+) -> tuple[list[ShellFunction], set[int]] | None:
+    """Walk a shfmt AST iteratively to collect shell functions and comment lines."""
+    stack: list[tuple[dict[str, object], str, int, int]] = [(tree, "", 0, -1)]
+    funcs: list[tuple[str, int, int]] = []
+    scores: list[int] = []
+    comments: set[int] = set()
+    for step in range(MAX_SHELL_AST_NODES + 1):
+        if not stack:
+            break
+        if step == MAX_SHELL_AST_NODES:
+            return None
+        node, key, depth, owner = stack.pop()
+        if node.get("Type") in _SH_NEST_TYPES:
+            depth += 1
+            if depth > MAX_SHELL_NESTING:
+                return None
+        owner = _visit_shell_node(node, key, owner, funcs, scores, comments)
+        _push_shell_children(stack, node, depth, owner)
+    rows = [
+        ShellFunction(name, start, end, score)
+        for (name, start, end), score in zip(funcs, scores, strict=True)
+    ]
+    rows.sort(key=lambda fn: fn.start)
+    return rows, comments
+
+
+def _shell_doc_lines(lines: list[str], comments: set[int], def_line: int) -> list[int]:
+    """Return 1-based contiguous comment lines directly above def_line, nearest first."""
+    doc: list[int] = []
+    top = min(def_line - 1, len(lines), MAX_SOURCE_LINES)
+    for idx in range(top, 0, -1):
+        if idx not in comments:
+            break
+        text = lines[idx - 1].lstrip()
+        if not text.startswith("#") or text.startswith("#!"):
+            break
+        doc.append(idx)
+    return doc
+
+
+def _shell_doc_block_start(lines: list[str], comments: set[int], def_line: int) -> int:
+    """Return the 1-based start line of the doc block above def_line, or def_line."""
+    doc = _shell_doc_lines(lines, comments, def_line)
+    return doc[-1] if doc else def_line
+
+
+def _shell_has_docstring(lines: list[str], comments: set[int], def_line: int) -> bool:
+    """Return whether any doc comment line above def_line is not a shellcheck directive."""
+    return any(
+        not lines[idx - 1].lstrip().lower().startswith("# shellcheck")
+        for idx in _shell_doc_lines(lines, comments, def_line)
+    )
 
 
 def check_shell_source(path: str, source: str, touched: set[int]) -> list[Finding]:
     """Analyze shell source text for missing docstrings on touched functions."""
     lines = lf_lines(source)
-    code = _shell_code_lines(lines)
-    if code is None:
-        return [
-            Finding(
-                path,
-                1,
-                "analysis-limit",
-                f"shell nesting deeper than {MAX_SHELL_NESTING}",
-            )
-        ]
-    defs = _shell_function_defs(lines, code)
-    if defs is None:
-        return [
-            Finding(
-                path,
-                1,
-                "analysis-limit",
-                f"shell nesting deeper than {MAX_SHELL_NESTING}",
-            )
-        ]
+    parsed = parse_shell(source)
+    if parsed.tree is None:
+        return [Finding(path, parsed.line, parsed.rule, parsed.message)]
+    found = shell_functions(parsed.tree)
+    if found is None:
+        msg = f"shell nesting deeper than {MAX_SHELL_NESTING} or more than {MAX_SHELL_AST_NODES} syntax nodes"
+        return [Finding(path, 1, "analysis-limit", msg)]
+    funcs, comments = found
     findings: list[Finding] = []
-    for def_line, name, def_idx, body_start, body_end, opener, over in defs:
-        span = _shell_function_span(def_line, def_idx, body_end)
-        if not span_touched(span, touched):
+    for fn in funcs:
+        if not span_touched((fn.start, fn.end), touched):
             continue
-        if _shell_has_docstring(lines, def_idx):
+        if _shell_has_docstring(lines, comments, fn.start):
             continue
-        if over:
+        if fn.end - fn.start > MAX_SHELL_BODY_LINES + 1:
             findings.append(
                 Finding(
                     path,
-                    def_line,
+                    fn.start,
                     "analysis-limit",
-                    f"function {name} body has no closer within {MAX_SHELL_BODY_LINES} lines; split it",
+                    f"function {fn.name} body spans more than {MAX_SHELL_BODY_LINES} lines; split it",
                 )
             )
             continue
-        complexity = _shell_body_complexity(code, def_idx, body_start, body_end, opener)
-        if complexity < 2:
+        if fn.complexity < 2:
             continue
         findings.append(
             Finding(
                 path,
-                def_line,
+                fn.start,
                 "missing-docstring",
-                f"function {name} (complexity {complexity}) touched by this branch has no docstring",
+                f"function {fn.name} (complexity {fn.complexity}) touched by this branch has no docstring",
             )
         )
     return findings
@@ -1078,6 +808,9 @@ def main() -> int:
         findings = check(repo, base_sha, paths)
     except subprocess.CalledProcessError as exc:
         print(_git_failure_stderr(exc), file=sys.stderr)
+        return 3
+    except ShellParserUnavailable as exc:
+        print(str(exc), file=sys.stderr)
         return 3
     emit(findings)
     return 1 if findings else 0

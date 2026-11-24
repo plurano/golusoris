@@ -1281,6 +1281,128 @@ class DocstringCoveragePolicyTest(unittest.TestCase):
                 found = policy.check_source("scripts/ci/x.sh", text, touched)
                 self.assertEqual([(item.line, item.rule) for item in found], expected)
 
+    def test_b71_case_arm_inside_substitution(self) -> None:
+        """B71: case arms inside $(...) keep the scanner in step (review F1)."""
+        found = policy.check_source(
+            "scripts/ci/x.sh",
+            'f() {\n  x="$(case $1 in a) echo 1 ;; b) echo 2 ;; esac)"\n}\n',
+        )
+        self.assertEqual([item.rule for item in found], ["missing-docstring"])
+        self.assertEqual(found[0].line, 1)
+        text = (
+            'f() {\n  x="$(\n  case $1 in\n    a) echo 1 ;;\n  esac\n)"\n}\n'
+            "# doc\ng() {\n  if a; then b; fi\n}\n"
+        )
+        self.assertEqual(policy.check_source("scripts/ci/x.sh", text, {9, 10, 11}), [])
+
+    def test_b72_shell_doc_replaced_by_directive(self) -> None:
+        """B72: rewriting the doc comment into a directive marks the function touched (review F2)."""
+        found = self.branch_fixture(
+            "scripts/ci/x.sh",
+            "# Explain f\nf() {\n  if a; then b; fi\n}\n",
+            "# shellcheck disable=SC2034\nf() {\n  if a; then b; fi\n}\n",
+        )
+        self.assertEqual([item.rule for item in found], ["missing-docstring"])
+
+    def test_b73_python_tail_replaced(self) -> None:
+        """B73: a hunk that replaces a function's last line marks the function touched (review F2)."""
+        found = self.branch_fixture(
+            "scripts/ci/x.py",
+            "def f(a):\n    if a:\n        return 1\n    x = 1\n    return 2\ny = 1\n",
+            "def f(a):\n    if a:\n        return 1\n    x = 1\ny = 2\n",
+        )
+        self.assertEqual([item.rule for item in found], ["missing-docstring"])
+
+    def test_b74_nested_brace_on_def_line(self) -> None:
+        """B74: a nested brace group on the def line does not end the body (review F3)."""
+        found = policy.check_source("scripts/ci/x.sh", "f() { { echo 1; }\n  if a; then b; fi\n}\n")
+        self.assertEqual([item.rule for item in found], ["missing-docstring"])
+        self.assertEqual(found[0].line, 1)
+
+    def test_b75_arith_shift_not_heredoc(self) -> None:
+        """B75: << inside arithmetic is a shift, not a heredoc (review F4)."""
+        for body in ("(( x = 1 << 2 ))", "x=$(( (1 << 2) ))"):
+            with self.subTest(body=body):
+                found = policy.check_source("scripts/ci/x.sh", f"f() {{\n  {body}\n  if a; then b; fi\n}}\n")
+                self.assertEqual([item.rule for item in found], ["missing-docstring"])
+
+    def test_b76_quotes_inside_parameter_expansion(self) -> None:
+        """B76: quotes inside ${...} follow bash (review F5)."""
+        valid = policy.check_source("scripts/ci/x.sh", "f() {\n  x=${v:-$'\\''}\n  if a; then b; fi\n}\n")
+        self.assertEqual([item.rule for item in valid], ["missing-docstring"])
+        invalid = policy.check_source("scripts/ci/x.sh", "f() {\n  echo \"${v:-don't}\"\n  if a; then b; fi\n}\n")
+        self.assertEqual([item.rule for item in invalid], ["parse-error"])
+
+    def test_b77_case_fallthrough_terminators(self) -> None:
+        """B77: ;;& and ;& arms count as decisions (review F6)."""
+        found = policy.check_source(
+            "scripts/ci/x.sh",
+            "f() {\n  case $1 in\n    a) echo 1 ;;&\n    b) echo 2 ;&\n  esac\n}\n",
+        )
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0].rule, "missing-docstring")
+        self.assertIn("complexity 3", found[0].message)
+
+    def test_b78_continued_argument_not_keyword(self) -> None:
+        """B78: a backslash-continued argument named if is not a decision (review F7)."""
+        self.assertEqual(policy.check_source("scripts/ci/x.sh", "f() {\n  printf '%s\\n' \\\n    if\n}\n"), [])
+
+    def test_b79_shell_complexity_counts(self) -> None:
+        """B79: if, elif and short-circuit operators each count; nested bodies belong to their own function."""
+        found = policy.check_source(
+            "scripts/ci/x.sh",
+            "f() {\n  if a; then :; elif b; then :; fi\n  [[ a && b ]] || :\n}\n",
+        )
+        self.assertEqual(len(found), 1)
+        self.assertIn("complexity 5", found[0].message)
+        nested = policy.check_source("scripts/ci/x.sh", "f() {\n  g() { if a; then :; fi; }\n}\n")
+        self.assertEqual(len(nested), 1)
+        self.assertEqual(nested[0].line, 2)
+        self.assertIn("function g", nested[0].message)
+
+    def test_b80_quoted_hash_line_not_doc(self) -> None:
+        """B80: a # line inside a string above a def is not a doc comment."""
+        found = policy.check_source("scripts/ci/x.sh", "x='a\n# not a doc'\nf() {\n  if a; then b; fi\n}\n")
+        self.assertEqual([item.rule for item in found], ["missing-docstring"])
+        self.assertEqual(found[0].line, 3)
+
+    def test_n17_shell_parse_error(self) -> None:
+        """N17: a shell syntax error is a parse-error finding on the reported line."""
+        found = policy.check_source("scripts/ci/x.sh", "f() {\n  if a; then\n}\n")
+        self.assertEqual([item.rule for item in found], ["parse-error"])
+        self.assertEqual(found[0].line, 3)
+
+    def test_n18_missing_shfmt_exits_three(self) -> None:
+        """N18: a missing shfmt fails closed with exit 3."""
+        with patch.dict(os.environ, {"SHFMT_BIN": str(Path(self.fx.root) / "no-such-shfmt")}):
+            with self.assertRaises(policy.ShellParserUnavailable):
+                policy.check_source("scripts/ci/x.sh", "f() { :; }\n")
+            self.start_topic()
+            self.fx.write("scripts/ci/x.sh", 'f() {\n\tif [ -n "$1" ]; then echo a; fi\n}\n')
+            self.fx.commit("topic")
+            code, _, err = self.run_main(["--pushed", "scripts/ci/x.sh"])
+        self.assertEqual(code, 3)
+        self.assertIn("make tools-bootstrap", err)
+
+    def test_b81_normalize_paths_dedupes(self) -> None:
+        """B81: normalize_paths keeps one copy of each path in first-seen order."""
+        self.assertEqual(
+            policy.normalize_paths(["a.py", "a.py", "b\\c.sh", "x.txt", "b/c.sh"]),
+            (["a.py", "b/c.sh"], 0),
+        )
+
+    def test_n19_python_deletion_bound_counts_lone_cr(self) -> None:
+        """N19: lone CRs count toward the base-side size bound."""
+        with patch.object(policy, "MAX_SOURCE_LINES", 3):
+            self.assertIsNone(
+                policy._python_deleted_owner_lines(
+                    "x.py",
+                    "x=1\ry=2\rz=3\rdef f(a):\n    return a\n",
+                    [(1, 1)],
+                    [(1, 1, 1, 1)],
+                )
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
