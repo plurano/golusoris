@@ -104,6 +104,8 @@ MAX_LOCK_CONTEXTS = 4
 MAX_LOCK_LINES = 16384
 MAX_REQUIREMENT_LINES = 256
 MAX_EXTENDS = 32
+# check_pypi_overrides inspects renovate.json plus every extended preset.
+MAX_RENOVATE_CONFIGS = MAX_EXTENDS + 1
 MAX_PACKAGE_RULES = 256
 PRESET_REF = re.compile(r"github>(?P<owner>[A-Za-z0-9-]+)/(?P<repo>[A-Za-z0-9._-]+)")
 RELEASE_AGE = re.compile(
@@ -693,7 +695,9 @@ def check_pypi_overrides(
     configs: list[tuple[dict[str, Any], str]], base: timedelta
 ) -> None:
     """Refuse oversized packageRules lists or conflicting PyPI release ages."""
-    for i in range(min(len(configs), MAX_EXTENDS)):
+    if len(configs) > MAX_RENOVATE_CONFIGS:
+        raise CheckError(f"{RENOVATE_CONFIG}: too many configs to check")
+    for i in range(min(len(configs), MAX_RENOVATE_CONFIGS)):
         cfg, source = configs[i]
         rules = cfg.get("packageRules", [])
         if not isinstance(rules, list) or len(rules) > MAX_PACKAGE_RULES:
@@ -1762,11 +1766,8 @@ def run_release_age_refusal_cases(temp_dir: Path) -> tuple[list[str], int]:
 
     def pypi_override_fetch(_url: str) -> bytes:
         """Return a preset body overriding PyPI minimumReleaseAge."""
-        body = (
-            b'{"packageRules": [{"matchDatasources": ["pypi"], '
-            b'"minimumReleaseAge": "7 days"}]}'
-        )
-        return body
+        rule = b'{"matchDatasources": ["pypi"], "minimumReleaseAge": "7 days"}'
+        return b'{"packageRules": [' + rule + b"]}"
 
     def earlier_preset_fetch(url: str) -> bytes:
         """Return a PyPI override for preset a and three days otherwise."""
@@ -1774,12 +1775,18 @@ def run_release_age_refusal_cases(temp_dir: Path) -> tuple[list[str], int]:
             return pypi_override_fetch(url)
         return b'{"minimumReleaseAge": "3 days"}'
 
+    def last_preset_fetch(url: str) -> bytes:
+        """Return a PyPI override for the last preset and three days otherwise."""
+        hit = f"/example/p{MAX_EXTENDS - 1}/" in url
+        return pypi_override_fetch(url) if hit else b'{"minimumReleaseAge": "3 days"}'
+
     diff_rule = {"matchDatasources": ["pypi"], "minimumReleaseAge": "1 day"}
     diff_cfg = {"minimumReleaseAge": "3 days", "packageRules": [diff_rule]}
     bad_ref_cfg = {"extends": ["github>example/preset:other"]}
     top_cfg = {"minimumReleaseAge": "2 days", "extends": ["github>example/preset"]}
     ab_cfg = {"extends": ["github>example/a", "github>example/b"]}
     non_obj_cfg = {"minimumReleaseAge": "3 days", "packageRules": ["not-a-dict"]}
+    max_cfg = {"extends": [f"github>example/p{i}" for i in range(MAX_EXTENDS)]}
     cases: tuple[tuple[str, dict[str, Any] | None, Callable[[str], bytes]], ...] = (
         ("missing-renovate-json", None, fail_fetch),
         ("null-release-age", {"minimumReleaseAge": None}, fail_fetch),
@@ -1791,6 +1798,7 @@ def run_release_age_refusal_cases(temp_dir: Path) -> tuple[list[str], int]:
         ("top-level-age-preset-pypi-override", top_cfg, pypi_override_fetch),
         ("earlier-preset-pypi-override", ab_cfg, earlier_preset_fetch),
         ("non-object-package-rule", non_obj_cfg, fail_fetch),
+        ("last-of-max-presets-pypi-override", max_cfg, last_preset_fetch),
     )
     failures: list[str] = []
     refused = sum(
