@@ -824,10 +824,11 @@ jobs:
       - uses: ./.github/actions/setup-go
         with:
           cache: false
-      - name: Install pinned actionlint, Helm, buf and lefthook
+      - name: Install pinned actionlint, yq, Helm, buf and lefthook
         run: |
           . tools/tool-versions.env
           bash "$GITHUB_WORKSPACE/scripts/ci/retry.sh" go install "github.com/rhysd/actionlint/cmd/actionlint@${ACTIONLINT_VERSION}"
+          bash "$GITHUB_WORKSPACE/scripts/ci/retry.sh" go install "github.com/mikefarah/yq/v4@${YQ_VERSION}"
           bash "$GITHUB_WORKSPACE/scripts/ci/retry.sh" go install "helm.sh/helm/v4/cmd/helm@${HELM_VERSION}"
           bash "$GITHUB_WORKSPACE/scripts/ci/retry.sh" go install "github.com/bufbuild/buf/cmd/buf@${BUF_VERSION}"
           bash "$GITHUB_WORKSPACE/scripts/ci/retry.sh" go install "github.com/evilmartians/lefthook/v2@${LEFTHOOK_VERSION}"
