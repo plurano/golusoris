@@ -1141,6 +1141,7 @@ def run_module_sum_cases(repo: Path, temp_dir: Path) -> tuple[list[str], int, in
         "GOPROXY": (temp_dir / "goproxy").as_uri(),
         "GONOSUMDB": "example.com",
         "GOMODCACHE": str(temp_dir / "modcache"),
+        "GOTOOLCHAIN": "local",
         "RETRY_ATTEMPTS": "1",
         "RETRY_DELAY_SECONDS": "0",
     }
