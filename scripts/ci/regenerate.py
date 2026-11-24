@@ -79,9 +79,12 @@ SCALAR_PATHS = [
 ]
 TOOL_VERSIONS = "tools/tool-versions.env"
 MAX_TOOL_VERSION_LINES = 256
-MODULE_SUM_LINE = re.compile(r"(?P<name>[A-Z][A-Z0-9_]*)_MODULE_SUM=(?P<sum>\S*)")
-MODULE_SUM_PREFIX = re.compile(r"[A-Z][A-Z0-9_]*_MODULE_SUM=")
+UNSAFE_PIN_CHAR = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029]")
+MODULE_SUM_LINE = re.compile(
+    r"(?P<name>[A-Z][A-Z0-9_]*)_MODULE_SUM=(?P<sum>h1:[A-Za-z0-9+/]{43}=)"
+)
 MODULE_SUM_VALUE = re.compile(r"h1:[A-Za-z0-9+/]{43}=")
+GO_VERSION_VALUE = re.compile(r"v[0-9A-Za-z.+-]+")
 GO_PIN_COMMENT = re.compile(
     r"# renovate: datasource=go depName=(?P<module>\S+)(?: .*)?"
 )
@@ -434,36 +437,55 @@ def regenerate_upstream_pins(root: Path) -> list[list[str]]:
     return commands
 
 
-def module_sum_pins(text: str) -> list[tuple[str, str, int]]:
-    lines = text.splitlines()
-    if len(lines) > MAX_TOOL_VERSION_LINES:
+def tool_version_lines(text: str) -> list[str]:
+    # Split on LF only so Python agrees with bash source and Make include.
+    lines = text.split("\n")
+    if len(lines) > MAX_TOOL_VERSION_LINES + 1:
         raise CheckError(f"{TOOL_VERSIONS} exceeds {MAX_TOOL_VERSION_LINES} lines")
+    for i in range(min(len(lines), MAX_TOOL_VERSION_LINES + 1)):
+        if UNSAFE_PIN_CHAR.search(lines[i]) is not None:
+            msg = (
+                f"{TOOL_VERSIONS}:{i + 1}: "
+                "line holds a control or line-separator character"
+            )
+            raise CheckError(msg)
+    return lines
+
+
+def _pin_version(lines: list[str], index: int, name: str) -> tuple[str, str]:
+    prefix = f"{name}_VERSION="
+    comment = GO_PIN_COMMENT.fullmatch(lines[index - 2]) if index >= 2 else None
+    version = (
+        lines[index - 1].removeprefix(prefix)
+        if index >= 2 and lines[index - 1].startswith(prefix)
+        else ""
+    )
+    if comment is None or GO_VERSION_VALUE.fullmatch(version) is None:
+        msg = (
+            f"{TOOL_VERSIONS}:{index + 1}: {name}_MODULE_SUM needs {name}_VERSION "
+            "and a datasource=go renovate comment above it"
+        )
+        raise CheckError(msg)
+    return comment["module"], version
+
+
+def module_sum_pins(text: str) -> list[tuple[str, str, int]]:
+    lines = tool_version_lines(text)
     pins: list[tuple[str, str, int]] = []
-    for i in range(min(len(lines), MAX_TOOL_VERSION_LINES)):
-        sum_match = MODULE_SUM_LINE.fullmatch(lines[i])
+    for i in range(min(len(lines), MAX_TOOL_VERSION_LINES + 1)):
+        line = lines[i]
+        sum_match = MODULE_SUM_LINE.fullmatch(line)
         if sum_match is None:
-            if MODULE_SUM_PREFIX.match(lines[i]) is not None:
+            if "_MODULE_SUM" in line and not line.lstrip().startswith("#"):
                 msg = (
                     f"{TOOL_VERSIONS}:{i + 1}: module sum pin must be "
-                    "NAME_MODULE_SUM=<sum> with no comment or trailing space"
+                    "NAME_MODULE_SUM=h1:<43 base64 chars>= at column 0 "
+                    "with nothing after it"
                 )
                 raise CheckError(msg)
             continue
-        name = sum_match["name"]
-        prefix = f"{name}_VERSION="
-        comment = GO_PIN_COMMENT.fullmatch(lines[i - 2]) if i >= 2 else None
-        version = (
-            lines[i - 1].removeprefix(prefix)
-            if i >= 2 and lines[i - 1].startswith(prefix)
-            else ""
-        )
-        if comment is None or not version or any(ch.isspace() for ch in version):
-            msg = (
-                f"{TOOL_VERSIONS}:{i + 1}: {name}_MODULE_SUM needs {name}_VERSION "
-                "and a datasource=go renovate comment above it"
-            )
-            raise CheckError(msg)
-        pins.append((comment["module"], version, i))
+        module, version = _pin_version(lines, i, sum_match["name"])
+        pins.append((module, version, i))
     return pins
 
 
@@ -501,6 +523,12 @@ def go_module_sum(
         raise CheckError(f"go mod download {target}: expected JSON object")
     if data.get("Error") not in (None, ""):
         raise CheckError(f"go mod download {target}: {data['Error']}")
+    if data.get("Path") != module or data.get("Version") != version:
+        msg = (
+            f"go mod download {target}: "
+            f"resolved {data.get('Path')!r}@{data.get('Version')!r}"
+        )
+        raise CheckError(msg)
     module_sum = data.get("Sum")
     if (
         not isinstance(module_sum, str)
@@ -525,8 +553,7 @@ def regenerate_module_sums(
     pins = module_sum_pins(text)
     if not pins:
         return []
-    lines = text.splitlines()
-    raw_lines = text.splitlines(keepends=True)
+    lines = tool_version_lines(text)
     commands: list[list[str]] = []
     for i in range(min(len(pins), MAX_TOOL_VERSION_LINES)):
         module, version, line_idx = pins[i]
@@ -534,9 +561,9 @@ def regenerate_module_sums(
         commands.append(cmd)
         match = MODULE_SUM_LINE.fullmatch(lines[line_idx])
         if match is not None and match["sum"] != new_sum:
-            ending = raw_lines[line_idx][len(lines[line_idx]) :]
-            raw_lines[line_idx] = f"{match['name']}_MODULE_SUM={new_sum}{ending}"
-    updated = "".join(raw_lines)
+            name = match["name"]
+            lines[line_idx] = f"{name}_MODULE_SUM={new_sum}"
+    updated = "\n".join(lines)
     if updated != text:
         path.write_bytes(updated.encode("utf-8"))
     return commands
@@ -1088,10 +1115,10 @@ def write_fixture_goproxy(proxy_dir: Path) -> dict[str, str]:
     return sums
 
 
-def run_module_sum_refusal_cases(
-    repo: Path, temp_dir: Path, env: dict[str, str], sample_sum: str
-) -> tuple[list[str], int]:
-    pin_cases = (
+def _module_sum_pin_cases(sample_sum: str) -> tuple[tuple[str, str], ...]:
+    go_comment = "# renovate: datasource=go depName=example.com/tool"
+    header = f"{go_comment}\nTOOL_VERSION=v0.1.0\n"
+    return (
         ("line-1", f"TOOL_MODULE_SUM={sample_sum}\n"),
         (
             "github-releases-comment",
@@ -1102,20 +1129,38 @@ def run_module_sum_refusal_cases(
         ),
         (
             "missing-version-line",
+            f"{go_comment}\n# missing version\nTOOL_MODULE_SUM={sample_sum}\n",
+        ),
+        ("trailing-comment", f"{header}TOOL_MODULE_SUM={sample_sum} # checksum\n"),
+        ("trailing-space", f"{header}TOOL_MODULE_SUM={sample_sum} \n"),
+        ("crlf-sum", header + f"TOOL_MODULE_SUM={sample_sum}\r\n"),
+        (
+            "line-separator-after-sum",
+            header + f"TOOL_MODULE_SUM={sample_sum}{chr(0x2028)}EXTRA=1\n",
+        ),
+        (
+            "cr-separated-header",
             (
-                "# renovate: datasource=go depName=example.com/tool\n"
-                f"# missing version\nTOOL_MODULE_SUM={sample_sum}\n"
+                f"# c\r{go_comment}\r"
+                f"TOOL_VERSION=v0.1.0\rTOOL_MODULE_SUM={sample_sum}\n"
             ),
         ),
-        ("trailing-comment", (
-            "# renovate: datasource=go depName=example.com/tool\n"
-            f"TOOL_VERSION=v0.1.0\nTOOL_MODULE_SUM={sample_sum} # checksum\n"
-        )),
-        ("trailing-space", (
-            "# renovate: datasource=go depName=example.com/tool\n"
-            f"TOOL_VERSION=v0.1.0\nTOOL_MODULE_SUM={sample_sum} \n"
-        )),
+        ("indented-pin", header + f"  TOOL_MODULE_SUM={sample_sum}\n"),
+        ("export-pin", header + f"export TOOL_MODULE_SUM={sample_sum}\n"),
+        ("hash-after-sum", header + f"TOOL_MODULE_SUM={sample_sum}#c\n"),
+        ("quoted-sum", header + f'TOOL_MODULE_SUM="{sample_sum}"\n'),
+        ("short-sum", header + "TOOL_MODULE_SUM=h1:abc=\n"),
+        (
+            "version-hash",
+            f"{go_comment}\nTOOL_VERSION=v0.1.0#c\nTOOL_MODULE_SUM={sample_sum}\n",
+        ),
     )
+
+
+def run_module_sum_refusal_cases(
+    repo: Path, temp_dir: Path, env: dict[str, str], sample_sum: str
+) -> tuple[list[str], int]:
+    pin_cases = _module_sum_pin_cases(sample_sum)
     failures: list[str] = []
     refused = 0
     for i in range(min(len(pin_cases), MAX_TOOL_VERSION_LINES)):
@@ -1127,25 +1172,42 @@ def run_module_sum_refusal_cases(
         else:
             failures.append(f"module_sum_pins {label} was not refused")
 
-    reset_fixture_repo(repo)
-    original_head = run_git(["rev-parse", "HEAD"], repo).strip()
-    absent_pin = (
-        "# renovate: datasource=go depName=example.com/tool versioning=semver\n"
-        f"TOOL_VERSION=v0.3.0\nTOOL_MODULE_SUM={sample_sum}\n"
+    write_cases = (
+        (
+            "v0.3.0",
+            "plant missing module version v0.3.0",
+            "out-modsum-missing",
+            ("example.com/tool@v0.3.0",),
+        ),
+        (
+            "v0.2",
+            "plant module version query v0.2",
+            "out-modsum-query",
+            ("resolved", "v0.2.0"),
+        ),
     )
-    (repo / TOOL_VERSIONS).write_text(absent_pin, encoding="utf-8")
-    run_git(["commit", "-am", "plant missing module version v0.3.0"], repo)
-    try:
-        write_regenerated(temp_dir / "out-modsum-missing", repo, module_env=env)
-    except CheckError as error:
-        if "example.com/tool@v0.3.0" in str(error):
-            refused += 1
+    for i in range(min(len(write_cases), MAX_TOOL_VERSION_LINES)):
+        version, commit_msg, out_name, expected_parts = write_cases[i]
+        reset_fixture_repo(repo)
+        original_head = run_git(["rev-parse", "HEAD"], repo).strip()
+        pin = (
+            "# renovate: datasource=go depName=example.com/tool versioning=semver\n"
+            f"TOOL_VERSION={version}\nTOOL_MODULE_SUM={sample_sum}\n"
+        )
+        (repo / TOOL_VERSIONS).write_text(pin, encoding="utf-8")
+        run_git(["commit", "-am", commit_msg], repo)
+        try:
+            write_regenerated(temp_dir / out_name, repo, module_env=env)
+        except CheckError as error:
+            error_text = str(error)
+            if all(part in error_text for part in expected_parts):
+                refused += 1
+            else:
+                failures.append(f"module sum {version} wrong refusal: {error}")
         else:
-            failures.append(f"module sum v0.3.0 wrong refusal: {error}")
-    else:
-        failures.append("module sum v0.3.0 absent version was not refused")
-    run_git(["reset", "--hard", original_head], repo)
-    reset_fixture_repo(repo)
+            failures.append(f"module sum {version} was not refused")
+        run_git(["reset", "--hard", original_head], repo)
+        reset_fixture_repo(repo)
     return failures, refused
 
 
