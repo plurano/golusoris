@@ -26,17 +26,17 @@ var (
 	gmParser = parser.New(
 		parser.WithAutoHeadingID(),
 		parser.WithExtensions(
-			extension.GFMParser,
-			extension.FootnoteParser,
-			extension.TypographerParser,
+			extension.NewGFMParser(),
+			extension.NewFootnoteParser(),
+			extension.NewTypographerParser(),
 		),
 	)
 	gmRenderer = html.New(
 		html.WithHardWraps(),
 		html.WithXHTML(),
 		html.WithExtensions(
-			extension.GFMHTMLRenderer,
-			extension.FootnoteHTMLRenderer,
+			extension.NewGFMHTMLRenderer(),
+			extension.NewFootnoteHTMLRenderer(),
 		),
 	)
 )

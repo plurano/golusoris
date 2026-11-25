@@ -67,8 +67,10 @@ write_suite "$clean_root/scripts/ci/renovate_vulnerability_test.py" 'self.assert
 write_suite "$clean_root/scripts/ci/repo_git_test.py" 'self.assertTrue(True)'
 write_suite "$clean_root/scripts/ci/review_bot_badges_test.py" 'self.assertTrue(True)'
 write_suite "$clean_root/scripts/ci/context_size_test.py" 'self.assertTrue(True)'
+write_suite "$clean_root/scripts/ci/skill_frontmatter_test.py" 'self.assertTrue(True)'
 write_suite "$clean_root/scripts/ci/tiny-litert-sidecar-docs-policy_test.py" 'self.assertTrue(True)'
 write_suite "$clean_root/scripts/ci/pull_test_images_test.py" 'self.assertTrue(True)'
+write_suite "$clean_root/scripts/ci/docstring_coverage_policy_test.py" 'self.assertTrue(True)'
 git -C "$clean_root" add .
 bash "$clean_root/scripts/ci/python-tests.sh" --root "$clean_root" >/dev/null
 
@@ -82,8 +84,10 @@ write_suite "$failure_root/scripts/ci/renovate_vulnerability_test.py" 'self.asse
 write_suite "$failure_root/scripts/ci/repo_git_test.py" 'self.assertTrue(True)'
 write_suite "$failure_root/scripts/ci/review_bot_badges_test.py" 'self.assertTrue(True)'
 write_suite "$failure_root/scripts/ci/context_size_test.py" 'self.assertTrue(True)'
+write_suite "$failure_root/scripts/ci/skill_frontmatter_test.py" 'self.assertTrue(True)'
 write_suite "$failure_root/scripts/ci/tiny-litert-sidecar-docs-policy_test.py" 'self.assertTrue(True)'
 write_suite "$failure_root/scripts/ci/pull_test_images_test.py" 'self.assertTrue(True)'
+write_suite "$failure_root/scripts/ci/docstring_coverage_policy_test.py" 'self.assertTrue(True)'
 git -C "$failure_root" add .
 expect_failure 'FAILED' bash "$failure_root/scripts/ci/python-tests.sh" --root "$failure_root"
 
@@ -104,8 +108,10 @@ write_suite "$empty_root/scripts/ci/renovate_vulnerability_test.py" 'self.assert
 write_suite "$empty_root/scripts/ci/repo_git_test.py" 'self.assertTrue(True)'
 write_suite "$empty_root/scripts/ci/review_bot_badges_test.py" 'self.assertTrue(True)'
 write_suite "$empty_root/scripts/ci/context_size_test.py" 'self.assertTrue(True)'
+write_suite "$empty_root/scripts/ci/skill_frontmatter_test.py" 'self.assertTrue(True)'
 write_suite "$empty_root/scripts/ci/tiny-litert-sidecar-docs-policy_test.py" 'self.assertTrue(True)'
 write_suite "$empty_root/scripts/ci/pull_test_images_test.py" 'self.assertTrue(True)'
+write_suite "$empty_root/scripts/ci/docstring_coverage_policy_test.py" 'self.assertTrue(True)'
 git -C "$empty_root" add .
 expect_failure 'NO TESTS RAN' bash "$empty_root/scripts/ci/python-tests.sh" --root "$empty_root"
 
@@ -120,8 +126,10 @@ write_suite "$symlink_root/scripts/ci/renovate_vulnerability_test.py" 'self.asse
 write_suite "$symlink_root/scripts/ci/repo_git_test.py" 'self.assertTrue(True)'
 write_suite "$symlink_root/scripts/ci/review_bot_badges_test.py" 'self.assertTrue(True)'
 write_suite "$symlink_root/scripts/ci/context_size_test.py" 'self.assertTrue(True)'
+write_suite "$symlink_root/scripts/ci/skill_frontmatter_test.py" 'self.assertTrue(True)'
 write_suite "$symlink_root/scripts/ci/tiny-litert-sidecar-docs-policy_test.py" 'self.assertTrue(True)'
 write_suite "$symlink_root/scripts/ci/pull_test_images_test.py" 'self.assertTrue(True)'
+write_suite "$symlink_root/scripts/ci/docstring_coverage_policy_test.py" 'self.assertTrue(True)'
 git -C "$symlink_root" add .
 expect_failure 'Python tests refuse symlink input' \
 	bash "$symlink_root/scripts/ci/python-tests.sh" --root "$symlink_root"
@@ -137,6 +145,8 @@ required_suites=(
 	'scripts/ci/repo_git_test.py'
 	'scripts/ci/review_bot_badges_test.py'
 	'scripts/ci/context_size_test.py'
+	'scripts/ci/skill_frontmatter_test.py'
+	'scripts/ci/docstring_coverage_policy_test.py'
 	'scripts/ci/tiny-litert-sidecar-docs-policy_test.py'
 )
 
@@ -221,7 +231,7 @@ assert_required_suite_once() {
 		printf 'required suite did not run exactly once\n' >&2
 		return 1
 	fi
-	[[ "$output" == *'11 suites passed'* ]]
+	[[ "$output" == *'13 suites passed'* ]]
 }
 
 extra_root="$(new_repo extra-suites)"

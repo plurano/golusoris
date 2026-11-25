@@ -74,6 +74,7 @@ jobs:
           bash "$GITHUB_WORKSPACE/scripts/ci/retry.sh" go install "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}"
           bash "$GITHUB_WORKSPACE/scripts/ci/retry.sh" go install "helm.sh/helm/v4/cmd/helm@${HELM_VERSION}"
           bash "$GITHUB_WORKSPACE/scripts/ci/retry.sh" go install "github.com/rhysd/actionlint/cmd/actionlint@${ACTIONLINT_VERSION}"
+          bash "$GITHUB_WORKSPACE/scripts/ci/retry.sh" go install "mvdan.cc/sh/v3/cmd/shfmt@${SHFMT_VERSION}"
           govulncheck_version="$(govulncheck -version)"; grep -Fq "Scanner: govulncheck@${GOVULNCHECK_VERSION}" <<<"$govulncheck_version"
 
       - name: Format and lint every module

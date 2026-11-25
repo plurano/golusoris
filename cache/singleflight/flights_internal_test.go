@@ -24,6 +24,14 @@ func TestFlightsEmptyAfterCompletion(t *testing.T) {
 		if value != 42 || err != nil || len(g.flights) != 0 {
 			t.Fatalf("DoCancelable = %d, %v, flights %d", value, err, len(g.flights))
 		}
+	})
+}
+
+// TestFlightsKeptWhileCanceledStarterJoins ensures a canceled starter keeps its flight until the callback ends.
+func TestFlightsKeptWhileCanceledStarterJoins(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		g := New[string, int]()
 		gate := make(chan struct{})
 		ctx, cancel := context.WithCancel(t.Context())
 		defer cancel()
@@ -37,16 +45,44 @@ func TestFlightsEmptyAfterCompletion(t *testing.T) {
 		}()
 		synctest.Wait()
 		cancel()
-		if cancelErr := <-done; !errors.Is(cancelErr, context.Canceled) {
-			t.Errorf("cancelled waiter: %v", cancelErr)
+		synctest.Wait()
+		select {
+		case <-done:
+			close(gate)
+			t.Fatal("canceled starter returned before callback finished")
+		default:
 		}
 		if len(g.flights) != 1 {
 			t.Errorf("running flights = %d, want 1", len(g.flights))
 		}
 		close(gate)
+		if cancelErr := <-done; !errors.Is(cancelErr, context.Canceled) {
+			t.Errorf("cancelled waiter: %v", cancelErr)
+		}
 		synctest.Wait()
 		if len(g.flights) != 0 {
 			t.Errorf("finished flights = %d, want 0", len(g.flights))
 		}
 	})
+}
+
+// TestCallSkipsCallbackAfterStarterLeft ensures begin rejects a callback when the starter already left.
+func TestCallSkipsCallbackAfterStarterLeft(t *testing.T) {
+	t.Parallel()
+	g := New[string, int]()
+	flight := g.acquire("key")
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	called := false
+	_, err := g.call(ctx, "key", flight, &invocation{left: true}, func(context.Context) (int, error) {
+		called = true
+		return 0, nil
+	})
+	if called || !errors.Is(err, context.Canceled) || flight.running {
+		t.Fatalf("call = called %t, err %v, running %t", called, err, flight.running)
+	}
+	g.release("key", flight)
+	if len(g.flights) != 0 {
+		t.Fatalf("flights = %d, want 0", len(g.flights))
+	}
 }
