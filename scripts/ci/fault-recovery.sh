@@ -104,11 +104,27 @@ for package, test in sorted(hits):
 ' "$MARKER"
 }
 
+# Lists scoped modules or fails before GOROOT is copied.
+select_scan_modules() {
+	local listing status=0
+	listing="$(bash "$SCRIPT_DIR/go-modules.sh" list)" || status=$?
+	if ((status != 0)); then
+		printf '::error::fault-recovery: module discovery failed (exit %d)\n' "$status" >&2
+		return 1
+	fi
+	if [[ -z "$listing" ]]; then
+		printf '::error::fault-recovery: module selection is empty; nothing to scan\n' >&2
+		return 1
+	fi
+	printf '%s' "$listing"
+}
+
 # Short-tests each module with the marked GOROOT; JSON events go to $1.
 run_modules() {
-	local events="$1" module count=0 status=0
-	local -a modules=()
-	mapfile -t modules < <(bash "$SCRIPT_DIR/go-modules.sh" list)
+	local events="$1"
+	shift
+	local module count=0 status=0
+	local -a modules=("$@")
 	if ((${#modules[@]} > MAX_MODULES)); then
 		printf '::error::%d modules exceed the bound of %d\n' "${#modules[@]}" "$MAX_MODULES" >&2
 		return 1
@@ -127,6 +143,11 @@ run_modules() {
 
 # Runs module tests with the marked runtime and reports recovered faults.
 main() {
+	local listing tests_status=0 faults
+	local -a modules=()
+	listing="$(select_scan_modules)" || return 1
+	mapfile -t modules <<<"$listing"
+
 	local scratch
 	scratch="$(make_scratch "${SCRATCH_BASES[@]}")" || return 1
 	# shellcheck disable=SC2064 # expand now: scratch is local to main
@@ -135,8 +156,7 @@ main() {
 	export GOROOT="$scratch/goroot" GOTOOLCHAIN=local
 	export PATH="$GOROOT/bin:$PATH"
 
-	local tests_status=0 faults
-	run_modules "$scratch/events.jsonl" || tests_status=$?
+	run_modules "$scratch/events.jsonl" "${modules[@]}" || tests_status=$?
 	faults="$(report_faults <"$scratch/events.jsonl")"
 	if [[ -n "$faults" ]]; then
 		printf '::error::tests recovered a nil-dereference fault (golang/go#81238):\n%s\n' "$faults" >&2
