@@ -9,6 +9,9 @@ TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly TEST_DIR
 
 export GOFLAGS='' GOWORK=off GOTOOLCHAIN=local
+# Fixture git commands must ignore the caller's repository and user configuration.
+for git_var in "${!GIT_@}"; do unset "$git_var"; done
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
 
 # shellcheck source=scripts/ci/fault-recovery.sh
 source "$TEST_DIR/fault-recovery.sh"
@@ -175,6 +178,113 @@ check_symlink_base() {
 		fail "make_scratch did not explain the rejected symlink base"
 }
 
+# Fails unless the fault-recovery job exports CI_SCOPE_BASE to all steps.
+check_job_scope() {
+	local workflow="$TEST_DIR/../../.github/workflows/ci.yml" header
+	header="$(awk '/^  fault-recovery:$/ { inside = 1; next } inside && /^  [a-z]/ { exit } inside { print }' "$workflow")"
+	header="${header%%    steps:*}"
+	if ! grep -Fq '    env:' <<<"$header" ||
+		! grep -Fq \
+			"      CI_SCOPE_BASE: \${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || '' }}" \
+			<<<"$header"; then
+		fail "fault-recovery job does not pass CI_SCOPE_BASE to its steps"
+	fi
+}
+
+# Writes a passing test so a scanned fixture module exits 0.
+write_ok_test() {
+	local path="$1" package_name="$2"
+	printf 'package %s\n\nimport "testing"\n\nfunc TestOK(t *testing.T) {}\n' "$package_name" >"$path"
+}
+
+# Builds a four-module git fixture with ci scripts and a single ok test per module.
+make_scope_fixture() {
+	local dir="$1"
+	mkdir -p "$dir/scripts/ci" "$dir/core" "$dir/app" "$dir/lone"
+	cp "$TEST_DIR/fault-recovery.sh" "$TEST_DIR/go-modules.sh" \
+		"$TEST_DIR/ci_scope.py" "$TEST_DIR/gomod.py" "$dir/scripts/ci/"
+	printf '.workingdir/\n' >"$dir/.gitignore"
+	git -C "$dir" init -q
+	git -C "$dir" config user.name 'Test Runner'
+	git -C "$dir" config user.email 'test@example.com'
+	git -C "$dir" config commit.gpgsign false
+	printf 'module example.com/root\n\ngo 1.24\n\nreplace example.com/core => ./core\n' >"$dir/go.mod"
+	printf 'module example.com/core\n\ngo 1.24\n' >"$dir/core/go.mod"
+	printf 'module example.com/app\n\ngo 1.24\n\nreplace example.com/core => ../core\n' >"$dir/app/go.mod"
+	printf 'module example.com/lone\n\ngo 1.24\n' >"$dir/lone/go.mod"
+	write_ok_test "$dir/ok_test.go" root
+	write_ok_test "$dir/core/ok_test.go" core
+	write_ok_test "$dir/app/ok_test.go" app
+	write_ok_test "$dir/lone/ok_test.go" lone
+	git -C "$dir" add -A
+	git -C "$dir" -c commit.gpgsign=false commit -q -m 'init'
+}
+
+# Runs fault-recovery.sh scoped to base; stderr goes to the third argument.
+scan_scope() {
+	local dir="$1" base="$2" stderr_file="$3" status=0
+	( cd "$dir" && CI_SCOPE_BASE="$base" bash scripts/ci/fault-recovery.sh ) >/dev/null 2>"$stderr_file" || status=$?
+	return "$status"
+}
+
+# Prints module names from fault-recovery progress lines, sorted and space-joined.
+scanned_modules() {
+	local stderr_file="$1"
+	grep -E '^fault-recovery: \[[0-9]+/[0-9]+\] ' "$stderr_file" 2>/dev/null |
+		sed -E 's/^fault-recovery: \[[0-9]+\/[0-9]+\] //' | LC_ALL=C sort | paste -sd ' ' -
+}
+
+# Exercises scoped module selection for changed modules, global inputs, and failure paths.
+check_scope_selection() {
+	local scope_dir="$suite_root/scope" base head stderr_file="$suite_root/scope.stderr"
+	local status modules
+	mkdir -p "$scope_dir"
+	make_scope_fixture "$scope_dir"
+	base="$(git -C "$scope_dir" rev-parse HEAD)"
+
+	printf '// touch\n' >>"$scope_dir/core/ok_test.go"
+	git -C "$scope_dir" add -A
+	git -C "$scope_dir" -c commit.gpgsign=false commit -q -m 'change core'
+	status=0
+	scan_scope "$scope_dir" "$base" "$stderr_file" || status=$?
+	modules="$(scanned_modules "$stderr_file")"
+	[[ "$status" == 0 && "$modules" == '. app core' ]] ||
+		fail "S1: status=$status modules=${modules:-<empty>}"
+
+	local scope_global="$suite_root/scope-global"
+	make_scope_fixture "$scope_global"
+	base="$(git -C "$scope_global" rev-parse HEAD)"
+	printf 'linters: {}\n' >"$scope_global/.golangci.yml"
+	git -C "$scope_global" add .golangci.yml
+	git -C "$scope_global" -c commit.gpgsign=false commit -q -m 'global lint input'
+	status=0
+	scan_scope "$scope_global" "$base" "$stderr_file" || status=$?
+	modules="$(scanned_modules "$stderr_file")"
+	[[ "$status" == 0 && "$modules" == '. app core lone' ]] ||
+		fail "S2: status=$status modules=${modules:-<empty>}"
+
+	local scope_empty="$suite_root/scope-empty"
+	make_scope_fixture "$scope_empty"
+	head="$(git -C "$scope_empty" rev-parse HEAD)"
+	status=0
+	scan_scope "$scope_empty" "$head" "$stderr_file" || status=$?
+	grep -q 'module selection is empty' "$stderr_file" || fail "S3: missing empty-selection error"
+	if grep -qE '^fault-recovery: \[[0-9]+/[0-9]+\] ' "$stderr_file"; then
+		fail "S3: progress lines present on empty selection"
+	fi
+	[[ "$status" != 0 ]] || fail "S3: status=$status expected nonzero"
+
+	local scope_bad="$suite_root/scope-bad"
+	make_scope_fixture "$scope_bad"
+	status=0
+	scan_scope "$scope_bad" '0000000000000000000000000000000000000000' "$stderr_file" || status=$?
+	grep -q 'module discovery failed' "$stderr_file" || fail "S4: missing discovery-failure error"
+	if grep -qE '^fault-recovery: \[[0-9]+/[0-9]+\] ' "$stderr_file"; then
+		fail "S4: progress lines present on discovery failure"
+	fi
+	[[ "$status" != 0 ]] || fail "S4: status=$status expected nonzero"
+}
+
 # Checks EXIT trap cleanup with an apostrophe in the scratch path.
 check_trap_quoting() {
 	local quoted_dir="$suite_root/it's a dir"
@@ -197,6 +307,8 @@ main() {
 	check_tmp_checkout
 	check_symlink_base
 	check_trap_quoting
+	check_job_scope
+	check_scope_selection
 	printf 'fault-recovery policy: ok\n'
 }
 

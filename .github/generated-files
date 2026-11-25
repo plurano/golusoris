@@ -90,6 +90,7 @@ testutil/pact/go.mod
 testutil/pact/go.sum
 testutil/promcheck/go.mod
 testutil/promcheck/go.sum
+tools/tool-versions.env
 web3/evm/go.mod
 web3/evm/go.sum
 web3/solana/go.mod
