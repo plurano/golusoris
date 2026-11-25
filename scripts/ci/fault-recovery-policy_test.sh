@@ -121,8 +121,31 @@ check_failure_report() {
 
 	local mode_status=0 mode_err="$suite_root/mode.err"
 	summarize_events unknown </dev/null 2>"$mode_err" || mode_status=$?
-	[[ "$mode_status" == 2 && -s "$mode_err" ]] ||
+	[[ "$mode_status" == 3 && -s "$mode_err" ]] ||
 		fail "unknown summary mode: status=$mode_status err=$(cat "$mode_err")"
+}
+
+# Checks fail-closed CLI validation and zero-bound handling in go_test_events.py.
+check_cli_errors() {
+	local err_file="$suite_root/cli.err" out_file="$suite_root/cli.out" status=0
+	python3 -I "$TEST_DIR/go_test_events.py" failures marker 1 1 </dev/null 2>"$err_file" || status=$?
+	[[ "$status" == 3 && -s "$err_file" ]] ||
+		fail "cli 4 arguments: status=$status err=$(cat "$err_file")"
+
+	status=0
+	python3 -I "$TEST_DIR/go_test_events.py" failures marker x 1 1 </dev/null 2>"$err_file" || status=$?
+	[[ "$status" == 3 && -s "$err_file" ]] ||
+		fail "cli non-integer bound: status=$status err=$(cat "$err_file")"
+
+	status=0
+	python3 -I "$TEST_DIR/go_test_events.py" failures marker 1 -1 1 </dev/null 2>"$err_file" || status=$?
+	[[ "$status" == 3 && -s "$err_file" ]] ||
+		fail "cli negative bound: status=$status err=$(cat "$err_file")"
+
+	status=0
+	python3 -I "$TEST_DIR/go_test_events.py" failures marker 0 0 0 </dev/null >"$out_file" 2>"$err_file" || status=$?
+	[[ "$status" == 0 && ! -s "$out_file" && ! -s "$err_file" ]] ||
+		fail "cli zero bounds: status=$status out=$(cat "$out_file") err=$(cat "$err_file")"
 }
 
 # Checks failed-test count and per-test output tail bounds on a synthetic stream.
@@ -424,6 +447,7 @@ check_trap_quoting() {
 main() {
 	check_fault_report
 	check_failure_report
+	check_cli_errors
 	check_failure_bounds
 	check_bare_runtime
 	check_readonly_goroot

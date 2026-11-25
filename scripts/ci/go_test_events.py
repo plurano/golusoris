@@ -155,7 +155,7 @@ def main(argv: list[str]) -> int:
         cfg = parse_config(argv)
     except ValueError as err:
         sys.stderr.write(f"{err}\n")
-        return 2
+        return 3
     if isinstance(sys.stdout, io.TextIOWrapper):
         sys.stdout.reconfigure(newline="\n")
     if cfg.mode == "faults":
