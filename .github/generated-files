@@ -6,6 +6,9 @@
 # plurano/horistes, decision record 0032). One path per line; the train reads
 # this file from the default branch and never commits a path missing here.
 # scripts/ci/regenerate.py refuses a list that differs from its own table.
+ai/tiny/serve/tflite/sidecar/requirements.lock
+ai/tiny/trainers/gemma/requirements.lock
+ai/tiny/trainers/litert/requirements.lock
 apidocs/embed/SCALAR_RELEASED
 apidocs/embed/scalar.js
 container/registry/go.mod
@@ -82,6 +85,8 @@ science/plot/go.mod
 science/plot/go.sum
 scripts/ci/cmd/workflow_actor_parser/go.mod
 scripts/ci/cmd/workflow_actor_parser/go.sum
+scripts/ci/tiny-trainer-locks.sh
+scripts/ci/tiny-trainer-pip-audit.lock
 storage/azblob/go.mod
 storage/azblob/go.sum
 storage/gcs/go.mod

@@ -77,6 +77,9 @@ pre-push:
       run: bash scripts/hooks/python-tests.sh --pushed {push_files}
     shellcheck:
       run: bash scripts/hooks/shellcheck.sh --pushed {push_files}
+    docstring-coverage:
+      run: sh .config/lefthook/python.sh -B scripts/ci/docstring_coverage_policy.py --pre-push
+      use_stdin: true
     shell-flake-policy:
       run: sh .config/lefthook/python.sh -B scripts/ci/shell_flake_policy.py --pre-push
       use_stdin: true
