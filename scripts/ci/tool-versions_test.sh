@@ -67,6 +67,7 @@ for value in \
 	"$BUF_VERSION" \
 	"v$SHELLCHECK_VERSION" \
 	"$ACTIONLINT_VERSION" \
+	"$SHFMT_VERSION" \
 	"v$GORELEASER_VERSION" \
 	"v$SYFT_VERSION" \
 	"v$COSIGN_VERSION" \
@@ -155,6 +156,7 @@ for variable in \
 	CONTROLLER_GEN_VERSION \
 	GO_MUTESTING_VERSION \
 	HELM_VERSION \
+	SHFMT_VERSION \
 	ACTIONLINT_VERSION; do
 	if ! grep -Fq "\$(${variable})" "$repo_root/Makefile"; then
 		printf 'tools-bootstrap does not consume %s\n' "$variable" >&2
