@@ -10,6 +10,7 @@ embedded assets such as the Scalar API reference browser bundle are rebuilt.
 This tool executes go mod tidy across all modules, rebuilds the Scalar bundle,
 regenerates module-backed upstream documentation pins,
 recomputes the Go module sums pinned in tools/tool-versions.env,
+recomputes release asset and image digests annotated in tools/tool-versions.env,
 re-locks the tiny trainer Python requirements whose pins a Renovate branch moved,
 verifies that no unexpected files were modified or deleted, and writes a directory
 containing the regenerated files and a manifest describing them.
@@ -31,6 +32,8 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import http.client
+import io
 import json
 import os
 import re
@@ -92,6 +95,26 @@ GO_VERSION_VALUE = re.compile(r"v[0-9A-Za-z.+-]+")
 GO_PIN_COMMENT = re.compile(
     r"# renovate: datasource=go depName=(?P<module>\S+)(?: .*)?"
 )
+DIGEST_TIMEOUT_SECONDS = 300
+MAX_DIGEST_BYTES = 256 << 20
+DIGEST_CHUNK_BYTES = 65536
+MAX_RELEASE_DIGEST_CASES = 32
+RELEASE_DIGEST_COMMENT = re.compile(
+    r"# (?P<kind>sha256-of|digest-of): (?P<template>\S+)"
+)
+DIGEST_DIRECTIVE_PREFIX = re.compile(r"\s*#\s*(?:sha256-of|digest-of)(?:\s|:|$)")
+PIN_ASSIGNMENT = re.compile(r"(?P<name>[A-Z][A-Z0-9_]*)=(?P<value>[^\s\"'`#;]*)")
+RAW_PIN_ASSIGNMENT = re.compile(r"(?P<name>[A-Z][A-Z0-9_]*)=.*")
+DIGEST_PLACEHOLDER = re.compile(r"\$\{(?P<name>[A-Z][A-Z0-9_]*)(?P<strip>#v)?\}")
+SHA256_VALUE = re.compile(r"[0-9a-f]{64}")
+IMAGE_DIGEST_VALUE = re.compile(r"sha256:[0-9a-f]{64}")
+IMAGE_REF_VALUE = re.compile(r"[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+")
+SHA256_PIN_LINE = re.compile(
+    r"(?P<var>[A-Z][A-Z0-9_]*_SHA256)=(?P<value>[0-9a-f]{64})"
+)
+IMAGE_DIGEST_PIN_LINE = re.compile(
+    r"(?P<var>[A-Z][A-Z0-9_]*_IMAGE_DIGEST)=(?P<value>sha256:[0-9a-f]{64})"
+)
 TRAINER_LOCK_SCRIPT = "scripts/ci/tiny-trainer-locks.sh"
 TRAINER_LOCK_PATHS = [
     "ai/tiny/serve/tflite/sidecar/requirements.lock",
@@ -140,6 +163,23 @@ class LockHooks(NamedTuple):
     now: datetime
     fetch: Callable[[str], bytes]
     env: dict[str, str] | None
+
+
+class DigestHooks(NamedTuple):
+    """Injectable URL hasher and OCI image digest resolver for release pins."""
+
+    fetch_sha256: Callable[[str], str]
+    image_digest: Callable[[str], str]
+
+
+class ReleaseDigestPin(NamedTuple):
+    """Validated sha256-of or digest-of directive and target pin in tool-versions."""
+
+    kind: str
+    source: str
+    var: str
+    current: str
+    pin_idx: int
 
 
 class CheckError(Exception):
@@ -630,14 +670,218 @@ def regenerate_module_sums(
     return commands
 
 
-def _https_opener() -> urllib.request.OpenerDirector:
-    """Return a redirect-free urllib opener restricted to HTTPS URLs."""
+def _https_opener(
+    *, follow_redirects: bool = False
+) -> urllib.request.OpenerDirector:
+    """Return a urllib opener restricted to HTTPS URLs."""
     opener = urllib.request.OpenerDirector()
     opener.add_handler(urllib.request.UnknownHandler())
     opener.add_handler(urllib.request.HTTPSHandler())
+    if follow_redirects:
+        opener.add_handler(urllib.request.HTTPRedirectHandler())
     opener.add_handler(urllib.request.HTTPDefaultErrorHandler())
     opener.add_handler(urllib.request.HTTPErrorProcessor())
     return opener
+
+
+def sha256_stream(reader: io.BufferedIOBase, limit: int) -> str:
+    """Hash reader in fixed chunks up to limit bytes or refuse larger bodies."""
+    if limit < 0 or limit > MAX_DIGEST_BYTES:
+        raise CheckError(f"invalid digest byte limit: {limit}")
+    digest = hashlib.sha256()
+    total = 0
+    for _ in range(MAX_DIGEST_BYTES // DIGEST_CHUNK_BYTES + 1):
+        chunk = reader.read(DIGEST_CHUNK_BYTES)
+        if not chunk:
+            return digest.hexdigest()
+        total += len(chunk)
+        if total > limit:
+            raise CheckError(f"release asset exceeds {limit} bytes")
+        digest.update(chunk)
+    raise CheckError(f"release asset exceeds {limit} bytes")
+
+
+def fetch_sha256(url: str) -> str:
+    """Fetch an HTTPS URL and return its lowercase SHA-256 hex digest."""
+    if not url.startswith("https://"):
+        raise CheckError(f"release digest URL must start with https://: {url}")
+    try:
+        with _https_opener(follow_redirects=True).open(
+            url, timeout=DIGEST_TIMEOUT_SECONDS
+        ) as response:
+            return sha256_stream(response, MAX_DIGEST_BYTES)
+    except (OSError, ValueError, http.client.HTTPException) as error:
+        if isinstance(error, urllib.error.HTTPError):
+            error.close()
+        raise CheckError(f"could not fetch release asset {url}: {error}") from error
+
+
+def _imagetools_command(ref: str) -> list[str]:
+    """Return the retry-wrapped buildx imagetools inspect command for ref."""
+    return [
+        "bash",
+        "scripts/ci/retry.sh",
+        "docker",
+        "buildx",
+        "imagetools",
+        "inspect",
+        ref,
+        "--format",
+        "{{json .Manifest}}",
+    ]
+
+
+def image_digest(ref: str, root: Path | None = None) -> str:
+    """Return ref's OCI index or manifest digest via buildx imagetools inspect."""
+    if "@" in ref or IMAGE_REF_VALUE.fullmatch(ref) is None:
+        raise CheckError(f"invalid OCI image reference: {ref!r}")
+    actual_root = root if root is not None else Path(__file__).resolve().parents[2]
+    stdout = run_update_command(
+        _imagetools_command(ref), actual_root, DIGEST_TIMEOUT_SECONDS
+    )
+    manifest = load_json_object(stdout, f"imagetools inspect {ref}")
+    digest = manifest.get("digest")
+    if not isinstance(digest, str) or IMAGE_DIGEST_VALUE.fullmatch(digest) is None:
+        raise CheckError(f"imagetools inspect {ref}: invalid digest {digest!r}")
+    return digest
+
+
+def _expand_token(
+    match: re.Match[str], defs: dict[str, str], line_no: int
+) -> str:
+    """Resolve one ${NAME} or ${NAME#v} placeholder against prior assignments."""
+    name = match["name"]
+    if name not in defs:
+        raise CheckError(f"{TOOL_VERSIONS}:{line_no}: undefined variable {name}")
+    value = defs[name]
+    return value.removeprefix("v") if match["strip"] else value
+
+
+def _expand_digest_source(
+    template: str, kind: str, defs: dict[str, str], line_no: int
+) -> str:
+    """Expand allow-listed placeholders and validate the resulting URL or ref."""
+    expanded = DIGEST_PLACEHOLDER.sub(
+        lambda m: _expand_token(m, defs, line_no), template
+    )
+    if "$" in expanded:
+        msg = f"{TOOL_VERSIONS}:{line_no}: unsupported expansion in {template!r}"
+        raise CheckError(msg)
+    if kind == "sha256-of":
+        if not expanded.startswith("https://") or len(expanded) <= len("https://"):
+            msg = (
+                f"{TOOL_VERSIONS}:{line_no}: "
+                f"sha256-of URL must start with https://: {expanded!r}"
+            )
+            raise CheckError(msg)
+        return expanded
+    if "@" in expanded or IMAGE_REF_VALUE.fullmatch(expanded) is None:
+        msg = f"{TOOL_VERSIONS}:{line_no}: invalid digest-of ref {expanded!r}"
+        raise CheckError(msg)
+    return expanded
+
+
+def _parse_digest_pin_line(
+    kind: str, next_line: str, line_no: int
+) -> tuple[str, str]:
+    """Validate the pin line directly below a sha256-of or digest-of comment."""
+    pattern = SHA256_PIN_LINE if kind == "sha256-of" else IMAGE_DIGEST_PIN_LINE
+    match = pattern.fullmatch(next_line)
+    if match is None:
+        expected = (
+            "NAME_SHA256=<64 hex>"
+            if kind == "sha256-of"
+            else "NAME_IMAGE_DIGEST=sha256:<64 hex>"
+        )
+        msg = f"{TOOL_VERSIONS}:{line_no}: {kind} comment must precede {expected}"
+        raise CheckError(msg)
+    return match["var"], match["value"]
+
+
+def _record_pin_assignment(line: str, defs: dict[str, str]) -> bool:
+    """Record a column-0 NAME=value line into defs and report whether line matched."""
+    assign = PIN_ASSIGNMENT.fullmatch(line)
+    if assign is not None:
+        defs[assign["name"]] = assign["value"]
+        return True
+    raw_assign = RAW_PIN_ASSIGNMENT.fullmatch(line)
+    if raw_assign is not None:
+        defs.pop(raw_assign["name"], None)
+        return True
+    return False
+
+
+def release_digest_pins(text: str) -> list[ReleaseDigestPin]:
+    """Parse and validate all sha256-of and digest-of pin pairs in text."""
+    lines = tool_version_lines(text)
+    defs: dict[str, str] = {}
+    pins: list[ReleaseDigestPin] = []
+    for i in range(min(len(lines), MAX_TOOL_VERSION_LINES + 1)):
+        line = lines[i]
+        if _record_pin_assignment(line, defs):
+            continue
+        comment = RELEASE_DIGEST_COMMENT.fullmatch(line)
+        if comment is None:
+            if DIGEST_DIRECTIVE_PREFIX.match(line) is not None:
+                msg = f"{TOOL_VERSIONS}:{i + 1}: malformed release digest comment"
+                raise CheckError(msg)
+            continue
+        kind = comment["kind"]
+        next_line = lines[i + 1] if i + 1 < len(lines) else ""
+        var, current = _parse_digest_pin_line(kind, next_line, i + 1)
+        source = _expand_digest_source(comment["template"], kind, defs, i + 1)
+        pins.append(ReleaseDigestPin(kind, source, var, current, i + 1))
+    return pins
+
+
+def _resolve_release_digest(
+    pin: ReleaseDigestPin, hooks: DigestHooks
+) -> tuple[str, list[str]]:
+    """Compute one verified sha256 or OCI digest and its manifest command."""
+    if pin.kind == "sha256-of":
+        got = hooks.fetch_sha256(pin.source)
+        if not isinstance(got, str) or SHA256_VALUE.fullmatch(got) is None:
+            msg = f"{TOOL_VERSIONS}:{pin.pin_idx + 1}: invalid sha256 {got!r}"
+            raise CheckError(msg)
+        return got, ["sha256-of", pin.source]
+    got = hooks.image_digest(pin.source)
+    if not isinstance(got, str) or IMAGE_DIGEST_VALUE.fullmatch(got) is None:
+        msg = f"{TOOL_VERSIONS}:{pin.pin_idx + 1}: invalid image digest {got!r}"
+        raise CheckError(msg)
+    return got, _imagetools_command(pin.source)
+
+
+def regenerate_release_digests(
+    root: Path, hooks: DigestHooks | None = None
+) -> list[list[str]]:
+    """Recompute annotated release asset and OCI image digests in tool-versions."""
+    path = root / TOOL_VERSIONS
+    if not path.is_file():
+        return []
+    try:
+        text = path.read_bytes().decode("utf-8")
+    except (OSError, UnicodeError) as error:
+        raise CheckError(f"{TOOL_VERSIONS}: could not read: {error}") from error
+    pins = release_digest_pins(text)
+    if not pins:
+        return []
+    active = (
+        hooks
+        if hooks is not None
+        else DigestHooks(fetch_sha256, lambda ref: image_digest(ref, root))
+    )
+    lines = tool_version_lines(text)
+    commands: list[list[str]] = []
+    for i in range(min(len(pins), MAX_TOOL_VERSION_LINES)):
+        pin = pins[i]
+        new_value, cmd = _resolve_release_digest(pin, active)
+        commands.append(cmd)
+        if new_value != pin.current:
+            lines[pin.pin_idx] = f"{pin.var}={new_value}"
+    updated = "\n".join(lines)
+    if updated != text:
+        path.write_bytes(updated.encode("utf-8"))
+    return commands
 
 
 def fetch_preset(url: str) -> bytes:
@@ -1031,6 +1275,7 @@ def write_regenerated(
     after_pass: Callable[[Path], None] | None = None,
     module_env: dict[str, str] | None = None,
     lock_hooks: LockHooks | None = None,
+    digest_hooks: DigestHooks | None = None,
 ) -> tuple[list[str], str | None]:
     """Run regeneration steps, stage artifacts, and return failures or status."""
     head = run_git(["rev-parse", "HEAD"], root).strip()
@@ -1057,6 +1302,7 @@ def write_regenerated(
             executed.append(scalar_cmd)
         executed.extend(regenerate_upstream_pins(root))
         executed.extend(regenerate_module_sums(root, module_env))
+        executed.extend(regenerate_release_digests(root, digest_hooks))
         executed.extend(regenerate_trainer_locks(root, lock_hooks))
 
     raw_status = git_status_bytes(root)
@@ -1465,12 +1711,14 @@ def run_upstream_validation_cases() -> tuple[list[str], int]:
 
 
 def strip_module_sum_lines(text: str) -> str:
+    """Drop module-sum pins and release-digest comments for offline fixtures."""
     plain = text.splitlines()
     raw = text.splitlines(keepends=True)
     return "".join(
         raw[i]
         for i in range(min(len(plain), MAX_TOOL_VERSION_LINES))
         if MODULE_SUM_LINE.fullmatch(plain[i]) is None
+        and RELEASE_DIGEST_COMMENT.fullmatch(plain[i]) is None
     )
 
 
@@ -1667,6 +1915,266 @@ def run_module_sum_cases(repo: Path, temp_dir: Path) -> tuple[list[str], int, in
     )
     failures.extend(ref_failures)
     return failures, refused, accepted
+
+
+def _stub_digest_hooks() -> DigestHooks:
+    """Return deterministic offline DigestHooks hashing URL and ref text."""
+    return DigestHooks(
+        fetch_sha256=lambda url: hashlib.sha256(url.encode("utf-8")).hexdigest(),
+        image_digest=lambda ref: (
+            "sha256:" + hashlib.sha256(ref.encode("utf-8")).hexdigest()
+        ),
+    )
+
+
+def _fail_digest_hook(target: str) -> str:
+    """Refuse any unexpected digest lookup in unannotated boundary fixtures."""
+    raise CheckError(f"unexpected digest lookup: {target}")
+
+
+def _verify_release_digest_manifest(
+    out: Path, expected_url: str, expected_ref: str
+) -> list[str]:
+    """Verify manifest.json records both release digest update commands."""
+    manifest_file = out / "manifest.json"
+    if not manifest_file.is_file():
+        return ["release digest repair did not write manifest.json"]
+    manifest = load_json_object(
+        manifest_file.read_text(encoding="utf-8"), "manifest.json"
+    )
+    cmds = manifest.get("commands", [])
+    failures: list[str] = []
+    if ["sha256-of", expected_url] not in cmds:
+        failures.append("release digest manifest missing sha256-of command")
+    if _imagetools_command(expected_ref) not in cmds:
+        failures.append("release digest manifest missing imagetools command")
+    return failures
+
+
+def _run_release_digest_positive(
+    repo: Path, temp_dir: Path, hooks: DigestHooks
+) -> tuple[list[str], int]:
+    """Verify write_regenerated repairs stale sha256-of and digest-of pins."""
+    reset_fixture_repo(repo)
+    original_head = run_git(["rev-parse", "HEAD"], repo).strip()
+    url_comment = (
+        "# sha256-of: "
+        "https://example.com/${TOOL_VERSION}/tool-${TOOL_VERSION#v}.tar.gz\n"
+    )
+    ref_comment = "# digest-of: example.invalid/tool:${TOOL_VERSION#v}\n"
+    stale_text = (
+        "TOOL_VERSION=v1.2.0\n"
+        f"{url_comment}TOOL_SHA256={'0' * 64}\n"
+        f"{ref_comment}TOOL_IMAGE_DIGEST=sha256:{'1' * 64}\n"
+    )
+    expected_url = "https://example.com/v1.2.0/tool-1.2.0.tar.gz"
+    expected_ref = "example.invalid/tool:1.2.0"
+    expected_text = (
+        "TOOL_VERSION=v1.2.0\n"
+        f"{url_comment}TOOL_SHA256={hooks.fetch_sha256(expected_url)}\n"
+        f"{ref_comment}TOOL_IMAGE_DIGEST={hooks.image_digest(expected_ref)}\n"
+    )
+    try:
+        (repo / TOOL_VERSIONS).write_text(stale_text, encoding="utf-8")
+        run_git(["commit", "-am", "plant stale release digests"], repo)
+        out = temp_dir / "out-release-digests"
+        fails, _ = write_regenerated(out, repo, digest_hooks=hooks)
+        failures = [f"release digest repair failed: {f}" for f in fails]
+        copied = out / "files" / TOOL_VERSIONS
+        if not copied.is_file() or copied.read_text(encoding="utf-8") != expected_text:
+            failures.append(
+                "release digest repair did not write expected tool-versions.env"
+            )
+        failures.extend(
+            _verify_release_digest_manifest(out, expected_url, expected_ref)
+        )
+        if failures:
+            return failures, 0
+        run_git(["commit", "-am", "accept regenerated release digests"], repo)
+        fails2, msg = write_regenerated(
+            temp_dir / "out-release-digests-current", repo, digest_hooks=hooks
+        )
+        if fails2 or msg != "nothing to regenerate":
+            return [f"release digest repair not idempotent: {fails2}, {msg}"], 0
+        return [], 1
+    finally:
+        run_git(["reset", "--hard", original_head], repo)
+        reset_fixture_repo(repo)
+
+
+def _refuse_release_digest_case(
+    temp_dir: Path,
+    index: int,
+    case: tuple[str, str, DigestHooks, str],
+    failures: list[str],
+) -> int:
+    """Write one invalid tool-versions fixture and return 1 on CheckError."""
+    label, content, case_hooks, expected_substr = case
+    scratch = temp_dir / f"release-digest-refuse-{index}"
+    (scratch / TOOL_VERSIONS).parent.mkdir(parents=True, exist_ok=True)
+    (scratch / TOOL_VERSIONS).write_bytes(content.encode("utf-8"))
+    try:
+        regenerate_release_digests(scratch, case_hooks)
+    except CheckError as error:
+        if expected_substr in str(error):
+            return 1
+        failures.append(f"case {label}: wrong CheckError: {error}")
+        return 0
+    failures.append(f"case {label}: expected CheckError")
+    return 0
+
+
+def _release_digest_expansion_refusals(
+    hooks: DigestHooks,
+) -> tuple[tuple[str, str, DigestHooks, str], ...]:
+    """Return template-expansion fixtures that release digest parsing refuses."""
+    zero = "0" * 64
+    prefix = f"{TOOL_VERSIONS}:"
+    return (
+        (
+            "undefined-name",
+            f"# sha256-of: https://example.com/${{MISSING_NAME}}/a.tgz\nTOOL_SHA256={zero}\n",
+            hooks,
+            f"{prefix}1:",
+        ),
+        (
+            "percent-strip",
+            f"TOOL_VERSION=v1.2.0\n# sha256-of: https://example.com/${{TOOL_VERSION%v}}/a.tgz\nTOOL_SHA256={zero}\n",
+            hooks,
+            f"{prefix}2:",
+        ),
+        (
+            "bare-dollar",
+            f"TOOL_VERSION=v1.2.0\n# sha256-of: https://example.com/$TOOL_VERSION/a.tgz\nTOOL_SHA256={zero}\n",
+            hooks,
+            f"{prefix}2:",
+        ),
+        (
+            "http-url",
+            f"TOOL_VERSION=v1.2.0\n# sha256-of: http://example.com/${{TOOL_VERSION}}/a.tgz\nTOOL_SHA256={zero}\n",
+            hooks,
+            f"{prefix}2:",
+        ),
+        (
+            "digest-ref-at",
+            f"TOOL_VERSION=v1.2.0\n# digest-of: example.invalid/tool:${{TOOL_VERSION#v}}@sha256:{zero}\nTOOL_IMAGE_DIGEST=sha256:{zero}\n",
+            hooks,
+            f"{prefix}2:",
+        ),
+    )
+
+
+def _release_digest_pin_refusals(
+    hooks: DigestHooks,
+) -> tuple[tuple[str, str, DigestHooks, str], ...]:
+    """Return pin-shape, stub-value and trailing-comment refusal fixtures."""
+    zero = "0" * 64
+    bad_hooks = DigestHooks(lambda _url: "not-a-hex-digest", hooks.image_digest)
+    prefix = f"{TOOL_VERSIONS}:"
+    return (
+        (
+            "blank-after-comment",
+            f"TOOL_VERSION=v1.2.0\n# sha256-of: https://example.com/${{TOOL_VERSION}}/a.tgz\n\nTOOL_SHA256={zero}\n",
+            hooks,
+            f"{prefix}2:",
+        ),
+        (
+            "sha256-over-image-digest",
+            f"TOOL_VERSION=v1.2.0\n# sha256-of: https://example.com/${{TOOL_VERSION}}/a.tgz\nTOOL_IMAGE_DIGEST=sha256:{zero}\n",
+            hooks,
+            f"{prefix}2:",
+        ),
+        (
+            "non-hex-stub",
+            f"TOOL_VERSION=v1.2.0\n# sha256-of: https://example.com/${{TOOL_VERSION}}/a.tgz\nTOOL_SHA256={zero}\n",
+            bad_hooks,
+            f"{prefix}3:",
+        ),
+        (
+            "comment-last-line",
+            "TOOL_VERSION=v1.2.0\n# sha256-of: https://example.com/${TOOL_VERSION}/a.tgz",
+            hooks,
+            f"{prefix}2:",
+        ),
+    )
+
+
+def _release_digest_refusal_cases(
+    hooks: DigestHooks,
+) -> tuple[tuple[str, str, DigestHooks, str], ...]:
+    """Return negative and trailing-comment boundary fixtures for release digests."""
+    return (
+        *_release_digest_expansion_refusals(hooks),
+        *_release_digest_pin_refusals(hooks),
+    )
+
+
+def _run_release_digest_boundary_cases(
+    temp_dir: Path,
+) -> tuple[list[str], int, int]:
+    """Verify unannotated pins, overridden variables, and sha256_stream bounds."""
+    failures: list[str] = []
+    refused = 0
+    accepted = 0
+    uncommented_dir = temp_dir / "release-digest-uncommented"
+    (uncommented_dir / TOOL_VERSIONS).parent.mkdir(parents=True, exist_ok=True)
+    raw_pin = f"# Renovate-paired digest.\nUNMANAGED_SHA256={'a' * 64}\n".encode()
+    pin_path = uncommented_dir / TOOL_VERSIONS
+    pin_path.write_bytes(raw_pin)
+    fail_hooks = DigestHooks(_fail_digest_hook, _fail_digest_hook)
+    cmds = regenerate_release_digests(uncommented_dir, fail_hooks)
+    if cmds or pin_path.read_bytes() != raw_pin:
+        failures.append("case uncommented-sha256: file or command list changed")
+    else:
+        accepted += 1
+
+    redef_text = (
+        "TOOL_VERSION=v1.0.0\nTOOL_VERSION=v2.0.0\n"
+        "# sha256-of: https://example.com/${TOOL_VERSION}/a.tgz\n"
+        f"TOOL_SHA256={'0' * 64}\n"
+    )
+    if [p.source for p in release_digest_pins(redef_text)] != [
+        "https://example.com/v2.0.0/a.tgz"
+    ]:
+        failures.append("case last-definition-wins: wrong expanded URL")
+    else:
+        accepted += 1
+
+    limit = DIGEST_CHUNK_BYTES
+    exact_payload = b"a" * limit
+    if (
+        sha256_stream(io.BytesIO(exact_payload), limit)
+        != hashlib.sha256(exact_payload).hexdigest()
+    ):
+        failures.append("case sha256-stream-exact: unexpected digest at limit")
+    else:
+        accepted += 1
+    try:
+        sha256_stream(io.BytesIO(b"a" * (limit + 1)), limit)
+    except CheckError:
+        refused += 1
+    else:
+        failures.append("case sha256-stream-over-limit: expected CheckError")
+    return failures, refused, accepted
+
+
+def run_release_digest_cases(
+    repo: Path, temp_dir: Path
+) -> tuple[list[str], int, int]:
+    """Return failures, refusals, and acceptances for release digest regeneration."""
+    hooks = _stub_digest_hooks()
+    pos_failures, pos_accepted = _run_release_digest_positive(repo, temp_dir, hooks)
+    ref_cases = _release_digest_refusal_cases(hooks)
+    ref_failures: list[str] = []
+    refused = sum(
+        _refuse_release_digest_case(temp_dir, i, ref_cases[i], ref_failures)
+        for i in range(min(len(ref_cases), MAX_RELEASE_DIGEST_CASES))
+    )
+    bnd_failures, bnd_refused, bnd_accepted = _run_release_digest_boundary_cases(
+        temp_dir
+    )
+    failures = [*pos_failures, *ref_failures, *bnd_failures]
+    return failures, refused + bnd_refused, pos_accepted + bnd_accepted
 
 
 def write_trainer_target_fixtures(repo: Path) -> None:
@@ -2377,6 +2885,20 @@ def run_declared_cases(repo: Path, generated: list[str]) -> tuple[list[str], int
     return failures, refused, accepted
 
 
+def _stage_upstream_fixture(repo: Path, root: Path) -> None:
+    """Copy the upstream pin verifier and stripped tool-versions into repo."""
+    verifier = repo / "scripts/verify-upstream-pins.sh"
+    shutil.copy2(root / "scripts/verify-upstream-pins.sh", verifier)
+    (repo / "tools").mkdir()
+    source_tools = (root / TOOL_VERSIONS).read_text(encoding="utf-8")
+    release_digest_pins(source_tools)
+    (repo / TOOL_VERSIONS).write_text(
+        strip_module_sum_lines(source_tools), encoding="utf-8"
+    )
+    run_git(["add", "scripts/verify-upstream-pins.sh", TOOL_VERSIONS], repo)
+    run_git(["commit", "-m", "add upstream fixture verifier"], repo)
+
+
 def selftest(root: Path | None = None) -> tuple[list[str], int, int]:
     """Run all fixture selftests and return failures, refusals, and acceptances."""
     if root is None:
@@ -2391,22 +2913,16 @@ def selftest(root: Path | None = None) -> tuple[list[str], int, int]:
         generated = list(FIXTURE_GENERATED)
 
         failures, refused_rep, accepted_rep = run_repair_cases(repo, temp_dir)
-        verifier = repo / "scripts/verify-upstream-pins.sh"
-        shutil.copy2(root / "scripts/verify-upstream-pins.sh", verifier)
-        (repo / "tools").mkdir()
-        source_tools = (root / TOOL_VERSIONS).read_text(encoding="utf-8")
-        (repo / TOOL_VERSIONS).write_text(
-            strip_module_sum_lines(source_tools), encoding="utf-8"
-        )
-        run_git(["add", "scripts/verify-upstream-pins.sh", TOOL_VERSIONS], repo)
-        run_git(["commit", "-m", "add upstream fixture verifier"], repo)
+        _stage_upstream_fixture(repo, root)
         upstream_repair = run_upstream_repair_case(repo, temp_dir)
         upstream_source = run_upstream_source_plant(repo, temp_dir)
-        failures.extend(upstream_repair + upstream_source)
+        failures.extend([*upstream_repair, *upstream_source])
         upstream_validation, refused_upstream = run_upstream_validation_cases()
         failures.extend(upstream_validation)
         fails_ms, refused_ms, accepted_ms = run_module_sum_cases(repo, temp_dir)
         failures.extend(fails_ms)
+        fails_rd, refused_rd, accepted_rd = run_release_digest_cases(repo, temp_dir)
+        failures.extend(fails_rd)
         fails_tl, refused_tl, accepted_tl = run_trainer_lock_cases(
             repo, temp_dir, root
         )
@@ -2428,9 +2944,9 @@ def selftest(root: Path | None = None) -> tuple[list[str], int, int]:
 
         total_refused = refused_rep + refused_ab + refused_sc + refused_c + refused_de
         total_refused += refused_f + refused_decl + int(not upstream_source)
-        total_refused += refused_upstream + refused_ms + refused_tl
+        total_refused += refused_upstream + refused_ms + refused_rd + refused_tl
         total_accepted = accepted_rep + accepted_gh + accepted_decl + accepted_ms
-        total_accepted += int(not upstream_repair) + accepted_tl
+        total_accepted += int(not upstream_repair) + accepted_rd + accepted_tl
         return failures, total_refused, total_accepted
 
 
