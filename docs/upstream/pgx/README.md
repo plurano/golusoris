@@ -4,10 +4,10 @@ SPDX-FileCopyrightText: 2026 lusoris <lusoris@pm.me>
 SPDX-License-Identifier: CC-BY-SA-4.0
 -->
 
-# jackc/pgx/v5 — v5.11.0 snapshot
+# jackc/pgx/v5 — v5.13.0 snapshot
 
-Pinned: **v5.11.0**
-Source: [tagged source](https://github.com/jackc/pgx/tree/v5.11.0)
+Pinned: **v5.13.0**
+Source: [tagged source](https://github.com/jackc/pgx/tree/v5.13.0)
 
 ## Key API surface
 

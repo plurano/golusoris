@@ -18,6 +18,9 @@ readonly MARKER=GOLUSORIS_RECOVERED_FAULT
 readonly TEST_TIMEOUT="${GO_TEST_TIMEOUT:-10m}"
 readonly TEST_PARALLELISM="${GO_TEST_PARALLELISM:-4}"
 readonly MAX_MODULES=64
+readonly MAX_FAIL_OUTPUT_LINES=20
+readonly MAX_FAILED_TESTS=40
+readonly MAX_TRACKED_TESTS=256
 readonly SCRATCH_BASES=("$REPO_ROOT/.workingdir/cache" /var/tmp)
 
 # Creates scratch outside /tmp, where pact-go's -L/tmp makes Go 1.27.4 reject copied GOROOT testdata.
@@ -87,28 +90,38 @@ open(path, "w", encoding="utf-8").write(text)
 PY
 }
 
+# Summarizes recovered faults or failed tests from a go test -json stream on stdin.
+summarize_events() {
+	python3 -I "$SCRIPT_DIR/go_test_events.py" \
+		"$1" "$MARKER" "$MAX_FAIL_OUTPUT_LINES" "$MAX_FAILED_TESTS" "$MAX_TRACKED_TESTS"
+}
+
 # Prints "package (seen in test)" for every marker line in the go test -json stream on stdin.
 report_faults() {
-	python3 -I -c '
-import json, sys
-marker, hits = sys.argv[1], set()
-for line in sys.stdin:
-    try:
-        event = json.loads(line)
-    except ValueError:
-        continue
-    if event.get("Action") == "output" and marker in event.get("Output", ""):
-        hits.add((event.get("Package", "?"), event.get("Test", "<package>")))
-for package, test in sorted(hits):
-    print(f"{package} (seen in {test})")
-' "$MARKER"
+	summarize_events faults
+}
+
+# Lists scoped modules or fails before GOROOT is copied.
+select_scan_modules() {
+	local listing status=0
+	listing="$(bash "$SCRIPT_DIR/go-modules.sh" list)" || status=$?
+	if ((status != 0)); then
+		printf '::error::fault-recovery: module discovery failed (exit %d)\n' "$status" >&2
+		return 1
+	fi
+	if [[ -z "$listing" ]]; then
+		printf '::error::fault-recovery: module selection is empty; nothing to scan\n' >&2
+		return 1
+	fi
+	printf '%s' "$listing"
 }
 
 # Short-tests each module with the marked GOROOT; JSON events go to $1.
 run_modules() {
-	local events="$1" module count=0 status=0
-	local -a modules=()
-	mapfile -t modules < <(bash "$SCRIPT_DIR/go-modules.sh" list)
+	local events="$1"
+	shift
+	local module count=0 status=0
+	local -a modules=("$@")
 	if ((${#modules[@]} > MAX_MODULES)); then
 		printf '::error::%d modules exceed the bound of %d\n' "${#modules[@]}" "$MAX_MODULES" >&2
 		return 1
@@ -127,6 +140,11 @@ run_modules() {
 
 # Runs module tests with the marked runtime and reports recovered faults.
 main() {
+	local listing tests_status=0 faults failures
+	local -a modules=()
+	listing="$(select_scan_modules)" || return 1
+	mapfile -t modules <<<"$listing"
+
 	local scratch
 	scratch="$(make_scratch "${SCRATCH_BASES[@]}")" || return 1
 	# shellcheck disable=SC2064 # expand now: scratch is local to main
@@ -135,14 +153,19 @@ main() {
 	export GOROOT="$scratch/goroot" GOTOOLCHAIN=local
 	export PATH="$GOROOT/bin:$PATH"
 
-	local tests_status=0 faults
-	run_modules "$scratch/events.jsonl" || tests_status=$?
+	run_modules "$scratch/events.jsonl" "${modules[@]}" || tests_status=$?
 	faults="$(report_faults <"$scratch/events.jsonl")"
 	if [[ -n "$faults" ]]; then
 		printf '::error::tests recovered a nil-dereference fault (golang/go#81238):\n%s\n' "$faults" >&2
 		return 1
 	fi
 	if ((tests_status != 0)); then
+		failures="$(summarize_events failures <"$scratch/events.jsonl")"
+		printf '::group::fault-recovery failed tests\n' >&2
+		if [[ -n "$failures" ]]; then
+			printf '%s\n' "$failures" >&2
+		fi
+		printf '::endgroup::\n' >&2
 		printf '::error::short tests failed under the marked runtime\n' >&2
 		return 1
 	fi
