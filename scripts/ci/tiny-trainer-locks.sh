@@ -17,7 +17,7 @@ MAX_DOCKERFILE_LINES=256
 AUDIT_PYTHON_VERSION=3.11.16
 # Per-context upload cutoffs keep --check reproducible; scripts/ci/regenerate.py moves one
 # to the regen time minus the Renovate minimumReleaseAge when Renovate changes that context's pins.
-GEMMA_LOCK_EXCLUDE_NEWER=2026-10-20T00:00:00Z
+GEMMA_LOCK_EXCLUDE_NEWER=2026-11-22T00:41:02Z
 LITERT_LOCK_EXCLUDE_NEWER=2026-10-20T00:00:00Z
 SIDECAR_LOCK_EXCLUDE_NEWER=2026-10-17T00:00:00Z
 AUDIT_LOCK_EXCLUDE_NEWER=2026-10-20T00:00:00Z
