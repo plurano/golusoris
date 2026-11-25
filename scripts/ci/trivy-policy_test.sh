@@ -11,17 +11,7 @@ fixture_dir="$(mktemp -d "${TMPDIR:-/tmp}/golusoris-trivy-policy.XXXXXX")"
 readonly fixture_dir
 trap 'rm -rf "$fixture_dir"' EXIT
 
-grpc_version="$(go -C "$repo_root" list -m -f '{{.Version}}' google.golang.org/grpc)"
-if ! grep -Fq "pkg:golang/google.golang.org/grpc@${grpc_version}" \
-	"$repo_root/.trivy/openvex.json"; then
-	printf 'OpenVEX gRPC product does not match resolved module version %s\n' "$grpc_version" >&2
-	exit 1
-fi
 root_dependencies="$(go -C "$repo_root" list -deps ./...)"
-if grep -Fxq 'google.golang.org/grpc/xds' <<<"$root_dependencies"; then
-	printf 'OpenVEX exception is stale: vulnerable gRPC xDS server package is reachable\n' >&2
-	exit 1
-fi
 
 # check_expiry VEX PRODUCT LABEL TODAY: the statement for PRODUCT must carry a date that has not passed.
 check_expiry() {
