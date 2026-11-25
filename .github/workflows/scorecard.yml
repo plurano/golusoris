@@ -4,10 +4,8 @@
 
 # GitHub-only supply-chain gate. Gitea uses `.gitea/workflows/` and never
 # evaluates this file. Downstream apps may call this workflow directly.
-#
-# Scorecard requires:
-#   - global permissions read-only (contents: read only)
-#   - security-events: write and id-token: write set at the JOB level only
+# Required check and reusable analysis; OpenSSF publication runs in
+# scorecard-publish.yml (ADR-0029).
 name: Scorecard
 
 # Cancel a stale run when a newer commit supersedes it (#196).
@@ -16,17 +14,12 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 on:
-  push:
-    branches: [main]
-  # Required PR context. OpenSSF publication stays disabled below for PRs.
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
   # main requires this context; scorecard-action rejects merge_group refs, so the
   # queue leg reports the result the pull request head already had to pass.
   merge_group:
-  schedule:
-    - cron: '15 6 * * 1'
   workflow_dispatch:
   workflow_call:
 
@@ -41,10 +34,9 @@ jobs:
     permissions:
       contents: read
       security-events: write
-      id-token: write
     steps:
       - name: Stop on a draft pull request
-        uses: golusoris/golusoris/.github/actions/stop-on-draft@e601567f4e1acb72525f361f80dac6d89cbad553 # #1212
+        uses: plurano/golusoris/.github/actions/stop-on-draft@e601567f4e1acb72525f361f80dac6d89cbad553 # #1212
       - name: Report the pull request result in the merge queue
         if: github.event_name == 'merge_group'
         shell: bash
@@ -66,8 +58,7 @@ jobs:
         with:
           results_file: results.sarif
           results_format: sarif
-          # Can't publish from a PR context (no id-token to the OpenSSF API).
-          publish_results: ${{ github.event_name != 'pull_request' }}
+          publish_results: false
           # Fine-grained PAT with `Administration: Read-only` +
           # `Contents: Read-only` + `Metadata: Read-only` + `Webhooks:
           # Read-only`. Required for the Branch-Protection + Webhooks
