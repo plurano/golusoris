@@ -19,7 +19,7 @@
 # (scripts/hiss/semgrep-fixtures.sh). That corpus is excluded from this
 # ruleset's own scan — the positive and gap fixtures are violations by
 # construction — so the replay scans a temporary copy instead; the registry
-# rulesets in .github/workflows/security-scan.yml exclude the same directory,
+# rulesets in scripts/ci/semgrep-registry.sh exclude the same directory,
 # which is what keeps that gating job off fixtures that are wrong on purpose.
 # Every comment block states what its rule decides AND what it does not, and
 # each "does not" is pinned by a gap/ fixture that fails the replay the day the
