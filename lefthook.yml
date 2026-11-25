@@ -75,6 +75,8 @@ pre-push:
       use_stdin: true
     python-tests:
       run: bash scripts/hooks/python-tests.sh --pushed {push_files}
+    semgrep:
+      run: bash scripts/hooks/semgrep.sh --pushed {push_files}
     shellcheck:
       run: bash scripts/hooks/shellcheck.sh --pushed {push_files}
     docstring-coverage:
