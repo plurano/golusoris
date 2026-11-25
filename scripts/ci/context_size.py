@@ -15,63 +15,18 @@ LF line endings, whatever the working tree or a Windows checkout shows.
 
 from __future__ import annotations
 
-import shutil
-import subprocess  # Runs only fixed git subcommands below. # nosec B404
+import subprocess  # Caught in main for any subprocess error. # nosec B404
 import sys
 from pathlib import Path, PurePosixPath
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import repo_git
 
 NAME = "AGENTS.md"
 WINDSURF_CHARS_PER_FILE = 12_000
 CODEX_BYTES_PER_CHAIN = 32 * 1024
 NEAR_CAP_PERCENT = 95
-
-
-class CheckError(Exception):
-    """The check could not run; main reports it with exit status 3."""
-
-
-def _git(root: Path, *args: str, stdin: bytes | None = None) -> bytes:
-    """Run one fixed git command in root and return its stdout."""
-    git = shutil.which("git")
-    if git is None:
-        raise CheckError("git is not on PATH")
-    if not root.is_dir():
-        raise CheckError(f"{root} is not a directory")
-    done = subprocess.run(  # noqa: S603 - fixed git subcommands; root checked above. # nosec B603
-        [git, *args], cwd=root, input=stdin, capture_output=True, check=True, timeout=60
-    )
-    return done.stdout
-
-
-def _is_agents(path: str) -> bool:
-    """Return whether path names a file called exactly AGENTS.md."""
-    return PurePosixPath(path).name == NAME
-
-
-def _staged_blobs(root: Path) -> dict[str, str]:
-    """Map each staged AGENTS.md path to its index object ID."""
-    raw = _git(root, "ls-files", "-z", "--stage", "--", f"*{NAME}")
-    blobs = {}
-    for entry in filter(None, raw.split(b"\0")):
-        meta, _, path = entry.decode("utf-8").partition("\t")
-        if _is_agents(path):
-            blobs[path] = meta.split()[1]
-    return blobs
-
-
-def _read_blobs(root: Path, oids: list[str]) -> list[bytes]:
-    """Read blobs by object ID; IDs are hex, so newline-separated batch input is safe."""
-    batch = _git(root, "cat-file", "--batch", stdin="".join(f"{oid}\n" for oid in oids).encode())
-    blobs = []
-    for oid in oids:
-        header, _, batch = batch.partition(b"\n")
-        fields = header.split()
-        if len(fields) != 3 or fields[0].decode() != oid:
-            raise CheckError(f"git cat-file returned {header!r} for {oid}")
-        size = int(fields[2])
-        blobs.append(batch[:size])
-        batch = batch[size + 1 :]
-    return blobs
 
 
 def agents_contents(root: Path, *, worktree: bool = False) -> dict[str, bytes]:
@@ -80,18 +35,16 @@ def agents_contents(root: Path, *, worktree: bool = False) -> dict[str, bytes]:
     Commit view: tracked files from the index, untracked ones with the LF endings that
     eol=lf gives them on add. Disk view: raw bytes, since clients read those.
     """
-    staged = _staged_blobs(root)
+    staged = repo_git.staged_entries(root, NAME)
     paths = sorted(staged)
     if worktree:
         contents = {p: (root / p).read_bytes() for p in paths if (root / p).is_file()}
     else:
-        blobs = _read_blobs(root, [staged[p] for p in paths]) if paths else []
+        blobs = repo_git.read_blobs(root, [staged[p][1] for p in paths])
         contents = dict(zip(paths, blobs, strict=True))
-    new = _git(root, "ls-files", "-z", "--others", "--exclude-standard", "--", f"*{NAME}")
-    for path in sorted({p.decode("utf-8") for p in new.split(b"\0") if p}):
-        if _is_agents(path):
-            raw = (root / path).read_bytes()
-            contents[path] = raw if worktree else raw.replace(b"\r\n", b"\n")
+    for path in repo_git.untracked_files(root, NAME):
+        raw = (root / path).read_bytes()
+        contents[path] = raw if worktree else raw.replace(b"\r\n", b"\n")
     return contents
 
 
@@ -133,7 +86,7 @@ def main(argv: list[str]) -> int:
     root = Path(rest[0] if rest else ".").resolve()
     try:
         problems = oversized(agents_contents(root, worktree=worktree))
-    except (CheckError, OSError, UnicodeDecodeError, subprocess.SubprocessError) as err:
+    except (repo_git.GitError, OSError, UnicodeDecodeError, subprocess.SubprocessError) as err:
         sys.stderr.write(f"context-size: error: {err}\n")
         return 3
     for line in problems:
