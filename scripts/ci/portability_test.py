@@ -21,6 +21,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+from collections.abc import Iterator
 from pathlib import Path
 from unittest import TestCase, main, mock, skipUnless
 
@@ -40,6 +41,63 @@ TEARDOWN_BUDGET_SECONDS = (
     + portability.PROCESS_KILL_WAIT_SECONDS
     + 3
 )
+
+# 3600 s cap at 0.05 s polls; hold deletion ends the loop.
+PIPE_HOLD_POLLS = 72000
+
+# 10 s cap at 0.05 s polls for the grandchild acknowledgement; ends at the first acknowledgement.
+RELEASE_ACK_POLLS = 200
+
+
+def pipe_holding_parent(hold: Path, released: Path) -> str:
+    """The grandchild holds the pipes from the system temp directory while hold exists, then renames its acknowledgement into released."""
+    grandchild = (
+        "import os,sys,time\n"
+        f"for _ in range({PIPE_HOLD_POLLS}):\n"
+        "    if not os.path.exists(sys.argv[1]):\n"
+        "        break\n"
+        "    time.sleep(0.05)\n"
+        'open(sys.argv[2] + ".tmp", "w").close()\n'
+        'os.replace(sys.argv[2] + ".tmp", sys.argv[2])'
+    )
+    return (
+        "import subprocess,sys; "
+        f"subprocess.Popen([sys.executable, '-c', {grandchild!r}, {str(hold)!r}, {str(released)!r}], "
+        f"cwd={tempfile.gettempdir()!r})"
+    )
+
+
+def await_release(released: Path) -> bool:
+    """Return True once released exists or after the acknowledgement poll cap."""
+    for _ in range(RELEASE_ACK_POLLS):
+        if released.exists():
+            return True
+        time.sleep(0.05)
+    return released.exists()
+
+
+@contextlib.contextmanager
+def held_pipes(directory: Path) -> Iterator[str]:
+    """Yield a direct-child script that keeps pipes open until hold is removed."""
+    hold = directory / "hold"
+    released = directory / "released"
+    hold.touch()
+    try:
+        yield pipe_holding_parent(hold, released)
+    except BaseException:
+        hold.unlink(missing_ok=True)
+        await_release(released)
+        raise
+    hold.unlink(missing_ok=True)
+
+
+def _transient_retry_responses(compressed: bytes) -> list[object]:
+    """Keep the scripted retry sequence identical across download checks."""
+    return [
+        TimeoutError("first timeout"),
+        TimeoutError("second timeout"),
+        io.BytesIO(compressed),
+    ]
 
 
 def _is_pure_number(node: ast.expr) -> bool:
@@ -116,13 +174,33 @@ class FakeRunner:
         packages: bytes = b"example.test/package\n",
         fail_phase: str = "",
         created_after_build: tuple[str, ...] = (),
+        download_failures: int = 0,
+        download_writes: str = "",
+        download_failure_writes: str = "",
     ) -> None:
         self.manifests = manifests
         self.deleted_manifests = deleted_manifests
         self.packages = packages
         self.fail_phase = fail_phase
         self.created_after_build = created_after_build
+        self.download_failures = download_failures
+        self.download_writes = download_writes
+        self.download_failure_writes = download_failure_writes
+        self.download_calls = 0
         self.commands: list[tuple[Path, tuple[str, ...]]] = []
+
+    def _download(self, cwd: Path) -> bytes:
+        should_fail = self.download_calls < self.download_failures
+        self.download_calls += 1
+        if should_fail:
+            if self.download_failure_writes:
+                with (cwd / "go.sum").open("a", encoding="utf-8") as handle:
+                    handle.write(self.download_failure_writes)
+            raise portability.PortabilityError("injected download failure")
+        if self.download_writes:
+            with (cwd / "go.sum").open("a", encoding="utf-8") as handle:
+                handle.write(self.download_writes)
+        return b""
 
     def output(
         self,
@@ -141,6 +219,8 @@ class FakeRunner:
             ):
                 manifests += self.created_after_build
             return b"\0".join(path.encode() for path in manifests) + b"\0"
+        if argv == ("go", "mod", "download"):
+            return self._download(cwd)
         if argv == ("go", "list", "./..."):
             return self.packages
         raise AssertionError(f"unexpected output command: {argv!r}")
@@ -155,6 +235,8 @@ class FakeRunner:
     ) -> None:
         del environment, timeout
         self.commands.append((cwd, argv))
+        if argv == ("go", "mod", "download"):
+            raise AssertionError(f"download must use the tree-killing output path: {argv!r}")
         if self.fail_phase and argv[1] == self.fail_phase:
             raise portability.PortabilityError(f"injected {self.fail_phase} failure")
 
@@ -251,24 +333,60 @@ class PortabilityDriverTest(TestCase):
 
     def test_process_output_bounds_pipe_inheriting_descendant(self) -> None:
         runner = portability.ProcessRunner()
-        grandchild = "import time; time.sleep(60)"
-        parent = (
-            "import subprocess,sys; "
-            f"subprocess.Popen([sys.executable, '-c', {grandchild!r}]); "
-        )
         started = time.monotonic()
         with tempfile.TemporaryDirectory() as directory:
-            with self.assertRaisesRegex(
-                portability.PortabilityError, "output pipes remained open"
-            ):
-                runner.output(
-                    (sys.executable, "-c", parent),
-                    cwd=Path(directory),
-                    environment=dict(os.environ),
-                    timeout=30,
-                    max_output_bytes=4,
-                )
+            with held_pipes(Path(directory)) as script:
+                with self.assertRaisesRegex(portability.PortabilityError, "output pipes remained open"):
+                    runner.output(
+                        (sys.executable, "-c", script),
+                        cwd=Path(directory), environment=dict(os.environ), timeout=30, max_output_bytes=4,
+                    )
         self.assertLess(time.monotonic() - started, TEARDOWN_BUDGET_SECONDS)
+
+    def test_process_output_pipe_detection_survives_runner_stall(self) -> None:
+        # Exceeds PROCESS_PIPE_JOIN_SECONDS (1.0 s) so a 1 s timer-bounded hold would already exit.
+        STALL = 1.5
+        original = portability._join_threads
+        first_call = [True]
+
+        def stalled_join(threads: list[portability.threading.Thread], timeout: float) -> bool:
+            if first_call[0]:
+                first_call[0] = False
+                time.sleep(STALL)
+            return original(threads, timeout)
+
+        runner = portability.ProcessRunner()
+        started = time.monotonic()
+        with tempfile.TemporaryDirectory() as directory:
+            with held_pipes(Path(directory)) as script:
+                with (
+                    mock.patch.object(portability, "_join_threads", side_effect=stalled_join),
+                    self.assertRaisesRegex(portability.PortabilityError, "output pipes remained open"),
+                ):
+                    runner.output(
+                        (sys.executable, "-c", script),
+                        cwd=Path(directory), environment=dict(os.environ), timeout=30, max_output_bytes=4,
+                    )
+        self.assertLess(time.monotonic() - started, TEARDOWN_BUDGET_SECONDS + STALL)
+
+    def test_pipe_holder_exits_when_directory_vanishes_before_release(self) -> None:
+        with tempfile.TemporaryDirectory() as witness:
+            held = tempfile.mkdtemp()
+            self.addCleanup(shutil.rmtree, held, ignore_errors=True)
+            hold = Path(held) / "hold"
+            hold.touch()
+            released = Path(witness) / "released"
+            subprocess.run(  # noqa: S603 - fixed interpreter runs a test-built script. # nosec B603
+                (sys.executable, "-c", pipe_holding_parent(hold, released)),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=30,
+                check=True,
+            )
+            # Stand in for TemporaryDirectory cleanup winning the race before an explicit release.
+            shutil.rmtree(held)
+            self.assertTrue(await_release(released), "grandchild kept holding after its directory vanished")
 
     @skipUnless(os.name == "posix", "process groups are POSIX")
     def test_boundary_process_group_signal_refuses_unbounded_targets(self) -> None:
@@ -294,8 +412,19 @@ class PortabilityDriverTest(TestCase):
             runner = FakeRunner(manifests)
             summary = verify_quiet(root, runner)
         self.assertEqual(summary, portability.Summary(modules=2, packages=2, phases=6))
-        phase_commands = [argv for _, argv in runner.commands if argv[0] == "go" and argv[1] != "list"]
-        self.assertEqual(phase_commands, [argv for _ in manifests for _, argv in portability.PHASES])
+        phase_commands = [argv for _, argv in runner.commands if argv[0] == "go"]
+        self.assertEqual(
+            phase_commands,
+            [
+                argv
+                for _ in manifests
+                for argv in (
+                    ("go", "mod", "download"),
+                    ("go", "list", "./..."),
+                    *(phase_argv for _, phase_argv in portability.PHASES),
+                )
+            ],
+        )
 
     def test_positive_untracked_snapshots_surround_module_phases(self) -> None:
         manifests = ("go.mod", "nested/go.mod")
@@ -308,11 +437,22 @@ class PortabilityDriverTest(TestCase):
             summary = verify_quiet(root, runner)
         self.assertEqual(summary.modules, 2)
         snapshot = (resolved, ("git", "-C", str(resolved), "ls-files", "-z", "--others", "--exclude-standard"))
-        trace = [entry for entry in runner.commands if entry == snapshot or entry[1][:2] in PHASE_HEADS]
+        trace = [
+            entry
+            for entry in runner.commands
+            if entry == snapshot or entry[1][:2] in PHASE_HEADS | {("go", "mod"), ("go", "list")}
+        ]
         modules = [resolved.joinpath(*manifest.split("/")[:-1]) for manifest in manifests]
         # Each snapshot follows its own module's phases, so a later module cannot hide earlier output.
         expected = [snapshot] + [
-            step for module in modules for step in [*((module, argv) for _, argv in portability.PHASES), snapshot]
+            step
+            for module in modules
+            for step in [
+                (module, ("go", "mod", "download")),
+                (module, ("go", "list", "./...")),
+                *((module, argv) for _, argv in portability.PHASES),
+                snapshot,
+            ]
         ]
         self.assertEqual(trace, expected)
 
@@ -392,8 +532,141 @@ class PortabilityDriverTest(TestCase):
             runner = FakeRunner(manifests, packages=b"")
             with self.assertRaisesRegex(portability.PortabilityError, "expected 1..512"):
                 verify_quiet(root, runner)
-        phase_commands = [argv for _, argv in runner.commands if argv[0] == "go" and argv[1] != "list"]
-        self.assertEqual(phase_commands, [])
+        phase_commands = [argv for _, argv in runner.commands if argv[0] == "go"]
+        self.assertEqual(phase_commands, [("go", "mod", "download"), ("go", "list", "./...")])
+
+    def test_download_modules_succeeds_first_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            module = Path(directory)
+            runner = FakeRunner(("go.mod",), download_failures=0)
+            with mock.patch.object(portability.time, "sleep") as sleep:
+                attempt = portability.download_modules(module, runner, {"GOFLAGS": "-mod=readonly"})
+        self.assertEqual(attempt, 1)
+        self.assertEqual(runner.commands, [(module, ("go", "mod", "download"))])
+        sleep.assert_not_called()
+
+    def test_download_modules_recovers_on_last_attempt(self) -> None:
+        failures = portability.DOWNLOAD_ATTEMPTS - 1
+        with tempfile.TemporaryDirectory() as directory:
+            module = Path(directory)
+            runner = FakeRunner(("go.mod",), download_failures=failures)
+            try:
+                with (
+                    mock.patch.object(portability.time, "sleep") as sleep,
+                    contextlib.redirect_stdout(io.StringIO()),
+                ):
+                    attempt = portability.download_modules(
+                        module, runner, {"GOFLAGS": "-mod=readonly"}
+                    )
+            except portability.PortabilityError as error:
+                self.fail(f"download_modules did not recover on final attempt: {error}")
+        self.assertEqual(attempt, portability.DOWNLOAD_ATTEMPTS)
+        self.assertEqual(
+            runner.commands,
+            [(module, ("go", "mod", "download"))] * portability.DOWNLOAD_ATTEMPTS,
+        )
+        self.assertEqual(
+            sleep.call_args_list,
+            [mock.call(portability.DOWNLOAD_RETRY_SECONDS)] * failures,
+        )
+
+    def test_download_modules_fails_after_all_attempts(self) -> None:
+        attempts = portability.DOWNLOAD_ATTEMPTS
+        with tempfile.TemporaryDirectory() as directory:
+            module = Path(directory)
+            runner = FakeRunner(("go.mod",), download_failures=attempts)
+            with (
+                mock.patch.object(portability.time, "sleep") as sleep,
+                contextlib.redirect_stdout(io.StringIO()),
+                self.assertRaisesRegex(
+                    portability.PortabilityError,
+                    f"failed after {attempts} attempts",
+                ),
+            ):
+                portability.download_modules(module, runner, {"GOFLAGS": "-mod=readonly"})
+        download_commands = [
+            argv for _, argv in runner.commands if argv == ("go", "mod", "download")
+        ]
+        self.assertEqual(len(download_commands), attempts)
+        self.assertEqual(
+            sleep.call_args_list,
+            [mock.call(portability.DOWNLOAD_RETRY_SECONDS)] * (attempts - 1),
+        )
+
+    def test_verify_repository_stops_before_build_when_download_fails(self) -> None:
+        manifests = ("go.mod", "nested/go.mod")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            create_repository(root, manifests)
+            runner = FakeRunner(manifests, download_failures=portability.DOWNLOAD_ATTEMPTS)
+            with (
+                mock.patch.object(portability.time, "sleep"),
+                self.assertRaisesRegex(
+                    portability.PortabilityError,
+                    f"failed after {portability.DOWNLOAD_ATTEMPTS} attempts",
+                ),
+            ):
+                verify_quiet(root, runner)
+        build_commands = [argv for _, argv in runner.commands if argv == ("go", "build", "./...")]
+        self.assertEqual(build_commands, [])
+
+    def test_download_modules_rejects_repaired_go_sum(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            module = Path(directory)
+            create_repository(module, ("go.mod",))
+            (module / "go.sum").write_text("example.test/dep v1.0.0 h1:existing=\n", encoding="utf-8")
+            runner = FakeRunner(("go.mod",), download_writes="example.test/dep v1.0.0/go.mod h1:x=\n")
+            with self.assertRaisesRegex(portability.PortabilityError, "changed go.mod or go.sum"):
+                portability.download_modules(module, runner, {"GOFLAGS": "-mod=readonly"})
+        self.assertEqual(runner.commands, [(module, ("go", "mod", "download"))])
+
+    def test_download_modules_rejects_created_go_sum(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            module = Path(directory)
+            create_repository(module, ("go.mod",))
+            runner = FakeRunner(("go.mod",), download_writes="example.test/dep v1.0.0/go.mod h1:x=\n")
+            with self.assertRaisesRegex(portability.PortabilityError, "changed go.mod or go.sum"):
+                portability.download_modules(module, runner, {"GOFLAGS": "-mod=readonly"})
+        self.assertEqual(runner.commands, [(module, ("go", "mod", "download"))])
+
+    def test_download_modules_rejects_metadata_written_by_failed_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            module = Path(directory)
+            create_repository(module, ("go.mod",))
+            (module / "go.sum").write_text("example.test/dep v1.0.0 h1:existing=\n", encoding="utf-8")
+            runner = FakeRunner(
+                ("go.mod",),
+                download_failures=portability.DOWNLOAD_ATTEMPTS,
+                download_failure_writes="example.test/dep v1.0.0/go.mod h1:x=\n",
+            )
+            with (
+                mock.patch.object(portability.time, "sleep") as sleep,
+                self.assertRaisesRegex(
+                    portability.PortabilityError, "changed go.mod or go.sum"
+                ) as failure,
+            ):
+                portability.download_modules(module, runner, {"GOFLAGS": "-mod=readonly"})
+        self.assertEqual(runner.download_calls, 1)
+        sleep.assert_not_called()
+        self.assertIsInstance(failure.exception.__cause__, portability.PortabilityError)
+        self.assertIn("injected download failure", str(failure.exception.__cause__))
+
+    def test_verify_repository_stops_before_build_when_download_repairs_metadata(self) -> None:
+        manifests = ("go.mod", "nested/go.mod")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            create_repository(root, manifests)
+            runner = FakeRunner(
+                manifests,
+                download_writes="example.test/dep v1.0.0/go.mod h1:x=\n",
+            )
+            with self.assertRaisesRegex(
+                portability.PortabilityError,
+                "changed go.mod or go.sum",
+            ):
+                verify_quiet(root, runner)
+        build_commands = [argv for _, argv in runner.commands if argv == ("go", "build", "./...")]
+        self.assertEqual(build_commands, [])
 
     def test_negative_phase_failure_is_not_hidden(self) -> None:
         manifests = ("go.mod",)
@@ -900,11 +1173,7 @@ class PactFFIInstallerTests(TestCase):
         payload, compressed, asset = retry_fixture()
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            responses: list[object] = [
-                TimeoutError("first timeout"),
-                TimeoutError("second timeout"),
-                io.BytesIO(compressed),
-            ]
+            responses = _transient_retry_responses(compressed)
             calls, sleeps, _stderr, outcome = self._retry_download(
                 responses, directory=root, asset=asset
             )
@@ -1051,11 +1320,7 @@ class PactFFIInstallerTests(TestCase):
         _, compressed, asset = retry_fixture()
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            responses: list[object] = [
-                TimeoutError("first timeout"),
-                TimeoutError("second timeout"),
-                io.BytesIO(compressed),
-            ]
+            responses = _transient_retry_responses(compressed)
             calls, sleeps, stderr_text, outcome = self._retry_download(
                 responses, directory=root, asset=asset
             )

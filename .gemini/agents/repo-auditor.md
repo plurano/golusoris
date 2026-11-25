@@ -12,6 +12,7 @@ role: authoritative repository governance auditor.
 purpose: autonomous codebase and commit sweeps; enforce declared standards.
 
 ## Command
+
 ```bash
 praetorctl audit
 ```
