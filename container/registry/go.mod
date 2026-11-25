@@ -3,11 +3,11 @@ module github.com/golusoris/golusoris/container/registry
 go 1.27.4
 
 require (
-	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.23.3
+	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.24.0
 	github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.15.0
 	github.com/aws/aws-sdk-go-v2 v1.48.0
-	github.com/aws/aws-sdk-go-v2/config v1.33.18
-	github.com/aws/aws-sdk-go-v2/service/ecr v1.67.6
+	github.com/aws/aws-sdk-go-v2/config v1.33.19
+	github.com/aws/aws-sdk-go-v2/service/ecr v1.68.0
 	github.com/golusoris/golusoris/core v0.12.1
 	github.com/google/go-containerregistry v0.22.1
 	github.com/testcontainers/testcontainers-go v0.44.0
@@ -22,7 +22,7 @@ require (
 	github.com/Azure/go-ansiterm v0.0.0-20250102033503-faa5f7b0171c // indirect
 	github.com/AzureAD/microsoft-authentication-library-for-go v1.10.1 // indirect
 	github.com/Microsoft/go-winio v0.6.2 // indirect
-	github.com/aws/aws-sdk-go-v2/credentials v1.21.0 // indirect
+	github.com/aws/aws-sdk-go-v2/credentials v1.21.1 // indirect
 	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.20.9 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/configsources v1.5.12 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.8.12 // indirect
@@ -103,7 +103,7 @@ require (
 	go.uber.org/dig v1.19.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.28.0 // indirect
-	go.yaml.in/yaml/v3 v3.0.5 // indirect
+	go.yaml.in/yaml/v3 v3.0.6 // indirect
 	golang.org/x/crypto v0.59.0 // indirect
 	golang.org/x/net v0.62.0 // indirect
 	golang.org/x/sync v0.25.0 // indirect
