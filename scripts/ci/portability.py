@@ -39,6 +39,9 @@ PROCESS_PIPE_JOIN_SECONDS = 1.0
 PROCESS_TASKKILL_SECONDS = 5.0
 MAX_PATH_COMPONENTS = 64
 DISCOVERY_TIMEOUT_SECONDS = 60
+DOWNLOAD_ATTEMPTS = 3
+DOWNLOAD_RETRY_SECONDS = 5
+DOWNLOAD_TIMEOUT_SECONDS = 600
 LIST_TIMEOUT_SECONDS = 300
 PHASE_TIMEOUT_SECONDS = 900
 PHASES = (
@@ -506,6 +509,75 @@ def discover_modules(root: Path, runner: ProcessRunner) -> tuple[Path, ...]:
     return tuple(sorted(modules, key=lambda path: (path != root, path.as_posix())))
 
 
+def module_metadata(module: Path) -> tuple[bytes | None, bytes | None]:
+    """Return the go.mod and go.sum bytes for module, or None when absent."""
+    snapshots: list[bytes | None] = []
+    for filename in ("go.mod", "go.sum"):
+        try:
+            snapshots.append((module / filename).read_bytes())
+        except FileNotFoundError:
+            snapshots.append(None)
+        except OSError as error:
+            raise PortabilityError(
+                f"{module}: cannot read module metadata: {error}"
+            ) from error
+    return snapshots[0], snapshots[1]
+
+
+def _refuse_repaired_metadata(
+    module: Path,
+    before: tuple[bytes | None, bytes | None],
+    cause: PortabilityError | None = None,
+) -> None:
+    """Refuse go.mod or go.sum changes written by go mod download."""
+    if module_metadata(module) != before:
+        raise PortabilityError(
+            f"{module}: go mod download changed go.mod or go.sum; run go mod tidy and commit the result"
+        ) from cause
+
+
+def _download_with_retries(
+    module: Path,
+    runner: ProcessRunner,
+    environment: dict[str, str],
+    before: tuple[bytes | None, bytes | None],
+) -> int:
+    """Retry transient proxy failures during module download; return the succeeding attempt."""
+    last_error: PortabilityError | None = None
+    for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+        try:
+            runner.output(
+                ("go", "mod", "download"),
+                cwd=module,
+                environment=environment,
+                timeout=DOWNLOAD_TIMEOUT_SECONDS,
+            )
+        except PortabilityError as error:
+            _refuse_repaired_metadata(module, before, cause=error)
+            last_error = error
+            if attempt < DOWNLOAD_ATTEMPTS:
+                print(
+                    f"    download attempt {attempt}/{DOWNLOAD_ATTEMPTS} failed; retrying in {DOWNLOAD_RETRY_SECONDS}s",
+                    flush=True,
+                )
+                time.sleep(DOWNLOAD_RETRY_SECONDS)
+        else:
+            _refuse_repaired_metadata(module, before)
+            return attempt
+    raise PortabilityError(
+        f"{module}: go mod download failed after {DOWNLOAD_ATTEMPTS} attempts: {last_error}"
+    ) from last_error
+
+
+def download_modules(
+    module: Path,
+    runner: ProcessRunner,
+    environment: dict[str, str],
+) -> int:
+    """Retry transient download failures and refuse metadata the download repaired."""
+    return _download_with_retries(module, runner, environment, module_metadata(module))
+
+
 def list_packages(
     module: Path,
     runner: ProcessRunner,
@@ -569,6 +641,7 @@ def verify_repository(root: Path, runner: ProcessRunner | None = None) -> Summar
     phase_total = 0
     for module in modules:
         name = module_name(resolved_root, module)
+        download_modules(module, process_runner, environment)
         package_count = list_packages(module, process_runner, environment)
         package_total += package_count
         print(f"==> {name}: {package_count} package(s)", flush=True)

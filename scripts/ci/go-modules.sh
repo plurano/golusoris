@@ -428,7 +428,7 @@ main() {
 			return 1
 		fi
 		if ((${#modules[@]} == 0)); then
-			printf 'ci-scope: no Go module changed; skipping %s\n' "$phase"
+			printf 'ci-scope: no Go module changed; skipping %s\n' "$phase" >&2
 			return 0
 		fi
 	fi

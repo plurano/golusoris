@@ -37,7 +37,7 @@ jobs:
     timeout-minutes: 25
     steps:
       - name: Stop on a draft pull request
-        uses: golusoris/golusoris/.github/actions/stop-on-draft@e601567f4e1acb72525f361f80dac6d89cbad553 # #1212
+        uses: plurano/golusoris/.github/actions/stop-on-draft@e601567f4e1acb72525f361f80dac6d89cbad553 # #1212
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Pull Docker Hub images through mirror.gcr.io
         uses: ./.github/actions/docker-hub-mirror
@@ -51,29 +51,7 @@ jobs:
 
       - name: Run Semgrep
         shell: bash
-        run: |
-          set -euo pipefail
-          . tools/tool-versions.env
-          # Stream the tree in over stdin instead of bind-mounting the
-          # workspace: it skips .git and keeps working where the daemon does
-          # not share the runner filesystem (dind, remote DOCKER_HOST).
-          #
-          # .config/hiss/testdata is excluded because it is a corpus of
-          # deliberate violations: the HISS-20 enforcement-coverage fixtures
-          # (plugin.Open, unsafe.Pointer, `sh -c`, unbounded fan-out) exist to
-          # prove .semgrep.yml reports them, and the registry rulesets would
-          # report them too — turning this gating job red on fixtures that are
-          # correct by construction. They are replayed against .semgrep.yml,
-          # in both directions, by scripts/hiss/semgrep-fixtures.sh
-          # (`make hiss-fixtures`), which scans them from a temporary copy.
-          semgrep_image="semgrep/semgrep:${SEMGREP_VERSION}@${SEMGREP_IMAGE_DIGEST}"
-          tar -cf - --exclude=.git . \
-            | docker run --rm -i "$semgrep_image" \
-                sh -ec 'mkdir -p /src && tar -xf - -C /src && cd /src && \
-                  semgrep scan --config p/golang --config p/javascript \
-                    --config p/security-audit --error --metrics=off --quiet \
-                    --exclude .config/hiss/testdata \
-                    --exclude .config/hiss/semgrep/testdata .'
+        run: bash scripts/ci/semgrep-registry.sh
 
       - name: Run Trivy dependency, secret, and IaC gate
         shell: bash
