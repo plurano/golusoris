@@ -35,6 +35,8 @@ func newPeer(t *testing.T, shared l2, b Broadcaster) *TwoTier {
 	tt, err := New(l1, opts, slog.New(slog.DiscardHandler), options...)
 	require.NoError(t, err)
 	tt.l2 = shared
+	// The shared L2 stub models the Redis-mode Set fence.
+	tt.l1Only = false
 	return tt
 }
 
@@ -97,6 +99,30 @@ func TestInvalidation_SetMakesPeerReadNewValue(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 7, value, "peer reads the new value from L2")
 	require.Zero(t, loads.Load())
+}
+
+// TestInvalidation_PeerSetDuringLocalSetLeavesNoStaleL1 checks the shared-L2 Set fence through pubsub.
+func TestInvalidation_PeerSetDuringLocalSetLeavesNoStaleL1(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	a, b, shared := newPeers(t)
+	aView := NewTyped[int](a, "n")
+	bView := NewTyped[int](b, "n")
+	entered, release, hook := blockL2Write(t, "set", "1")
+	shared.afterWrite = hook
+
+	localSet := startL2LockOperation(t, release, func() error { return aView.Set(ctx, "a", 1) })
+	waitL2LockSignal(t, entered, "local Set did not write to L2")
+	peerSet := startL2LockOperation(t, release, func() error { return bView.Set(ctx, "a", 2) })
+	// LocalBus delivers the peer notice synchronously before Set returns.
+	peerSet.requireDone(t, "peer Set did not finish while local Set was paused")
+	release()
+	localSet.requireDone(t, "local Set did not finish after release")
+
+	gets := shared.getCalls.Load()
+	read := startL2LockOperation(t, nil, func() error { return readCachedL2LockTestKey(ctx, aView, "a", 2) })
+	read.requireDone(t, "read after local Set did not finish")
+	require.Equal(t, int32(1), shared.getCalls.Load()-gets, "L2 reads after local Set")
 }
 
 func TestInvalidation_PrefixEvictsPeerMatchesOnly(t *testing.T) {
