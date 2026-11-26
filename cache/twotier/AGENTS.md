@@ -54,6 +54,12 @@ func (s *UserService) Load(ctx context.Context, id string) (*User, error) {
 | `Typed.InvalidatePrefix(ctx, prefix)` | Bulk-evicts every key under the view + `prefix` from both tiers (`""` clears the whole view) |
 | `(*TwoTier).InvalidatePrefix(ctx, prefix)` | Same, but takes an already-composed key prefix (no view prefix added) |
 
+## Locking
+
+- `mutation` covers epoch + L1 only.
+- L2 key writes hold shared `l2Prefix` gate + key stripe. L2 prefix deletes hold gate exclusively. L2 reads take neither lock.
+- Lock order: `l2Prefix` -> key stripe -> `mutation`.
+
 ## Prefix invalidation
 
 `InvalidatePrefix` composes prefix exactly like `Get`/`Set`/`Delete`

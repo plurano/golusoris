@@ -86,6 +86,8 @@ type flightKey struct {
 	epoch uint64
 }
 
+const l2StripeCount = 64
+
 // TwoTier is the untyped two-tier cache. It is created by the fx module and
 // shared across the app; callers obtain a type-safe view via [Typed].
 //
@@ -96,6 +98,8 @@ type TwoTier struct {
 	logger           *slog.Logger
 	l1TTL            time.Duration
 	l2TTL            time.Duration
+	l2Order          [l2StripeCount]sync.Mutex
+	l2Prefix         sync.RWMutex
 	mutation         sync.RWMutex
 	epoch            uint64
 	group            *singleflight.Group[flightKey, []byte]
@@ -219,10 +223,41 @@ func (t *Typed[V]) load(ctx context.Context, key string, epoch uint64, loader Lo
 	return raw, nil
 }
 
+// l2StripeIndex uses FNV-1a over the composed key to select a stripe without allocating.
+func l2StripeIndex(key string) int {
+	const offset64 uint64 = 14695981039346656037
+	const prime64 uint64 = 1099511628211
+	hash := offset64
+	for i := range len(key) {
+		hash ^= uint64(key[i])
+		hash *= prime64
+	}
+	return int(hash % l2StripeCount)
+}
+
+// lockL2Key keeps each key's L2 writes ordered with same-key writes and prefix deletes.
+func (t *TwoTier) lockL2Key(key string) func() {
+	t.l2Prefix.RLock()
+	stripe := &t.l2Order[l2StripeIndex(key)]
+	stripe.Lock()
+	return func() {
+		stripe.Unlock()
+		t.l2Prefix.RUnlock()
+	}
+}
+
+// isCurrentEpoch checks the fence without holding mutation during L2 I/O.
+func (t *TwoTier) isCurrentEpoch(epoch uint64) bool {
+	t.mutation.RLock()
+	defer t.mutation.RUnlock()
+	return t.epoch == epoch
+}
+
+// setL2IfCurrent fences loader fills superseded before they acquire the write locks.
 func (t *TwoTier) setL2IfCurrent(ctx context.Context, key string, raw []byte, epoch uint64) error {
-	t.mutation.Lock()
-	defer t.mutation.Unlock()
-	if t.epoch != epoch {
+	unlock := t.lockL2Key(key)
+	defer unlock()
+	if !t.isCurrentEpoch(epoch) {
 		return nil
 	}
 	if err := t.l2.Set(ctx, key, raw, t.l2TTL); err != nil {
@@ -231,10 +266,11 @@ func (t *TwoTier) setL2IfCurrent(ctx context.Context, key string, raw []byte, ep
 	return nil
 }
 
+// deleteL2IfCurrent prevents corruption repair from deleting a superseding write.
 func (t *TwoTier) deleteL2IfCurrent(ctx context.Context, key string, epoch uint64) error {
-	t.mutation.Lock()
-	defer t.mutation.Unlock()
-	if t.epoch != epoch {
+	unlock := t.lockL2Key(key)
+	defer unlock()
+	if !t.isCurrentEpoch(epoch) {
 		return nil
 	}
 	if err := t.l2.Del(ctx, key); err != nil {
@@ -261,12 +297,15 @@ func (t *Typed[V]) Set(ctx context.Context, k string, v V) error {
 	return t.tt.broadcast(ctx, InvalidationKey, key)
 }
 
+// setBoth commits the new L1 value and epoch only after L2 accepts the write.
 func (t *Typed[V]) setBoth(ctx context.Context, key string, raw []byte, value V) error {
-	t.tt.mutation.Lock()
-	defer t.tt.mutation.Unlock()
+	unlock := t.tt.lockL2Key(key)
+	defer unlock()
 	if serr := t.tt.l2.Set(ctx, key, raw, t.tt.l2TTL); serr != nil {
 		return fmt.Errorf("cache/twotier: L2 set: %w", serr)
 	}
+	t.tt.mutation.Lock()
+	defer t.tt.mutation.Unlock()
 	t.tt.epoch++
 	t.setL1(key, value)
 	return nil
@@ -286,12 +325,15 @@ func (t *Typed[V]) Delete(ctx context.Context, k string) error {
 	return t.tt.broadcast(ctx, InvalidationKey, key)
 }
 
+// deleteBoth preserves the L1 entry and epoch if L2 deletion fails.
 func (t *TwoTier) deleteBoth(ctx context.Context, key string) error {
-	t.mutation.Lock()
-	defer t.mutation.Unlock()
+	unlock := t.lockL2Key(key)
+	defer unlock()
 	if derr := t.l2.Del(ctx, key); derr != nil {
 		return fmt.Errorf("cache/twotier: L2 delete: %w", derr)
 	}
+	t.mutation.Lock()
+	defer t.mutation.Unlock()
 	t.epoch++
 	t.l1.Invalidate(key)
 	return nil
@@ -330,12 +372,15 @@ func (t *TwoTier) InvalidatePrefix(ctx context.Context, prefix string) error {
 	return t.broadcast(ctx, InvalidationPrefix, prefix)
 }
 
+// invalidatePrefixBoth excludes key writers until both tiers and the epoch reflect the deletion.
 func (t *TwoTier) invalidatePrefixBoth(ctx context.Context, prefix string) error {
-	t.mutation.Lock()
-	defer t.mutation.Unlock()
+	t.l2Prefix.Lock()
+	defer t.l2Prefix.Unlock()
 	if derr := t.l2.DelPrefix(ctx, prefix); derr != nil {
 		return fmt.Errorf("cache/twotier: L2 invalidate prefix %q: %w", prefix, derr)
 	}
+	t.mutation.Lock()
+	defer t.mutation.Unlock()
 	t.epoch++
 	t.evictL1Prefix(prefix)
 	return nil

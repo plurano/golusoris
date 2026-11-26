@@ -31,6 +31,7 @@ type stubL2 struct {
 	failSet        bool
 	failDel        bool
 	failDelPrefix  bool
+	beforeWrite    func(op, key string, val []byte)
 }
 
 func newStubL2() *stubL2 { return &stubL2{data: make(map[string][]byte)} }
@@ -48,10 +49,14 @@ func (s *stubL2) Get(_ context.Context, key string) ([]byte, bool, error) {
 	return v, ok, nil
 }
 
+// Set allows the write hook to pause before the stub changes state.
 func (s *stubL2) Set(_ context.Context, key string, val []byte, _ time.Duration) error {
 	s.setCalls.Add(1)
 	if s.failSet {
 		return errStub
+	}
+	if s.beforeWrite != nil {
+		s.beforeWrite("set", key, val)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -59,10 +64,14 @@ func (s *stubL2) Set(_ context.Context, key string, val []byte, _ time.Duration)
 	return nil
 }
 
+// Del allows tests to pause key deletion before it changes stub state.
 func (s *stubL2) Del(_ context.Context, key string) error {
 	s.delCalls.Add(1)
 	if s.failDel {
 		return errStub
+	}
+	if s.beforeWrite != nil {
+		s.beforeWrite("del", key, nil)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -70,10 +79,14 @@ func (s *stubL2) Del(_ context.Context, key string) error {
 	return nil
 }
 
+// DelPrefix allows tests to pause bulk deletion before it changes stub state.
 func (s *stubL2) DelPrefix(_ context.Context, prefix string) error {
 	s.delPrefixCalls.Add(1)
 	if s.failDelPrefix {
 		return errStub
+	}
+	if s.beforeWrite != nil {
+		s.beforeWrite("del-prefix", prefix, nil)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
