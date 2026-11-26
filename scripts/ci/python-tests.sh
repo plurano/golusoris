@@ -110,7 +110,7 @@ run_tests() {
 	shift 2
 	if [[ -f "$root/scripts/ci/ci_scope.py" ]]; then
 		local rc=0
-		"$python_bin" "$root/scripts/ci/ci_scope.py" --root "$root" any '*.py' 'scripts/ci/*' '.config/lefthook/*' '*AGENTS.md' || rc=$?
+		"$python_bin" "$root/scripts/ci/ci_scope.py" --root "$root" any '*.py' 'scripts/ci/*' '.config/lefthook/*' '*AGENTS.md' '*SKILL.md' || rc=$?
 		case "$rc" in
 			0) ;;
 			1)
@@ -132,7 +132,9 @@ run_tests() {
 		'scripts/ci/repo_git_test.py'
 		'scripts/ci/review_bot_badges_test.py'
 		'scripts/ci/context_size_test.py'
+		'scripts/ci/skill_frontmatter_test.py'
 		'scripts/ci/tiny-litert-sidecar-docs-policy_test.py'
+		'scripts/ci/docstring_coverage_policy_test.py'
 	)
 	local test_file bare_before
 	local -A seen=()
