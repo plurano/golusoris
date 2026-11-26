@@ -60,10 +60,10 @@ func readBoundedWaitTestSources(t *testing.T) []boundedWaitTestSource {
 // TestL2LockTestsArmWatchdog catches lock regression tests without a synchronous-call deadline.
 func TestL2LockTestsArmWatchdog(t *testing.T) {
 	t.Parallel()
-	positions, err := missingL2LockWatchdogs(readBoundedWaitTestSources(t))
+	findings, err := missingL2LockWatchdogs(readBoundedWaitTestSources(t))
 	require.NoError(t, err)
-	for _, position := range positions {
-		t.Errorf("cache/twotier: %s: lock regression test must start with armL2LockWatchdog after optional t.Parallel()", position)
+	for _, finding := range findings {
+		t.Errorf("cache/twotier: %s: %s must start with armL2LockWatchdog after optional t.Parallel()", finding.position, finding.name)
 	}
 }
 
@@ -139,21 +139,26 @@ func isAllowedL2HookCall(callee string) bool {
 	}
 }
 
+type l2LockWatchdogFinding struct {
+	position token.Position
+	name     string
+}
+
 // missingL2LockWatchdogs reports tests that reach a lock worker without arming a watchdog.
-func missingL2LockWatchdogs(sources []boundedWaitTestSource) ([]token.Position, error) {
+func missingL2LockWatchdogs(sources []boundedWaitTestSource) ([]l2LockWatchdogFinding, error) {
 	files := token.NewFileSet()
 	decls, err := l2LockTestDecls(files, sources)
 	if err != nil {
 		return nil, err
 	}
 	helpers := l2LockHelpers(decls)
-	var positions []token.Position
+	var findings []l2LockWatchdogFinding
 	for _, decl := range decls {
 		if strings.HasPrefix(decl.Name.Name, "Test") && callsL2LockHelper(decl.Body, helpers) && !startsWithL2LockWatchdog(decl.Body.List) {
-			positions = append(positions, files.PositionFor(decl.Pos(), false))
+			findings = append(findings, l2LockWatchdogFinding{position: files.PositionFor(decl.Pos(), false), name: decl.Name.Name})
 		}
 	}
-	return positions, nil
+	return findings, nil
 }
 
 // l2LockTestDecls gathers function bodies before resolving calls across test files.
@@ -347,15 +352,17 @@ func workerHelper(t *testing.T) {
 	startL2LockOperation(t, nil, run)
 }
 `
-	positions, err := missingL2LockWatchdogs([]boundedWaitTestSource{
+	findings, err := missingL2LockWatchdogs([]boundedWaitTestSource{
 		{name: "planted_test.go", data: []byte(planted)},
 		{name: "helper_planted_test.go", data: []byte(helperPlanted)},
 		{name: "clean_test.go", data: []byte(clean)},
 	})
 	require.NoError(t, err)
-	require.Len(t, positions, 2)
-	require.Equal(t, "planted_test.go:2:1", positions[0].String())
-	require.Equal(t, "helper_planted_test.go:2:1", positions[1].String())
+	require.Len(t, findings, 2)
+	require.Equal(t, "planted_test.go:2:1", findings[0].position.String())
+	require.Equal(t, "TestPlanted", findings[0].name)
+	require.Equal(t, "helper_planted_test.go:2:1", findings[1].position.String())
+	require.Equal(t, "TestHelperPlanted", findings[1].name)
 }
 
 // TestL2StubHooksOnlyCallAllowedFunctionsFixtures plants direct and nested test failures.

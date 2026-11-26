@@ -7,9 +7,11 @@ package twotier
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -462,6 +464,208 @@ func TestFencedFillEvictionOutlivesFailedWrite(t *testing.T) {
 	}
 }
 
+// TestFencedFillEvictionMatchesL1EvictionOnL2Hit pins review r12 F1 with two independent flights before either installs.
+//
+//nolint:paralleltest,tparallel // WHY: the rows share the decode pause used by Get's zero-value destination.
+func TestFencedFillEvictionMatchesL1EvictionOnL2Hit(t *testing.T) {
+	t.Parallel()
+	armL2LockWatchdog(t)
+	t.Run("fenced-fill", func(row *testing.T) { checkEvictedKeyL2Hit(row, true) })
+	t.Run("direct-eviction", func(row *testing.T) { checkEvictedKeyL2Hit(row, false) })
+}
+
+// checkEvictedKeyL2Hit holds the two Gets after separate flights and releases them after the failed Set.
+func checkEvictedKeyL2Hit(t *testing.T, fenced bool) {
+	t.Helper()
+	stub := newStubL2()
+	view := NewTyped[pausedL1InstallValue](newTestTwoTier(t, stub), "n")
+	epoch := prepareFailedSetEviction(t, view, stub)
+	write, releaseWrite := startFailedEvictionSet(t, view, stub)
+	requireFailedSetEviction(t, releaseWrite, view, epoch, fenced)
+
+	gets := stub.getCalls.Load()
+	first, releaseFirst := pauseL1InstallGet(t, view)
+	require.Equal(t, gets+1, stub.getCalls.Load())
+	second, releaseSecond := pauseL1InstallGet(t, view)
+	require.Equal(t, gets+2, stub.getCalls.Load())
+	_, cached, present := snapshotL2LockTestKey(t, releaseWrite, view, "n:a")
+	require.False(t, present, "both Gets must still be before L1 install, found %d", cached)
+
+	requireFailedEvictionSet(t, write, releaseWrite)
+	releaseFirst()
+	first.requireDone(t, "first Get did not finish after release")
+	requireEvictedKeyInBothTiers(t, view, stub, 2)
+	releaseSecond()
+	second.requireDone(t, "second Get did not finish after release")
+	requireEvictedKeyInBothTiers(t, view, stub, 2)
+	require.Equal(t, gets+2, stub.getCalls.Load())
+}
+
+type pausedL1InstallValue int
+
+type l1InstallPause struct {
+	decodes  atomic.Int32
+	entered  chan struct{}
+	released chan struct{}
+}
+
+// l1InstallGetPause belongs to the sequential L2-hit rows and is used only by their value type.
+var l1InstallGetPause atomic.Pointer[l1InstallPause]
+
+// UnmarshalJSON pauses the second decode because it runs after singleflight, immediately before L1 install.
+func (v *pausedL1InstallValue) UnmarshalJSON(raw []byte) error {
+	var decoded int
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		return fmt.Errorf("cache/twotier: decode paused Get value: %w", err)
+	}
+	if pause := l1InstallGetPause.Load(); pause != nil && pause.decodes.Add(1) == 2 {
+		close(pause.entered)
+		<-pause.released
+	}
+	*v = pausedL1InstallValue(decoded)
+	return nil
+}
+
+// pauseL1InstallGet waits for Get to leave its flight and reach the L1 decode.
+func pauseL1InstallGet(t *testing.T, view *Typed[pausedL1InstallValue]) (*l2LockOperation, func()) {
+	t.Helper()
+	pause := &l1InstallPause{entered: make(chan struct{}), released: make(chan struct{})}
+	l1InstallGetPause.Store(pause)
+	t.Cleanup(func() { l1InstallGetPause.Store(nil) })
+	release := sync.OnceFunc(func() { close(pause.released) })
+	ctx := t.Context()
+	get := startL2LockOperation(t, release, func() error { return readCachedL2LockTestKey(ctx, view, "a", 2) })
+	waitL2LockSignal(t, pause.entered, "Get did not leave singleflight before L1 install")
+	return get, release
+}
+
+// TestFencedFillEvictionMatchesL1EvictionOnL2Expiry pins review r12 F2 with an older loader value after expiry.
+func TestFencedFillEvictionMatchesL1EvictionOnL2Expiry(t *testing.T) {
+	t.Parallel()
+	armL2LockWatchdog(t)
+	t.Run("fenced-fill", func(row *testing.T) {
+		row.Parallel()
+		checkEvictedKeyL2Expiry(row, true)
+	})
+	t.Run("direct-eviction", func(row *testing.T) {
+		row.Parallel()
+		checkEvictedKeyL2Expiry(row, false)
+	})
+}
+
+// checkEvictedKeyL2Expiry reaches the loader during the paused Set, then lets the reload cache its result.
+func checkEvictedKeyL2Expiry(t *testing.T, fenced bool) {
+	t.Helper()
+	ctx := t.Context()
+	stub := newStubL2()
+	view := NewTyped[int](newTestTwoTier(t, stub), "n")
+	epoch := prepareFailedSetEviction(t, view, stub)
+	expire := startL2LockOperation(t, nil, func() error { return stub.Del(ctx, "n:a") })
+	expire.requireDone(t, "L2 expiry did not finish")
+	write, releaseWrite := startFailedEvictionSet(t, view, stub)
+	requireFailedSetEviction(t, releaseWrite, view, epoch, fenced)
+
+	gets := stub.getCalls.Load()
+	var loads atomic.Int32
+	entered := make(chan struct{})
+	blocked := make(chan struct{})
+	releaseLoader := sync.OnceFunc(func() { close(blocked) })
+	release := func() {
+		releaseWrite()
+		releaseLoader()
+	}
+	reload := startL2LockOperation(t, release, func() error {
+		value, err := view.Get(ctx, "a", func(context.Context) (int, error) {
+			if loads.Add(1) == 1 {
+				close(entered)
+			}
+			<-blocked
+			return 1, nil
+		})
+		return checkL2LockTestValue(value, err, 1)
+	})
+	waitL2LockSignal(t, entered, "read after L2 expiry did not reach the loader during Set")
+	requireFailedEvictionSet(t, write, releaseWrite)
+	stub.failAfterHook = false
+	releaseLoader()
+	reload.requireDone(t, "reload did not finish after failed Set")
+	require.EqualValues(t, 1, loads.Load())
+	require.Equal(t, gets+1, stub.getCalls.Load())
+	requireEvictedKeyInBothTiers(t, view, stub, 1)
+}
+
+// prepareFailedSetEviction captures the old fill's epoch and commits 2 before either eviction schedule.
+func prepareFailedSetEviction[V ~int](t *testing.T, view *Typed[V], stub *stubL2) uint64 {
+	t.Helper()
+	ctx := t.Context()
+	stub.data["n:a"] = []byte("1")
+	epoch, _, present := snapshotL2LockTestKey(t, nil, view, "n:a")
+	require.False(t, present)
+	read := startL2LockOperation(t, nil, func() error { return readCachedL2LockTestKey(ctx, view, "a", 1) })
+	read.requireDone(t, "initial Get did not finish")
+	requireL2LockSetupSet(t, func() error { return view.Set(ctx, "a", 2) })
+	committedEpoch, cached, present := snapshotL2LockTestKey(t, nil, view, "n:a")
+	require.True(t, present)
+	require.Equal(t, 2, int(cached))
+	require.NotEqual(t, epoch, committedEpoch)
+	return epoch
+}
+
+// startFailedEvictionSet leaves the pending fence active without changing the stub's L2 data.
+func startFailedEvictionSet[V ~int](t *testing.T, view *Typed[V], stub *stubL2) (*l2LockOperation, func()) {
+	t.Helper()
+	entered, release, hook := blockL2Write(t, "set", "3")
+	stub.beforeWrite = hook
+	stub.failAfterHook = true
+	ctx := t.Context()
+	write := startL2LockOperation(t, release, func() error { return view.Set(ctx, "a", 3) })
+	waitL2LockSignal(t, entered, "later Set did not enter L2")
+	return write, release
+}
+
+// requireFailedSetEviction compares the old fill with an L1 TTL or capacity eviction at the same point.
+func requireFailedSetEviction[V ~int](t *testing.T, release func(), view *Typed[V], epoch uint64, fenced bool) {
+	t.Helper()
+	if fenced {
+		requireStaleL1InstallDone(t, release, view, epoch)
+	} else {
+		evict := startL2LockOperation(t, release, func() error {
+			view.tt.mutation.Lock()
+			defer view.tt.mutation.Unlock()
+			view.tt.l1.Invalidate(view.key("a"))
+			return nil
+		})
+		evict.requireDone(t, "direct L1 eviction did not finish")
+	}
+	_, cached, present := snapshotL2LockTestKey(t, release, view, "n:a")
+	require.False(t, present, "eviction must leave L1 empty, found %d", cached)
+}
+
+// requireFailedEvictionSet verifies that releasing the writer clears the fence through its failure path.
+func requireFailedEvictionSet(t *testing.T, write *l2LockOperation, release func()) {
+	t.Helper()
+	release()
+	waitL2LockSignal(t, write.done, "later Set did not finish after release")
+	require.ErrorIs(t, write.err, errStub)
+}
+
+// requireEvictedKeyInBothTiers inspects the installed values without triggering another read-through.
+func requireEvictedKeyInBothTiers[V ~int](t *testing.T, view *Typed[V], stub *stubL2, want int) {
+	t.Helper()
+	_, cached, present := snapshotL2LockTestKey(t, nil, view, "n:a")
+	require.True(t, present)
+	require.Equal(t, want, int(cached))
+	var raw string
+	snapshot := startL2LockOperation(t, nil, func() error {
+		stub.mu.Lock()
+		defer stub.mu.Unlock()
+		raw = string(stub.data["n:a"])
+		return nil
+	})
+	snapshot.requireDone(t, "L2 snapshot did not finish")
+	require.Equal(t, strconv.Itoa(want), raw)
+}
+
 // requireFencedFillEviction checks that the fenced fill evicted only its key.
 func requireFencedFillEviction(t *testing.T, release func(), view *Typed[int]) {
 	t.Helper()
@@ -497,10 +701,10 @@ func checkFailedFencedFillReload(t *testing.T, view *Typed[int], stub *stubL2) {
 }
 
 // snapshotL2LockTestKey bounds the read of the epoch and L1 value under mutation.
-func snapshotL2LockTestKey(t *testing.T, release func(), view *Typed[int], key string) (uint64, int, bool) {
+func snapshotL2LockTestKey[V ~int](t *testing.T, release func(), view *Typed[V], key string) (uint64, V, bool) {
 	t.Helper()
 	var epoch uint64
-	var value int
+	var value V
 	var present bool
 	snapshot := startL2LockOperation(t, release, func() error {
 		epoch, value, present = view.l1Snapshot(key)
@@ -655,7 +859,7 @@ func writePeerL2Value(t *testing.T, stub *stubL2, key, raw string) {
 }
 
 // requireStaleL1InstallDone bounds the stale install attempt while the L2 write is paused.
-func requireStaleL1InstallDone(t *testing.T, release func(), view *Typed[int], epoch uint64) {
+func requireStaleL1InstallDone[V ~int](t *testing.T, release func(), view *Typed[V], epoch uint64) {
 	t.Helper()
 	install := startL2LockOperation(t, release, func() error {
 		view.setL1IfCurrent("n:a", 1, epoch)
@@ -1059,11 +1263,11 @@ func fillL2LockTestKey(ctx context.Context, view *Typed[int]) error {
 }
 
 // readCachedL2LockTestKey treats an origin load as a failure of the expected cache hit.
-func readCachedL2LockTestKey(ctx context.Context, view *Typed[int], key string, want int) error {
-	value, err := view.Get(ctx, key, func(context.Context) (int, error) {
+func readCachedL2LockTestKey[V ~int](ctx context.Context, view *Typed[V], key string, want int) error {
+	value, err := view.Get(ctx, key, func(context.Context) (V, error) {
 		return 0, errors.New("cache/twotier: loader ran for cached key")
 	})
-	return checkL2LockTestValue(value, err, want)
+	return checkL2LockTestValue(int(value), err, want)
 }
 
 // checkL2LockTestValue reports a failed read without terminating the worker goroutine.
