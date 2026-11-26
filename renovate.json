@@ -20,7 +20,7 @@
     }
   },
   "postUpdateOptions": [
-    "gomodTidy"
+    "gomodTidyAll"
   ],
   "dockerfile": {
     "managerFilePatterns": [
@@ -556,6 +556,14 @@
       "automerge": false
     },
     {
+      "description": "Update the yq policy tool and backup-restore image together.",
+      "matchPackageNames": [
+        "github.com/mikefarah/yq/v4",
+        "mikefarah/yq"
+      ],
+      "groupName": "yq"
+    },
+    {
       "description": "Review media image and APK updates as one ABI-tested set.",
       "matchFileNames": [
         "tools/Dockerfile.media.template"
@@ -640,6 +648,16 @@
         "github-actions"
       ],
       "groupName": "github actions"
+    },
+    {
+      "description": "goenvoy tags each module on its own; one branch carries every goenvoy bump of a Renovate run instead of one pull request per module.",
+      "matchDatasources": [
+        "go"
+      ],
+      "matchPackageNames": [
+        "github.com/golusoris/goenvoy/**"
+      ],
+      "groupName": "goenvoy modules"
     },
     {
       "description": "Keep Go module directives current through reviewed product-org pull requests.",
@@ -753,7 +771,9 @@
         "github.com/cordanaLLM/praetor/**",
         "github.com/cordanaLLM/praetor/cmd/standardsctl",
         "cordanaLLM/praetor",
-        "cordanaLLM/praetor/**"
+        "cordanaLLM/praetor/**",
+        "tekmora/praetor",
+        "tekmora/praetor/**"
       ],
       "enabled": false
     },
