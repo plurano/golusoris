@@ -215,4 +215,4 @@ Ready to implement auth feature
 - Any skill needing isolated workspace
 
 **Pairs with:**
-- **finishing--development-branch** - REQUIRED for cleanup after work complete
+- **finishing-a-development-branch** - REQUIRED for cleanup after work complete
