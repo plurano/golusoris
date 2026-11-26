@@ -187,6 +187,187 @@ func TestWriterReplicaReadsPendingL2Value(t *testing.T) {
 	committedRead.requireDone(t, "local Get after Set did not finish")
 }
 
+// TestWriterReplicaReadsPendingL2ValuePastOlderFlight holds an older read open after a peer has read the new value.
+//
+//nolint:paralleltest // WHY: the decode pause is shared with the parallel L2-hit eviction test.
+func TestWriterReplicaReadsPendingL2ValuePastOlderFlight(t *testing.T) {
+	armL2LockWatchdog(t)
+	ctx := t.Context()
+	a, b, shared := newPeers(t)
+	aView := NewTyped[pausedL1InstallValue](a, "n")
+	bView := NewTyped[int](b, "n")
+	olderRead, releaseOlder := warmWriterWithOlderRead(t, aView, shared)
+	defer releaseOlder()
+
+	entered, releaseSet, hook := blockL2WriteForKey(t, "set", "n:k", "2")
+	shared.afterWrite = hook
+	release := func() {
+		releaseOlder()
+		releaseSet()
+	}
+	set := startL2LockOperation(t, release, func() error { return aView.Set(ctx, "k", 2) })
+	waitL2LockSignal(t, entered, "writer Set did not publish to L2")
+	peer := startL2LockOperation(t, release, func() error { return readCachedL2LockTestKey(ctx, bView, "k", 2) })
+	peer.requireDone(t, "peer did not read the pending L2 value")
+	writer := startL2LockOperation(t, release, func() error { return readCachedL2LockTestKey(ctx, aView, "k", 2) })
+	writer.requireDone(t, "writer Get joined the older flight after the peer read 2")
+	_, cached, present := snapshotL2LockTestKey(t, release, aView, "n:k")
+	require.True(t, present)
+	require.EqualValues(t, 1, cached, "fenced Get changed the writer's L1 entry")
+
+	releaseSet()
+	set.requireDone(t, "writer Set did not finish after release")
+	releaseOlder()
+	olderRead.requireDone(t, "older L2 flight did not finish")
+	gets := shared.getCalls.Load()
+	committed := startL2LockOperation(t, nil, func() error { return readCachedL2LockTestKey(ctx, aView, "k", 2) })
+	committed.requireDone(t, "writer did not read the committed value")
+	require.Equal(t, gets, shared.getCalls.Load(), "committed Get reached L2")
+}
+
+// warmWriterWithOlderRead lets the first Get fill L1 while a second flight holds the same old L2 value.
+func warmWriterWithOlderRead(t *testing.T, view *Typed[pausedL1InstallValue], shared *stubL2) (*l2LockOperation, func()) {
+	t.Helper()
+	shared.data["n:k"] = []byte("1")
+	first, releaseFirst := pauseGetDecode(t, view, "k", 1, 2)
+	defer releaseFirst()
+	entered, blocked := make(chan struct{}), make(chan struct{})
+	signal := sync.OnceFunc(func() { close(entered) })
+	release := sync.OnceFunc(func() { close(blocked) })
+	shared.afterGet = func(key string, raw []byte, found bool) {
+		if key == "n:k" && found && string(raw) == "1" {
+			signal()
+			<-blocked
+		}
+	}
+	ctx := t.Context()
+	older := startL2LockOperation(t, release, func() error { return readCachedL2LockTestKey(ctx, view, "k", 1) })
+	waitL2LockSignal(t, entered, "older flight did not read L2 value 1")
+	releaseFirst()
+	first.requireDone(t, "first Get did not warm the writer's L1")
+	_, cached, present := snapshotL2LockTestKey(t, release, view, "n:k")
+	require.True(t, present)
+	require.EqualValues(t, 1, cached)
+	return older, release
+}
+
+// TestWriterReplicaFallsBackToWarmL1OnFencedL2Error protects a commit across two L2 failures.
+func TestWriterReplicaFallsBackToWarmL1OnFencedL2Error(t *testing.T) {
+	t.Parallel()
+	armL2LockWatchdog(t)
+	ctx := t.Context()
+	shared := newStubL2()
+	view := NewTyped[int](newPeer(t, shared, nil), "n")
+	requireL2LockSetupSet(t, func() error { return view.Set(ctx, "a", 2) })
+	set, release := startFailedEvictionSet(t, view, shared)
+	shared.failGet.Store(true)
+	gets, sets := shared.getCalls.Load(), shared.setCalls.Load()
+	var loads atomic.Int32
+
+	read := startL2LockOperation(t, release, func() error {
+		value, err := view.Get(ctx, "a", func(context.Context) (int, error) {
+			loads.Add(1)
+			// Let an incorrect fallback finish so the read can report its value.
+			release()
+			return 1, nil
+		})
+		return checkL2LockTestValue(value, err, 2)
+	})
+	read.requireDone(t, "warm fenced Get did not complete during the L2 outage")
+	require.Zero(t, loads.Load(), "warm fenced Get called the loader during an L2 error")
+	requireOperationRunning(t, set, "fenced Get opened the pending Set")
+	require.Equal(t, gets+1, shared.getCalls.Load(), "fenced Get did not attempt L2")
+
+	requireFailedEvictionSet(t, set, release)
+	_, cached, present := snapshotL2LockTestKey(t, nil, view, "n:a")
+	require.True(t, present)
+	require.Equal(t, 2, cached)
+	raw, found := snapshotL2LockStubKey(t, nil, shared, "n:a")
+	require.True(t, found)
+	require.Equal(t, "2", raw)
+	require.Equal(t, sets, shared.setCalls.Load(), "fenced Get wrote to L2")
+}
+
+type coldFencedReadCase struct {
+	name   string
+	raw    string
+	outage bool
+}
+
+// TestFencedFillColdReadsShareLoaderWithoutCaching covers cold L2 misses, corrupt hits, and outages.
+func TestFencedFillColdReadsShareLoaderWithoutCaching(t *testing.T) {
+	t.Parallel()
+	armL2LockWatchdog(t)
+	cases := [...]coldFencedReadCase{
+		{name: "miss"},
+		{name: "corrupt", raw: "invalid-json"},
+		{name: "outage", outage: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(subtest *testing.T) {
+			subtest.Parallel()
+			checkColdFencedReads(subtest, tc)
+		})
+	}
+}
+
+// checkColdFencedReads holds a Set before its L2 write while both Gets finish.
+func checkColdFencedReads(t *testing.T, tc coldFencedReadCase) {
+	t.Helper()
+	ctx := t.Context()
+	shared := newStubL2()
+	if tc.raw != "" {
+		shared.data["n:a"] = []byte(tc.raw)
+	}
+	shared.failGet.Store(tc.outage)
+	view := NewTyped[int](newPeer(t, shared, nil), "n")
+	entered, releaseSet, hook := blockL2Write(t, "set", "2")
+	shared.beforeWrite = hook
+	set := startL2LockOperation(t, releaseSet, func() error { return view.Set(ctx, "a", 2) })
+	waitL2LockSignal(t, entered, "cold Set did not reach its L2 hook")
+
+	sets := shared.setCalls.Load()
+	requireSharedColdFencedLoader(t, releaseSet, view)
+	requireColdFencedTiers(t, releaseSet, view, shared, tc.raw, tc.raw != "")
+	require.EqualValues(t, 2, shared.getCalls.Load(), "each fenced Get must read L2")
+	require.Equal(t, sets, shared.setCalls.Load(), "fenced loader wrote to L2")
+	require.Zero(t, shared.delCalls.Load(), "fenced Get attempted to repair corrupt L2")
+	requireOperationRunning(t, set, "cold Set returned before its L2 hook was released")
+	releaseSet()
+	set.requireDone(t, "cold Set did not finish after release")
+}
+
+// requireSharedColdFencedLoader observes the second Get join while the first loader is blocked.
+func requireSharedColdFencedLoader(t *testing.T, releaseSet func(), view *Typed[int]) {
+	t.Helper()
+	var loads atomic.Int32
+	entered, blocked := make(chan struct{}), make(chan struct{})
+	signal := sync.OnceFunc(func() { close(entered) })
+	releaseLoader := sync.OnceFunc(func() { close(blocked) })
+	release := func() {
+		releaseLoader()
+		releaseSet()
+	}
+	ctx := t.Context()
+	read := func() error {
+		value, err := view.Get(ctx, "a", func(context.Context) (int, error) {
+			loads.Add(1)
+			signal()
+			<-blocked
+			return 1, nil
+		})
+		return checkL2LockTestValue(value, err, 1)
+	}
+	first := startL2LockOperation(t, release, read)
+	waitL2LockSignal(t, entered, "cold fenced Get did not reach the loader")
+	second := startL2LockOperation(t, release, read)
+	second.requireBlocked(t, "sync.WaitGroup.Wait", "golang.org/x/sync/singleflight.(*Group).Do(")
+	releaseLoader()
+	first.requireDone(t, "fenced loader result waited for the pending Set")
+	second.requireDone(t, "shared fenced loader result waited for the pending Set")
+	require.EqualValues(t, 1, loads.Load(), "cold fenced Gets did not share their loader")
+}
+
 type localMutationCase struct {
 	name   string
 	prefix bool
@@ -237,7 +418,7 @@ func checkLocalMutationAfterBlockedFill(t *testing.T, tc localMutationCase) {
 		releaseFill()
 		fill.requireDone(t, "loader fill did not finish before the prefix write")
 	}
-	epoch, _ := localMutationSnapshot(a, "n:z", tc.prefix)
+	epoch, _ := localMutationSnapshot(t, a, tc, releaseReader)
 	mutation := startL2LockOperation(t, releaseReader, func() error {
 		if err := tc.mutate(ctx, aView); err != nil {
 			return fmt.Errorf("cache/twotier: local %s: %w", tc.name, err)
@@ -252,7 +433,7 @@ func checkLocalMutationAfterBlockedFill(t *testing.T, tc localMutationCase) {
 	requireFillGateWriter(t, &a.l2FillGate, func(queued bool) {
 		requireOperationRunning(t, mutation, "local mutation returned before the older fill barrier opened")
 		if queued {
-			requireLocalMutationCommitted(t, a, tc, epoch, broadcastStarted)
+			requireLocalMutationCommitted(t, a, tc, epoch, broadcastStarted, releaseReader)
 		}
 	}, "local mutation never queued on the fill gate")
 	releaseReader()
@@ -267,9 +448,9 @@ func checkLocalMutationAfterBlockedFill(t *testing.T, tc localMutationCase) {
 }
 
 // requireLocalMutationCommitted checks that the queued barrier follows commit and precedes broadcast.
-func requireLocalMutationCommitted(t *testing.T, tt *TwoTier, tc localMutationCase, before uint64, broadcast <-chan struct{}) {
+func requireLocalMutationCommitted(t *testing.T, tt *TwoTier, tc localMutationCase, before uint64, broadcast <-chan struct{}, release func()) {
 	t.Helper()
-	epoch, pending := localMutationSnapshot(tt, "n:z", tc.prefix)
+	epoch, pending := localMutationSnapshot(t, tt, tc, release)
 	require.Greater(t, epoch, before, "local %s queued its fill barrier before committing its epoch", tc.name)
 	require.False(t, pending, "local %s queued its fill barrier with its pending write still active", tc.name)
 	select {
@@ -279,14 +460,38 @@ func requireLocalMutationCommitted(t *testing.T, tt *TwoTier, tc localMutationCa
 	}
 }
 
-// localMutationSnapshot reads the committed epoch and relevant pending slot under mutation.
-func localMutationSnapshot(tt *TwoTier, key string, prefix bool) (uint64, bool) {
-	tt.mutation.RLock()
+// localMutationSnapshot reads the commit without letting a misplaced barrier block the test goroutine.
+func localMutationSnapshot(t *testing.T, tt *TwoTier, tc localMutationCase, release func()) (uint64, bool) {
+	t.Helper()
+	if !waitForLocalMutationReadLock(&tt.mutation) {
+		release()
+		t.Fatalf("local %s held mutation while queued on the fill barrier", tc.name)
+	}
 	defer tt.mutation.RUnlock()
-	if prefix {
+	if tc.prefix {
 		return tt.epoch, tt.prefixPending.active
 	}
-	return tt.epoch, tt.l2Pending[l2StripeIndex(key)].active
+	return tt.epoch, tt.l2Pending[l2StripeIndex("n:z")].active
+}
+
+// waitForLocalMutationReadLock bounds attempts to observe the queued writer's commit.
+func waitForLocalMutationReadLock(mutation *sync.RWMutex) bool {
+	const interval = time.Millisecond
+	ticks := time.NewTicker(interval)
+	defer ticks.Stop()
+	deadline := time.NewTimer(l2LockTimeout)
+	defer deadline.Stop()
+	for range int(l2LockTimeout / interval) {
+		if mutation.TryRLock() {
+			return true
+		}
+		select {
+		case <-deadline.C:
+			return false
+		case <-ticks.C:
+		}
+	}
+	return false
 }
 
 // requireOperationRunning checks a worker has yet to return at a held test checkpoint.

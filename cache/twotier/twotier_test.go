@@ -27,11 +27,12 @@ type stubL2 struct {
 	setCalls       atomic.Int32
 	delCalls       atomic.Int32
 	delPrefixCalls atomic.Int32
-	failGet        bool
+	failGet        atomic.Bool
 	failSet        bool
 	failDel        bool
 	failDelPrefix  bool
 	failAfterHook  bool
+	afterGet       func(key string, val []byte, ok bool)
 	beforeWrite    func(op, key string, val []byte)
 	afterWrite     func(op, key string, val []byte)
 }
@@ -40,14 +41,18 @@ func newStubL2() *stubL2 { return &stubL2{data: make(map[string][]byte)} }
 
 var errStub = errors.New("stub l2 failure")
 
+// Get runs the read hook after releasing the mutex so paused reads do not block writes.
 func (s *stubL2) Get(_ context.Context, key string) ([]byte, bool, error) {
 	s.getCalls.Add(1)
-	if s.failGet {
+	if s.failGet.Load() {
 		return nil, false, errStub
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	v, ok := s.data[key]
+	s.mu.Unlock()
+	if s.afterGet != nil {
+		s.afterGet(key, v, ok)
+	}
 	return v, ok, nil
 }
 
@@ -202,10 +207,11 @@ func TestGet_l2HitBackfillsL1AndSkipsLoader(t *testing.T) {
 	}
 }
 
+// TestGet_l2FailureFallsThroughToLoader covers the unfenced fallback during an L2 outage.
 func TestGet_l2FailureFallsThroughToLoader(t *testing.T) {
 	t.Parallel()
 	l2 := newStubL2()
-	l2.failGet = true
+	l2.failGet.Store(true)
 	l2.failSet = true // also ensure a failing L2 set does not fail the Get
 	tt := newTestTwoTier(t, l2)
 	view := NewTyped[int](tt, "n")

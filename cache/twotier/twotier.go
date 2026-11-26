@@ -82,8 +82,9 @@ type l2 interface {
 type Loader[V any] func(ctx context.Context) (V, error)
 
 type flightKey struct {
-	key   string
-	epoch uint64
+	key    string
+	epoch  uint64
+	fenced bool
 }
 
 const l2StripeCount = 64
@@ -141,6 +142,11 @@ func (t *Typed[V]) key(k string) string {
 // tier that has it wins and back-fills the faster tiers it skipped. Concurrent
 // Gets for the same key share a single loader invocation.
 //
+// Each Get fenced by a pending shared-L2 write reads L2 on its own. A decodable
+// hit wins. An L2 error uses the warm L1 snapshot when present. An L2 miss,
+// corrupt value, or error with no warm entry falls through to the loader.
+// Fenced Gets share loader calls for the same key and epoch and write neither tier.
+//
 // On a disabled (nil) cache, Get calls loader directly and caches nothing.
 func (t *Typed[V]) Get(ctx context.Context, k string, loader Loader[V]) (V, error) {
 	if t.tt == nil {
@@ -148,45 +154,88 @@ func (t *Typed[V]) Get(ctx context.Context, k string, loader Loader[V]) (V, erro
 	}
 	key := t.key(k)
 
-	epoch, cached, ok := t.l1Snapshot(key)
-	if ok {
-		return cached, nil
+	snapshot := t.l1Snapshot(key)
+	if snapshot.fenced {
+		return t.getFenced(ctx, key, snapshot, loader)
+	}
+	if snapshot.ok {
+		return snapshot.cached, nil
 	}
 
-	flight := flightKey{key: key, epoch: epoch}
+	flight := flightKey{key: key, epoch: snapshot.epoch}
 	raw, _, err := t.tt.group.Do(ctx, flight, func(ctx context.Context) ([]byte, error) {
-		return t.load(ctx, key, epoch, loader)
+		return t.load(ctx, key, snapshot.epoch, loader)
 	})
 	if err != nil {
 		var zero V
 		return zero, fmt.Errorf("cache/twotier: get %q: %w", key, err)
 	}
 
-	var v V
-	if uerr := json.Unmarshal(raw, &v); uerr != nil {
-		var zero V
-		return zero, fmt.Errorf("cache/twotier: decode loaded value: %w", uerr)
+	v, err := decodeLoadedValue[V](raw)
+	if err != nil {
+		return v, err
 	}
-	t.setL1IfCurrent(key, v, epoch)
+	t.setL1IfCurrent(key, v, snapshot.epoch)
 	return v, nil
 }
 
-// l1Snapshot reads one generation and its typed L1 value atomically against
-// Set, Delete, and prefix invalidation. A covering pending write makes shared-L2 reads miss L1.
-func (t *Typed[V]) l1Snapshot(key string) (uint64, V, bool) {
+type l1ReadSnapshot[V any] struct {
+	cached V
+	epoch  uint64
+	ok     bool
+	fenced bool
+}
+
+// l1Snapshot captures the epoch, pending fence, and typed L1 entry together so a fenced Get can read L2 independently and use the warm entry on error.
+func (t *Typed[V]) l1Snapshot(key string) l1ReadSnapshot[V] {
 	t.tt.mutation.RLock()
 	defer t.tt.mutation.RUnlock()
-	if !t.tt.l1Only && t.tt.fillFenced(key) {
-		var zero V
-		return t.tt.epoch, zero, false
+	snapshot := l1ReadSnapshot[V]{epoch: t.tt.epoch, fenced: !t.tt.l1Only && t.tt.fillFenced(key)}
+	if raw, ok := t.tt.l1.GetIfPresent(key); ok {
+		snapshot.cached, snapshot.ok = raw.(V)
 	}
-	raw, ok := t.tt.l1.GetIfPresent(key)
-	if !ok {
-		var zero V
-		return t.tt.epoch, zero, false
+	return snapshot
+}
+
+// getFenced reads L2 outside singleflight so a pending write can be observed ahead of an older flight.
+func (t *Typed[V]) getFenced(ctx context.Context, key string, snapshot l1ReadSnapshot[V], loader Loader[V]) (V, error) {
+	raw, ok, err := t.tt.l2.Get(ctx, key)
+	if err != nil {
+		t.tt.logger.WarnContext(ctx, "cache/twotier: fenced L2 get failed", slog.String("key", key), slog.Any("error", err))
+		if snapshot.ok {
+			return snapshot.cached, nil
+		}
+	} else if ok {
+		var cached V
+		if decodeErr := json.Unmarshal(raw, &cached); decodeErr == nil {
+			return cached, nil
+		}
+		t.tt.logger.WarnContext(ctx, "cache/twotier: corrupt fenced L2 value, falling through", slog.String("key", key))
 	}
-	v, ok := raw.(V)
-	return t.tt.epoch, v, ok
+	return t.loadFenced(ctx, key, snapshot.epoch, loader)
+}
+
+// loadFenced shares origin work without letting a fenced Get back-fill either tier.
+func (t *Typed[V]) loadFenced(ctx context.Context, key string, epoch uint64, loader Loader[V]) (V, error) {
+	flight := flightKey{key: key, epoch: epoch, fenced: true}
+	raw, _, err := t.tt.group.Do(ctx, flight, func(ctx context.Context) ([]byte, error) {
+		return encodeLoadedValue(ctx, loader)
+	})
+	if err != nil {
+		var zero V
+		return zero, fmt.Errorf("cache/twotier: get %q: %w", key, err)
+	}
+	return decodeLoadedValue[V](raw)
+}
+
+// decodeLoadedValue restores the typed value returned by a shared flight.
+func decodeLoadedValue[V any](raw []byte) (V, error) {
+	var value V
+	if err := json.Unmarshal(raw, &value); err != nil {
+		var zero V
+		return zero, fmt.Errorf("cache/twotier: decode loaded value: %w", err)
+	}
+	return value, nil
 }
 
 func (t *Typed[V]) setL1(key string, value V) {
@@ -237,16 +286,25 @@ func (t *Typed[V]) load(ctx context.Context, key string, epoch uint64, loader Lo
 		}
 	}
 
-	v, err := loader(ctx)
+	raw, err := encodeLoadedValue(ctx, loader)
 	if err != nil {
-		return nil, fmt.Errorf("loader: %w", err)
-	}
-	raw, err := json.Marshal(v)
-	if err != nil {
-		return nil, fmt.Errorf("cache/twotier: encode loaded value: %w", err)
+		return nil, err
 	}
 	if serr := t.tt.setL2IfCurrent(ctx, key, raw, epoch); serr != nil {
 		t.tt.logger.WarnContext(ctx, "cache/twotier: L2 set failed", slog.Any("error", serr))
+	}
+	return raw, nil
+}
+
+// encodeLoadedValue carries the loader result between typed callers in a flight.
+func encodeLoadedValue[V any](ctx context.Context, loader Loader[V]) ([]byte, error) {
+	value, err := loader(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("loader: %w", err)
+	}
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return nil, fmt.Errorf("cache/twotier: encode loaded value: %w", err)
 	}
 	return raw, nil
 }

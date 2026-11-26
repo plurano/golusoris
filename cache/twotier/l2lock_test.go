@@ -11,7 +11,6 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -146,8 +145,8 @@ func TestInFlightSetBlocksStaleL1Install(t *testing.T) {
 	first := startL2LockOperation(t, release, func() error { return readCachedL2LockTestKey(ctx, view, "a", 2) })
 	first.requireDone(t, "read during Set did not finish")
 	requireStaleL1InstallDone(t, release, view, epoch)
-	second := startL2LockOperation(t, release, func() error { return readCachedL2LockTestKey(ctx, view, "a", 2) })
-	second.requireDone(t, "read after stale install attempt did not finish")
+	_, cached, present := snapshotL2LockTestKey(t, release, view, "n:a")
+	require.False(t, present, "stale install left %d in L1 during Set", cached)
 
 	release()
 	set.requireDone(t, "Set did not finish after release")
@@ -178,8 +177,8 @@ func TestInFlightDeleteBlocksStaleL1Install(t *testing.T) {
 	first := startL2LockOperation(t, release, func() error { return readCachedL2LockTestKey(ctx, view, "a", 2) })
 	first.requireDone(t, "read during Delete did not finish")
 	requireStaleL1InstallDone(t, release, view, epoch)
-	second := startL2LockOperation(t, release, func() error { return readCachedL2LockTestKey(ctx, view, "a", 2) })
-	second.requireDone(t, "read after stale install attempt did not finish")
+	_, cached, present := snapshotL2LockTestKey(t, release, view, "n:a")
+	require.False(t, present, "stale install left %d in L1 during Delete", cached)
 
 	release()
 	deleted.requireDone(t, "Delete did not finish after release")
@@ -192,12 +191,12 @@ func TestInFlightPrefixDeleteBlocksStaleL1Install(t *testing.T) {
 	t.Parallel()
 	armL2LockWatchdog(t)
 	cases := []struct {
-		name     string
-		prefix   string
-		want     int
-		wantGets int32
+		name   string
+		prefix string
+		want   int
+		fenced bool
 	}{
-		{name: "covering-prefix", prefix: "a", want: 2, wantGets: 1},
+		{name: "covering-prefix", prefix: "a", want: 2, fenced: true},
 		{name: "non-covering-prefix", prefix: "b", want: 1},
 	}
 	for _, tc := range cases {
@@ -219,12 +218,11 @@ func TestInFlightPrefixDeleteBlocksStaleL1Install(t *testing.T) {
 			first := startL2LockOperation(subtest, release, func() error { return readCachedL2LockTestKey(ctx, view, "a", 2) })
 			first.requireDone(subtest, "read during prefix delete did not finish")
 			requireStaleL1InstallDone(subtest, release, view, epoch)
-			gets := stub.getCalls.Load()
-			second := startL2LockOperation(subtest, release, func() error {
-				return readCachedL2LockTestKey(ctx, view, "a", tc.want)
-			})
-			second.requireDone(subtest, "read after stale install attempt did not finish")
-			require.Equal(subtest, tc.wantGets, stub.getCalls.Load()-gets, "L2 reads after stale install attempt")
+			_, cached, present := snapshotL2LockTestKey(subtest, release, view, "n:a")
+			require.Equal(subtest, !tc.fenced, present, "L1 presence after stale install, value %d", cached)
+			if present {
+				require.Equal(subtest, tc.want, cached, "unrelated L1 key did not retain its value")
+			}
 
 			release()
 			deleted.requireDone(subtest, "prefix delete did not finish after release")
@@ -343,7 +341,7 @@ func TestFencedFillEvictsOlderL1(t *testing.T) {
 				return nil
 			})
 			install.requireDone(subtest, "fenced fill did not finish")
-			checkFencedFillReads(subtest, release, view, stub)
+			requireFencedFillEviction(subtest, release, view)
 
 			release()
 			write.requireDone(subtest, "write did not finish after release")
@@ -464,7 +462,7 @@ func TestFencedFillEvictionOutlivesFailedWrite(t *testing.T) {
 	}
 }
 
-// TestFencedFillEvictionMatchesL1EvictionOnL2Hit pins review r12 F1 with two independent flights before either installs.
+// TestFencedFillEvictionMatchesL1EvictionOnL2Hit compares two independent fenced reads after either form of eviction.
 //
 //nolint:paralleltest,tparallel // WHY: the rows share the decode pause used by Get's zero-value destination.
 func TestFencedFillEvictionMatchesL1EvictionOnL2Hit(t *testing.T) {
@@ -474,7 +472,7 @@ func TestFencedFillEvictionMatchesL1EvictionOnL2Hit(t *testing.T) {
 	t.Run("direct-eviction", func(row *testing.T) { checkEvictedKeyL2Hit(row, false) })
 }
 
-// checkEvictedKeyL2Hit holds the two Gets after separate flights and releases them after the failed Set.
+// checkEvictedKeyL2Hit holds two direct L2 decodes until the pending Set fails.
 func checkEvictedKeyL2Hit(t *testing.T, fenced bool) {
 	t.Helper()
 	stub := newStubL2()
@@ -484,20 +482,21 @@ func checkEvictedKeyL2Hit(t *testing.T, fenced bool) {
 	requireFailedSetEviction(t, releaseWrite, view, epoch, fenced)
 
 	gets := stub.getCalls.Load()
-	first, releaseFirst := pauseL1InstallGet(t, view)
+	first, releaseFirst := pauseGetDecode(t, view, "a", 2, 1)
+	defer releaseFirst()
 	require.Equal(t, gets+1, stub.getCalls.Load())
-	second, releaseSecond := pauseL1InstallGet(t, view)
+	second, releaseSecond := pauseGetDecode(t, view, "a", 2, 1)
+	defer releaseSecond()
 	require.Equal(t, gets+2, stub.getCalls.Load())
 	_, cached, present := snapshotL2LockTestKey(t, releaseWrite, view, "n:a")
-	require.False(t, present, "both Gets must still be before L1 install, found %d", cached)
+	require.False(t, present, "both reads must leave L1 empty, found %d", cached)
 
 	requireFailedEvictionSet(t, write, releaseWrite)
 	releaseFirst()
 	first.requireDone(t, "first Get did not finish after release")
-	requireEvictedKeyInBothTiers(t, view, stub, 2)
 	releaseSecond()
 	second.requireDone(t, "second Get did not finish after release")
-	requireEvictedKeyInBothTiers(t, view, stub, 2)
+	requireColdFencedTiers(t, nil, view, stub, "2", true)
 	require.Equal(t, gets+2, stub.getCalls.Load())
 }
 
@@ -505,20 +504,21 @@ type pausedL1InstallValue int
 
 type l1InstallPause struct {
 	decodes  atomic.Int32
+	at       int32
 	entered  chan struct{}
 	released chan struct{}
 }
 
-// l1InstallGetPause belongs to the sequential L2-hit rows and is used only by their value type.
+// l1InstallGetPause is shared by the sequential eviction rows and the serial older-flight test.
 var l1InstallGetPause atomic.Pointer[l1InstallPause]
 
-// UnmarshalJSON pauses the second decode because it runs after singleflight, immediately before L1 install.
+// UnmarshalJSON pauses the chosen decode to hold a Get inside or outside its flight.
 func (v *pausedL1InstallValue) UnmarshalJSON(raw []byte) error {
 	var decoded int
 	if err := json.Unmarshal(raw, &decoded); err != nil {
 		return fmt.Errorf("cache/twotier: decode paused Get value: %w", err)
 	}
-	if pause := l1InstallGetPause.Load(); pause != nil && pause.decodes.Add(1) == 2 {
+	if pause := l1InstallGetPause.Load(); pause != nil && pause.decodes.Add(1) == pause.at {
 		close(pause.entered)
 		<-pause.released
 	}
@@ -526,16 +526,16 @@ func (v *pausedL1InstallValue) UnmarshalJSON(raw []byte) error {
 	return nil
 }
 
-// pauseL1InstallGet waits for Get to leave its flight and reach the L1 decode.
-func pauseL1InstallGet(t *testing.T, view *Typed[pausedL1InstallValue]) (*l2LockOperation, func()) {
+// pauseGetDecode waits for a chosen Get decode with cleanup registered before the read.
+func pauseGetDecode(t *testing.T, view *Typed[pausedL1InstallValue], key string, want int, at int32) (*l2LockOperation, func()) {
 	t.Helper()
-	pause := &l1InstallPause{entered: make(chan struct{}), released: make(chan struct{})}
+	pause := &l1InstallPause{at: at, entered: make(chan struct{}), released: make(chan struct{})}
 	l1InstallGetPause.Store(pause)
 	t.Cleanup(func() { l1InstallGetPause.Store(nil) })
 	release := sync.OnceFunc(func() { close(pause.released) })
 	ctx := t.Context()
-	get := startL2LockOperation(t, release, func() error { return readCachedL2LockTestKey(ctx, view, "a", 2) })
-	waitL2LockSignal(t, pause.entered, "Get did not leave singleflight before L1 install")
+	get := startL2LockOperation(t, release, func() error { return readCachedL2LockTestKey(ctx, view, key, want) })
+	waitL2LockSignal(t, pause.entered, "Get did not reach its paused decode")
 	return get, release
 }
 
@@ -553,7 +553,7 @@ func TestFencedFillEvictionMatchesL1EvictionOnL2Expiry(t *testing.T) {
 	})
 }
 
-// checkEvictedKeyL2Expiry reaches the loader during the paused Set, then lets the reload cache its result.
+// checkEvictedKeyL2Expiry checks that a fenced origin result stays uncached after the Set fails.
 func checkEvictedKeyL2Expiry(t *testing.T, fenced bool) {
 	t.Helper()
 	ctx := t.Context()
@@ -566,6 +566,7 @@ func checkEvictedKeyL2Expiry(t *testing.T, fenced bool) {
 	requireFailedSetEviction(t, releaseWrite, view, epoch, fenced)
 
 	gets := stub.getCalls.Load()
+	sets := stub.setCalls.Load()
 	var loads atomic.Int32
 	entered := make(chan struct{})
 	blocked := make(chan struct{})
@@ -591,7 +592,8 @@ func checkEvictedKeyL2Expiry(t *testing.T, fenced bool) {
 	reload.requireDone(t, "reload did not finish after failed Set")
 	require.EqualValues(t, 1, loads.Load())
 	require.Equal(t, gets+1, stub.getCalls.Load())
-	requireEvictedKeyInBothTiers(t, view, stub, 1)
+	require.Equal(t, sets, stub.setCalls.Load(), "fenced loader wrote to L2")
+	requireColdFencedTiers(t, nil, view, stub, "", false)
 }
 
 // prepareFailedSetEviction captures the old fill's epoch and commits 2 before either eviction schedule.
@@ -649,21 +651,30 @@ func requireFailedEvictionSet(t *testing.T, write *l2LockOperation, release func
 	require.ErrorIs(t, write.err, errStub)
 }
 
-// requireEvictedKeyInBothTiers inspects the installed values without triggering another read-through.
-func requireEvictedKeyInBothTiers[V ~int](t *testing.T, view *Typed[V], stub *stubL2, want int) {
+// requireColdFencedTiers inspects both tiers without triggering another read-through.
+func requireColdFencedTiers[V ~int](t *testing.T, release func(), view *Typed[V], stub *stubL2, wantRaw string, wantPresent bool) {
 	t.Helper()
-	_, cached, present := snapshotL2LockTestKey(t, nil, view, "n:a")
-	require.True(t, present)
-	require.Equal(t, want, int(cached))
+	_, cached, present := snapshotL2LockTestKey(t, release, view, "n:a")
+	require.False(t, present, "fenced Get installed %d in L1", cached)
+	raw, found := snapshotL2LockStubKey(t, release, stub, "n:a")
+	require.Equal(t, wantPresent, found, "fenced Get changed L2 key presence")
+	require.Equal(t, wantRaw, raw, "fenced Get changed L2 value")
+}
+
+// snapshotL2LockStubKey bounds a raw L2 inspection and keeps it out of the Get counts.
+func snapshotL2LockStubKey(t *testing.T, release func(), stub *stubL2, key string) (string, bool) {
+	t.Helper()
 	var raw string
-	snapshot := startL2LockOperation(t, nil, func() error {
+	var present bool
+	snapshot := startL2LockOperation(t, release, func() error {
 		stub.mu.Lock()
 		defer stub.mu.Unlock()
-		raw = string(stub.data["n:a"])
+		value, found := stub.data[key]
+		raw, present = string(value), found
 		return nil
 	})
 	snapshot.requireDone(t, "L2 snapshot did not finish")
-	require.Equal(t, strconv.Itoa(want), raw)
+	return raw, present
 }
 
 // requireFencedFillEviction checks that the fenced fill evicted only its key.
@@ -782,19 +793,6 @@ func moveFencedFillEpoch(t *testing.T, release func(), view *Typed[int], epoch u
 	})
 	notice.requireDone(t, "unrelated peer notice did not finish")
 	require.NotEqual(t, epoch, movedEpoch)
-}
-
-// checkFencedFillReads uses L2 calls to distinguish a per-key eviction from an L1 hit or a full flush.
-func checkFencedFillReads(t *testing.T, release func(), view *Typed[int], stub *stubL2) {
-	t.Helper()
-	ctx := t.Context()
-	before := stub.getCalls.Load()
-	read := startL2LockOperation(t, release, func() error { return readCachedL2LockTestKey(ctx, view, "a", 2) })
-	read.requireDone(t, "read after fenced fill did not finish")
-	require.Equal(t, before+1, stub.getCalls.Load(), "read after fenced fill must reach L2")
-	other := startL2LockOperation(t, release, func() error { return readCachedL2LockTestKey(ctx, view, "c", 7) })
-	other.requireDone(t, "read of unrelated key did not finish")
-	require.Equal(t, before+1, stub.getCalls.Load(), "unrelated key must stay warm in L1")
 }
 
 // TestPanickingL2WriteClearsPendingRecord verifies that read-through can backfill L1 after a panic.

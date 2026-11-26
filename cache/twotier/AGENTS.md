@@ -61,11 +61,12 @@ func (s *UserService) Load(ctx context.Context, id string) (*User, error) {
 - Loader fill or repair L2 write -> shared `l2FillGate` through epoch check and write.
 - Lock order: `l2Prefix` -> key stripe -> fill gate -> `mutation`.
 - Peer notice (key, prefix, empty prefix) -> exclusive fill gate -> waits for every in-flight loader fill or repair L2 write on this instance, as at base. Successful local Set, Delete, prefix delete -> after commit, before broadcast: exclusive fill gate, released at once -> returns after every fill or repair L2 call that passed its epoch check before commit, as at base.
-- Slow fill L2 write -> delays every peer notice. Fill gate wait has no deadline. L2 call uses Get context. Local write latency includes slowest in-flight fill L2 call; queued barrier blocks new fills (writer preference). Shared-L2 Get under pending write -> one extra L2 read per Get (same-flight reads share it).
-- Pending Set or Delete fences shared-L2 read-through fills for its key. Pending prefix delete fences shared-L2 fills under its prefix. Shared-L2 Get under pending key write or covering prefix delete -> ignore L1 entry, read L2 (may call loader) until commit. Shared-L2 fenced fill -> evict its key from L1. L1-only fill -> check epoch only. L1-only Set always publishes to L1. Shared-L2 Set publishes unless a peer notice for its key or a covering prefix arrives during its L2 write.
+- Slow fill L2 write -> delays every peer notice. Fill gate wait has no deadline. L2 call uses Get context. Local write latency includes slowest in-flight fill L2 call; queued barrier blocks new fills (writer preference).
+- Pending Set or Delete fences its key. Pending prefix delete fences keys under its prefix. Shared-L2 fenced Get -> one independent L2 read. Decodable L2 hit -> return it. L2 error + warm L1 snapshot -> return L1 value. Cold L2 error, L2 miss, or corrupt value -> loader. Same key + epoch -> fenced Gets share loader call. Fenced Get writes neither tier.
+- Shared-L2 fill reaching L1 under fence -> evict its key. L1-only fill -> check epoch only. L1-only Set always publishes to L1. Shared-L2 Set publishes unless a peer notice for its key or a covering prefix arrives during its L2 write.
 - Shared-L2 fenced fill -> same key state as L1 TTL or capacity eviction at that instant, even after newer L1 commit. Pending Set, Delete, or prefix delete success or failure -> eviction holds.
-  After either eviction, each separate Get flight -> read L2 until next L1 install.
-  Covering pending write -> evict L1 again. No covering pending write, epoch moved since Get miss -> skip install.
+  After either eviction, unfenced Get flights -> read L2 until next L1 install.
+  Older fill reaches L1 under covering pending write -> evict L1 again. No covering pending write, epoch moved since Get miss -> skip install.
   No covering pending write + epoch unchanged since Get miss -> L2 hit can fill L1, loader after L2 expiry can fill both tiers, even if value older than last successful Set.
 - Empty prefix -> refused before fence; no L1 eviction.
 
@@ -103,8 +104,8 @@ func (s *UserService) Load(ctx context.Context, id string) (*User, error) {
 
 L1 stores live Go value; L2 stores its JSON encoding (Redis is byte
 store, and JSON keeps cache language-agnostic across replicas). Store
-JSON-round-trippable values only. Invalid L2 JSON is deleted and repaired
-through the origin loader.
+JSON-round-trippable values only. Unfenced Gets delete corrupt L2 values
+and repair through the origin loader.
 
 ## Disabled / nil-passthrough mode
 
@@ -132,7 +133,7 @@ Fenced-fill evictions during failed write -> same key state and read-through as 
  interface; stub it (see `twotier_test.go`) and use `memory.NewForTest` for L1.
  Cross-replica Redis behaviour lives in `integration_test.go`.
 - Don't rely on invalidation for correctness beyond `l1_ttl` — notices can be lost.
-- Don't treat L2 outage as fatal — `Get` logs and falls through to  loader; only `Set`/`Delete` surface L2 errors (caller chose to write).
+- Don't treat L2 outage as fatal — `Get` logs and uses the applicable fallback; only `Set`/`Delete` surface L2 errors (caller chose to write).
 - Don't store values that don't JSON-round-trip — L2 holds JSON, not  live object.
 - Don't cache by floating-point keys — keys are plain strings; format floats
  canonically before keying.

@@ -316,19 +316,47 @@ func isL2LockWorkerRun(run *ast.FuncLit, ancestors []ast.Node) bool {
 			return false
 		}
 		callee, named := ast.Unparen(call.Fun).(*ast.Ident)
-		return named && callee.Name == "startL2LockOperation" && isSynchronousWorkerStart(ancestors[i-1])
+		return named && callee.Name == "startL2LockOperation" && isSynchronousWorkerStart(ancestors[:i])
 	}
 	return false
 }
 
-// isSynchronousWorkerStart permits only the statement forms used to start bounded workers.
-func isSynchronousWorkerStart(parent ast.Node) bool {
-	switch parent.(type) {
-	case *ast.ExprStmt, *ast.AssignStmt, *ast.ReturnStmt:
-		return true
-	default:
+// isSynchronousWorkerStart follows only the statement and subtest forms that own bounded workers.
+func isSynchronousWorkerStart(ancestors []ast.Node) bool {
+	for i := len(ancestors) - 1; i >= 0; i-- {
+		switch node := ancestors[i].(type) {
+		case *ast.BlockStmt, *ast.ExprStmt, *ast.AssignStmt, *ast.ReturnStmt, *ast.IfStmt, *ast.ForStmt,
+			*ast.RangeStmt, *ast.CaseClause, *ast.SwitchStmt:
+		case *ast.FuncDecl:
+			return i+1 < len(ancestors) && ancestors[i+1] == node.Body
+		case *ast.FuncLit:
+			if i < 2 || !isSubtestRunLiteral(node, ancestors[i-1], ancestors[i-2]) {
+				return false
+			}
+			i--
+		default:
+			return false
+		}
+	}
+	return false
+}
+
+// isSubtestRunLiteral recognizes an inline subtest in a direct ident.Run call statement.
+func isSubtestRunLiteral(run *ast.FuncLit, parent, grandparent ast.Node) bool {
+	call, ok := parent.(*ast.CallExpr)
+	if !ok || len(call.Args) != 2 || call.Args[1] != run {
 		return false
 	}
+	statement, standalone := grandparent.(*ast.ExprStmt)
+	if !standalone || statement.X != call {
+		return false
+	}
+	selector, selected := call.Fun.(*ast.SelectorExpr)
+	if !selected || selector.Sel.Name != "Run" {
+		return false
+	}
+	_, named := selector.X.(*ast.Ident)
+	return named
 }
 
 // TestSetL1IfCurrentCallsAreBoundedFixtures accepts worker calls and flags escaping calls.
@@ -417,15 +445,64 @@ func test() {
 	requireUnboundedFillCall(t, "method_value_test.go", methodValue, 4)
 }
 
+// TestSetL1IfCurrentCallsAreBoundedWrappedWorkerFixtures rejects starts hidden in detached closures.
+func TestSetL1IfCurrentCallsAreBoundedWrappedWorkerFixtures(t *testing.T) {
+	t.Parallel()
+	const goWrapper = `package twotier
+func test() {
+	go func() {
+		startL2LockOperation(t, release, func() error {
+			view.setL1IfCurrent("n:a", 1, epoch)
+			return nil
+		})
+	}()
+}
+`
+	const deferWrapper = `package twotier
+func test() {
+	defer func() {
+		startL2LockOperation(t, release, func() error {
+			view.setL1IfCurrent("n:a", 1, epoch)
+			return nil
+		})
+	}()
+}
+`
+	const closureWrapper = `package twotier
+func test() {
+	start := func() {
+		startL2LockOperation(t, release, func() error {
+			view.setL1IfCurrent("n:a", 1, epoch)
+			return nil
+		})
+	}
+	start()
+}
+`
+	cases := [...]struct{ name, source string }{
+		{"goWrapper", goWrapper},
+		{"deferWrapper", deferWrapper},
+		{"closureWrapper", closureWrapper},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(subtest *testing.T) {
+			subtest.Parallel()
+			requireUnboundedFillCall(subtest, tc.name+"_test.go", tc.source, 5)
+		})
+	}
+}
+
 // requireBoundedFillCallFixture checks that the worker's synchronous run call is accepted.
 func requireBoundedFillCallFixture(t *testing.T) {
 	t.Helper()
-	const clean = `package twotier
+	const subtest = `package twotier
 func test() {
-	stub.beforeWrite = func() {
-		startL2LockOperation(t, nil, func() error {
-			view.setL1IfCurrent("n:a", 1, epoch)
-			return nil
+	for _, tc := range cases {
+		t.Run(tc.name, func(row *testing.T) {
+			startL2LockOperation(row, nil, func() error {
+				view.setL1IfCurrent("n:a", 1, epoch)
+				return nil
+			})
 		})
 	}
 }
@@ -442,7 +519,7 @@ func test() {
 	})
 }
 `
-	for _, source := range [...]string{clean, selectCase} {
+	for _, source := range [...]string{subtest, selectCase} {
 		positions, err := unboundedFillCalls("clean_test.go", []byte(source))
 		require.NoError(t, err)
 		require.Empty(t, positions)
