@@ -51,17 +51,28 @@ func newPeers(t *testing.T) (a, b *TwoTier, shared *stubL2) {
 // newPeersWithBroadcastSignal can observe broadcasts from the second replica.
 func newPeersWithBroadcastSignal(t *testing.T, signal func()) (a, b *TwoTier, shared *stubL2) {
 	t.Helper()
+	return newPeersWithBroadcastSignals(t, nil, signal)
+}
+
+// newPeersWithBroadcastSignals observes broadcast entry on either replica.
+func newPeersWithBroadcastSignals(t *testing.T, signalA, signalB func()) (a, b *TwoTier, shared *stubL2) {
+	t.Helper()
 	shared = newStubL2()
 	broadcaster, err := NewBusBroadcaster(pubsub.New(), "", nil)
 	require.NoError(t, err)
-	var peerBroadcaster Broadcaster = broadcaster
-	if signal != nil {
-		peerBroadcaster = &signalingBroadcaster{Broadcaster: broadcaster, signal: signal}
-	}
-	a, b = newPeer(t, shared, broadcaster), newPeer(t, shared, peerBroadcaster)
+	a = newPeer(t, shared, broadcasterWithSignal(broadcaster, signalA))
+	b = newPeer(t, shared, broadcasterWithSignal(broadcaster, signalB))
 	t.Cleanup(a.Listen())
 	t.Cleanup(b.Listen())
 	return a, b, shared
+}
+
+// broadcasterWithSignal wraps only broadcasters whose entry is observed by a test.
+func broadcasterWithSignal(broadcaster Broadcaster, signal func()) Broadcaster {
+	if signal == nil {
+		return broadcaster
+	}
+	return &signalingBroadcaster{Broadcaster: broadcaster, signal: signal}
 }
 
 type signalingBroadcaster struct {
@@ -152,10 +163,33 @@ func TestInvalidation_PeerSetDuringLocalSetLeavesNoStaleL1(t *testing.T) {
 	require.Equal(t, int32(1), shared.getCalls.Load()-gets, "L2 reads after local Set")
 }
 
+// TestWriterReplicaReadsPendingL2Value checks the warm writer after a cold peer reads its pending Set.
+func TestWriterReplicaReadsPendingL2Value(t *testing.T) {
+	t.Parallel()
+	armL2LockWatchdog(t)
+	ctx := t.Context()
+	a, b, shared := newPeers(t)
+	cacheOn(t, a)
+	aView, bView := NewTyped[int](a, "n"), NewTyped[int](b, "n")
+	entered, release, hook := blockL2WriteForKey(t, "set", "n:k", "2")
+	shared.afterWrite = hook
+
+	set := startL2LockOperation(t, release, func() error { return aView.Set(ctx, "k", 2) })
+	waitL2LockSignal(t, entered, "local Set did not publish to L2")
+	peerRead := startL2LockOperation(t, release, func() error { return readCachedL2LockTestKey(ctx, bView, "k", 2) })
+	peerRead.requireDone(t, "cold peer did not read the pending L2 value")
+	localRead := startL2LockOperation(t, release, func() error { return readCachedL2LockTestKey(ctx, aView, "k", 2) })
+	localRead.requireDone(t, "warm writer did not read the pending L2 value")
+	requireOperationRunning(t, set, "local Set returned before its L2 hook was released")
+	release()
+	set.requireDone(t, "local Set did not finish after release")
+	committedRead := startL2LockOperation(t, nil, func() error { return readCachedL2LockTestKey(ctx, aView, "k", 2) })
+	committedRead.requireDone(t, "local Get after Set did not finish")
+}
+
 type localMutationCase struct {
 	name   string
-	op     string
-	raw    string
+	prefix bool
 	mutate func(context.Context, *Typed[int]) error
 }
 
@@ -164,13 +198,13 @@ func TestLocalMutationWaitsForOlderFill(t *testing.T) {
 	t.Parallel()
 	armL2LockWatchdog(t)
 	cases := [...]localMutationCase{
-		{name: "set", op: "set", raw: "2", mutate: func(ctx context.Context, view *Typed[int]) error {
+		{name: "set", mutate: func(ctx context.Context, view *Typed[int]) error {
 			return view.Set(ctx, "z", 2)
 		}},
-		{name: "delete", op: "del", mutate: func(ctx context.Context, view *Typed[int]) error {
+		{name: "delete", mutate: func(ctx context.Context, view *Typed[int]) error {
 			return view.Delete(ctx, "z")
 		}},
-		{name: "prefix", op: "del-prefix", mutate: func(ctx context.Context, view *Typed[int]) error {
+		{name: "prefix", prefix: true, mutate: func(ctx context.Context, view *Typed[int]) error {
 			return view.InvalidatePrefix(ctx, "z")
 		}},
 	}
@@ -187,35 +221,38 @@ func TestLocalMutationWaitsForOlderFill(t *testing.T) {
 func checkLocalMutationAfterBlockedFill(t *testing.T, tc localMutationCase) {
 	t.Helper()
 	ctx := t.Context()
-	a, b, shared := newPeers(t)
+	broadcastStarted := make(chan struct{})
+	a, b, shared := newPeersWithBroadcastSignals(t, sync.OnceFunc(func() { close(broadcastStarted) }), nil)
 	aView, bView := NewTyped[int](a, "n"), NewTyped[int](b, "n")
 	entered, releaseFill, fillHook := blockL2WriteForKey(t, "set", "n:k", "1")
-	written, finishWrite, mutationHook := blockL2WriteForKey(t, tc.op, "n:z", tc.raw)
 	shared.beforeWrite = fillHook
-	shared.afterWrite = mutationHook
-	defer finishWrite()
 	fill := startOlderPeerFill(t, releaseFill, aView)
 	waitL2LockSignal(t, entered, "loader fill did not reach its L2 write")
-	mutation := startL2LockOperation(t, releaseFill, func() error { return tc.mutate(ctx, aView) })
-	if tc.op == "del-prefix" {
-		mutation.requireBlocked(t, "sync.RWMutex.Lock", ").invalidatePrefixBoth(")
-		releaseFill()
-		fill.requireDone(t, "loader fill did not finish before the prefix write")
-	}
-	waitL2LockSignal(t, written, "local mutation did not write to shared L2")
 	releaseReader := releaseFill
-	if tc.op == "del-prefix" {
-		// The prefix lock already drained the real fill, so hold a reader to isolate the post-commit barrier.
+	if tc.prefix {
+		// A separate reader isolates the prefix barrier after the prefix lock drains the real fill.
 		require.True(t, a.l2FillGate.TryRLock(), "could not hold a fill gate reader during the prefix commit")
 		releaseReader = sync.OnceFunc(a.l2FillGate.RUnlock)
 		defer releaseReader()
+		releaseFill()
+		fill.requireDone(t, "loader fill did not finish before the prefix write")
 	}
-	finishWrite()
-	requireFillGateWriter(t, &a.l2FillGate, func() {
+	epoch, _ := localMutationSnapshot(a, "n:z", tc.prefix)
+	mutation := startL2LockOperation(t, releaseReader, func() error {
+		if err := tc.mutate(ctx, aView); err != nil {
+			return fmt.Errorf("cache/twotier: local %s: %w", tc.name, err)
+		}
 		select {
-		case <-mutation.done:
-			t.Fatalf("local %s returned before the older fill wrote L2", tc.name)
+		case <-broadcastStarted:
+			return nil
 		default:
+			return fmt.Errorf("cache/twotier: local %s returned before entering broadcast", tc.name)
+		}
+	})
+	requireFillGateWriter(t, &a.l2FillGate, func(queued bool) {
+		requireOperationRunning(t, mutation, "local mutation returned before the older fill barrier opened")
+		if queued {
+			requireLocalMutationCommitted(t, a, tc, epoch, broadcastStarted)
 		}
 	}, "local mutation never queued on the fill gate")
 	releaseReader()
@@ -227,6 +264,130 @@ func checkLocalMutationAfterBlockedFill(t *testing.T, tc localMutationCase) {
 	require.NoError(t, err)
 	require.False(t, found, "older fill recreated the deleted L2 entry")
 	requirePeerReload(t, ctx, aView)
+}
+
+// requireLocalMutationCommitted checks that the queued barrier follows commit and precedes broadcast.
+func requireLocalMutationCommitted(t *testing.T, tt *TwoTier, tc localMutationCase, before uint64, broadcast <-chan struct{}) {
+	t.Helper()
+	epoch, pending := localMutationSnapshot(tt, "n:z", tc.prefix)
+	require.Greater(t, epoch, before, "local %s queued its fill barrier before committing its epoch", tc.name)
+	require.False(t, pending, "local %s queued its fill barrier with its pending write still active", tc.name)
+	select {
+	case <-broadcast:
+		t.Fatalf("local %s entered broadcast before its fill barrier opened", tc.name)
+	default:
+	}
+}
+
+// localMutationSnapshot reads the committed epoch and relevant pending slot under mutation.
+func localMutationSnapshot(tt *TwoTier, key string, prefix bool) (uint64, bool) {
+	tt.mutation.RLock()
+	defer tt.mutation.RUnlock()
+	if prefix {
+		return tt.epoch, tt.prefixPending.active
+	}
+	return tt.epoch, tt.l2Pending[l2StripeIndex(key)].active
+}
+
+// requireOperationRunning checks a worker has yet to return at a held test checkpoint.
+func requireOperationRunning(t *testing.T, op *l2LockOperation, message string) {
+	t.Helper()
+	select {
+	case <-op.done:
+		t.Fatal(message)
+	default:
+	}
+}
+
+// TestLocalWriteBarrierLimit reproduces the #1609 end state after a peer Delete.
+func TestLocalWriteBarrierLimit(t *testing.T) {
+	t.Parallel()
+	armL2LockWatchdog(t)
+	cases := [...]struct {
+		name   string
+		failed bool
+	}{
+		{name: "barrier-queued read"},
+		{name: "failed write", failed: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(subtest *testing.T) {
+			subtest.Parallel()
+			checkLocalWriteBarrierLimit(subtest, tc.failed)
+		})
+	}
+}
+
+// checkLocalWriteBarrierLimit makes the peer delete from L2 before the older fill writes.
+func checkLocalWriteBarrierLimit(t *testing.T, failed bool) {
+	t.Helper()
+	ctx := t.Context()
+	require.NotEqual(t, l2StripeIndex("n:k"), l2StripeIndex("n:z"))
+	a, b, shared := newPeers(t)
+	if failed {
+		a.l2 = &failSetForKeyL2{l2: shared, key: "n:z"}
+	}
+	aView, bView := NewTyped[int](a, "n"), NewTyped[int](b, "n")
+	entered, release, fillHook := blockL2WriteForKey(t, "set", "n:k", "1")
+	setWritten, peerDeleted := make(chan struct{}), make(chan struct{})
+	signals := map[[2]string]func(){
+		{"set", "n:z"}: sync.OnceFunc(func() { close(setWritten) }),
+		{"del", "n:k"}: sync.OnceFunc(func() { close(peerDeleted) }),
+	}
+	shared.beforeWrite = fillHook
+	shared.afterWrite = func(op, key string, _ []byte) {
+		if signal := signals[[2]string{op, key}]; signal != nil {
+			signal()
+		}
+	}
+	fill := startOlderPeerFill(t, release, aView)
+	waitL2LockSignal(t, entered, "loader fill did not reach its L2 write")
+	set := startL2LockOperation(t, release, func() error { return aView.Set(ctx, "z", 2) })
+	if failed {
+		waitL2LockSignal(t, set.done, "failed Set waited for the older fill")
+		require.ErrorIs(t, set.err, errStub)
+	} else {
+		requirePeerReadsBeforeLocalBarrier(t, a, bView, setWritten, release, set)
+	}
+	peer := startL2LockOperation(t, release, func() error { return bView.Delete(ctx, "k") })
+	waitL2LockSignal(t, peerDeleted, "peer Delete did not remove the L2 value")
+	release()
+	fill.requireDone(t, "loader fill did not finish after release")
+	if !failed {
+		set.requireDone(t, "local Set did not finish after release")
+	}
+	peer.requireDone(t, "peer Delete did not finish after release")
+	raw, found, err := shared.Get(ctx, "n:k")
+	require.NoError(t, err)
+	require.True(t, found, "older fill did not recreate L2 after the peer Delete")
+	require.Equal(t, "1", string(raw), "L2 did not retain the older fill after the peer Delete")
+}
+
+// requirePeerReadsBeforeLocalBarrier proves the peer can observe the Set while its barrier is queued.
+func requirePeerReadsBeforeLocalBarrier(t *testing.T, a *TwoTier, peer *Typed[int], written <-chan struct{}, release func(), set *l2LockOperation) {
+	t.Helper()
+	waitL2LockSignal(t, written, "local Set did not publish to L2")
+	requireFillGateWriter(t, &a.l2FillGate, func(bool) {
+		requireOperationRunning(t, set, "local Set returned before the older fill barrier opened")
+	}, "local Set never queued on the fill gate")
+	read := startL2LockOperation(t, release, func() error { return readCachedL2LockTestKey(t.Context(), peer, "z", 2) })
+	read.requireDone(t, "peer Get did not read the Set value while the barrier was queued")
+}
+
+type failSetForKeyL2 struct {
+	l2
+	key string
+}
+
+// Set fails only the configured key and delegates every other L2 write.
+func (s *failSetForKeyL2) Set(ctx context.Context, key string, raw []byte, ttl time.Duration) error {
+	if key == s.key {
+		return fmt.Errorf("cache/twotier: test L2 set %q: %w", key, errStub)
+	}
+	if err := s.l2.Set(ctx, key, raw, ttl); err != nil {
+		return fmt.Errorf("cache/twotier: test L2 set %q: %w", key, err)
+	}
+	return nil
 }
 
 // TestInvalidation_PeerDeleteWinsAfterBlockedFill covers same-stripe key, other-stripe key, and prefix notices.
@@ -284,7 +445,7 @@ func checkPeerDeleteAfterBlockedFill(t *testing.T, mutate func(context.Context, 
 		return bView.Delete(ctx, "k")
 	})
 	waitL2LockSignal(t, broadcastStarted, "peer did not start its first notice while the fill was paused")
-	requireFillGateWriter(t, &a.l2FillGate, func() {
+	requireFillGateWriter(t, &a.l2FillGate, func(bool) {
 		requirePeerNoticeFenced(t, deleteReached, peer.done)
 	}, "peer notice never queued on the receiving fill gate")
 	release()
@@ -309,8 +470,8 @@ func startOlderPeerFill(t *testing.T, release func(), view *Typed[int]) *l2LockO
 	})
 }
 
-// requireFillGateWriter observes a queued writer while the test holds a fill gate reader.
-func requireFillGateWriter(t *testing.T, gate *sync.RWMutex, requirePending func(), timeoutMessage string) {
+// requireFillGateWriter checks progress before each poll and reports when a writer is queued behind a held reader.
+func requireFillGateWriter(t *testing.T, gate *sync.RWMutex, requirePending func(queued bool), timeoutMessage string) {
 	t.Helper()
 	// Give the worker time to queue between lock attempts.
 	const fillGatePollInterval = time.Millisecond
@@ -322,9 +483,9 @@ func requireFillGateWriter(t *testing.T, gate *sync.RWMutex, requirePending func
 	defer deadline.Stop()
 poll:
 	for range fillGatePollLimit {
-		requirePending()
+		requirePending(false)
 		if !gate.TryRLock() {
-			requirePending()
+			requirePending(true)
 			return
 		}
 		gate.RUnlock()
@@ -334,7 +495,7 @@ poll:
 		case <-ticks.C:
 		}
 	}
-	requirePending()
+	requirePending(false)
 	t.Fatal(timeoutMessage)
 }
 

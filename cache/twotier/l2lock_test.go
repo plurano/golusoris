@@ -136,7 +136,7 @@ func TestInFlightSetBlocksStaleL1Install(t *testing.T) {
 	stub.data["n:a"] = []byte("1")
 	tiers := newTestTwoTier(t, stub)
 	view := NewTyped[int](tiers, "n")
-	epoch, _, ok := view.l1Snapshot("n:a")
+	epoch, _, ok := rawL1Snapshot(view, "n:a")
 	require.False(t, ok)
 
 	entered, release, hook := blockL2Write(t, "set", "2")
@@ -166,7 +166,7 @@ func TestInFlightDeleteBlocksStaleL1Install(t *testing.T) {
 	stub.data["n:a"] = []byte("1")
 	tiers := newTestTwoTier(t, stub)
 	view := NewTyped[int](tiers, "n")
-	epoch, _, ok := view.l1Snapshot("n:a")
+	epoch, _, ok := rawL1Snapshot(view, "n:a")
 	require.False(t, ok)
 
 	entered, release, hook := blockL2Write(t, "del", "")
@@ -207,7 +207,7 @@ func TestInFlightPrefixDeleteBlocksStaleL1Install(t *testing.T) {
 			stub := newStubL2()
 			stub.data["n:a"] = []byte("1")
 			view := NewTyped[int](newTestTwoTier(subtest, stub), "n")
-			epoch, _, ok := view.l1Snapshot("n:a")
+			epoch, _, ok := rawL1Snapshot(view, "n:a")
 			require.False(subtest, ok)
 
 			entered, release, hook := blockL2WriteForKey(subtest, "del-prefix", view.key(tc.prefix), "")
@@ -243,7 +243,7 @@ func TestRefusedEmptyPrefixKeepsCommittedL1(t *testing.T) {
 	stub.data["n:a"] = []byte("1")
 	tiers := newTestTwoTier(t, stub)
 	view := NewTyped[int](tiers, "n")
-	epoch0, _, ok := view.l1Snapshot("n:a")
+	epoch0, _, ok := rawL1Snapshot(view, "n:a")
 	require.False(t, ok)
 	requireL2LockSetupSet(t, func() error { return view.Set(ctx, "a", 2) })
 	installRequested := make(chan struct{})
@@ -700,6 +700,19 @@ func checkFailedFencedFillReload(t *testing.T, view *Typed[int], stub *stubL2) {
 	require.Equal(t, gets+1, stub.getCalls.Load(), "second read after failed write must hit L1")
 }
 
+// rawL1Snapshot reads the actual L1 entry and epoch while holding mutation.
+func rawL1Snapshot[V any](view *Typed[V], key string) (uint64, V, bool) {
+	view.tt.mutation.RLock()
+	defer view.tt.mutation.RUnlock()
+	raw, ok := view.tt.l1.GetIfPresent(key)
+	if !ok {
+		var zero V
+		return view.tt.epoch, zero, false
+	}
+	value, present := raw.(V)
+	return view.tt.epoch, value, present
+}
+
 // snapshotL2LockTestKey bounds the read of the epoch and L1 value under mutation.
 func snapshotL2LockTestKey[V ~int](t *testing.T, release func(), view *Typed[V], key string) (uint64, V, bool) {
 	t.Helper()
@@ -707,7 +720,7 @@ func snapshotL2LockTestKey[V ~int](t *testing.T, release func(), view *Typed[V],
 	var value V
 	var present bool
 	snapshot := startL2LockOperation(t, release, func() error {
-		epoch, value, present = view.l1Snapshot(key)
+		epoch, value, present = rawL1Snapshot(view, key)
 		return nil
 	})
 	snapshot.requireDone(t, "L1 snapshot did not finish")
@@ -764,7 +777,7 @@ func moveFencedFillEpoch(t *testing.T, release func(), view *Typed[int], epoch u
 	var movedEpoch uint64
 	notice := startL2LockOperation(t, release, func() error {
 		view.tt.applyInvalidation(Invalidation{Origin: "peer", Kind: InvalidationKey, Key: unrelatedKey})
-		movedEpoch, _, _ = view.l1Snapshot("n:a")
+		movedEpoch, _, _ = rawL1Snapshot(view, "n:a")
 		return nil
 	})
 	notice.requireDone(t, "unrelated peer notice did not finish")
@@ -987,7 +1000,7 @@ func TestL1OnlyFillKeepsCommittedL1DuringWrite(t *testing.T) {
 			tiers := newTestTwoTier(subtest, stub)
 			tiers.l1Only = true
 			view := NewTyped[int](tiers, "n")
-			epoch0, _, ok := view.l1Snapshot("n:a")
+			epoch0, _, ok := rawL1Snapshot(view, "n:a")
 			require.False(subtest, ok)
 			requireL2LockSetupSet(subtest, func() error { return view.Set(ctx, "a", 2) })
 
@@ -1002,7 +1015,7 @@ func TestL1OnlyFillKeepsCommittedL1DuringWrite(t *testing.T) {
 				requireL1OnlyCachedRead(subtest, nil, view, stub, 3)
 				return
 			}
-			_, _, present := view.l1Snapshot("n:a")
+			_, _, present := rawL1Snapshot(view, "n:a")
 			require.False(subtest, present, "delete did not remove the L1 value")
 		})
 	}

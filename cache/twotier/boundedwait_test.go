@@ -26,7 +26,7 @@ func TestSetL1IfCurrentCallsAreBounded(t *testing.T) {
 		positions, err := unboundedFillCalls(source.name, source.data)
 		require.NoError(t, err)
 		for _, position := range positions {
-			t.Errorf("cache/twotier: %s: setL1IfCurrent call must be inside a startL2LockOperation worker", position)
+			t.Errorf("cache/twotier: %s: setL1IfCurrent must be called directly inside a startL2LockOperation worker", position)
 		}
 	}
 }
@@ -252,7 +252,7 @@ func statementCallee(statement ast.Stmt) ast.Expr {
 	return ast.Unparen(call.Fun)
 }
 
-// unboundedFillCalls finds fill calls outside bounded worker literals.
+// unboundedFillCalls finds fill references without a direct call inside a bounded worker.
 func unboundedFillCalls(filename string, src []byte) ([]token.Position, error) {
 	files := token.NewFileSet()
 	file, err := parser.ParseFile(files, filename, src, parser.SkipObjectResolution)
@@ -261,41 +261,74 @@ func unboundedFillCalls(filename string, src []byte) ([]token.Position, error) {
 	}
 	var positions []token.Position
 	ast.PreorderStack(file, nil, func(node ast.Node, ancestors []ast.Node) bool {
-		call, ok := node.(*ast.CallExpr)
-		if !ok {
-			return true
-		}
-		selector, selected := ast.Unparen(call.Fun).(*ast.SelectorExpr)
-		if selected && selector.Sel.Name == "setL1IfCurrent" && !insideL2LockWorker(ancestors) {
-			positions = append(positions, files.PositionFor(call.Pos(), false))
+		selector, ok := node.(*ast.SelectorExpr)
+		if ok && selector.Sel.Name == "setL1IfCurrent" && !boundedFillSelector(selector, ancestors) {
+			positions = append(positions, files.PositionFor(selector.Pos(), false))
 		}
 		return true
 	})
 	return positions, nil
 }
 
+// boundedFillSelector requires a direct call to the selector inside the worker.
+func boundedFillSelector(selector *ast.SelectorExpr, ancestors []ast.Node) bool {
+	for i, ancestor := range slices.Backward(ancestors) {
+		if _, parens := ancestor.(*ast.ParenExpr); parens {
+			continue
+		}
+		if !isDirectFillCall(selector, ancestor) {
+			return false
+		}
+		return insideL2LockWorker(ancestors[:i])
+	}
+	return false
+}
+
+// isDirectFillCall excludes method values and selectors passed as arguments.
+func isDirectFillCall(selector *ast.SelectorExpr, parent ast.Node) bool {
+	call, ok := parent.(*ast.CallExpr)
+	return ok && ast.Unparen(call.Fun) == selector
+}
+
 // insideL2LockWorker accepts synchronous calls in the nearest worker's run literal.
 func insideL2LockWorker(ancestors []ast.Node) bool {
-	const runArgIndex = 2
-	var enclosing *ast.FuncLit
-	for _, ancestor := range slices.Backward(ancestors) {
+	for i, ancestor := range slices.Backward(ancestors) {
 		switch node := ancestor.(type) {
-		case *ast.GoStmt:
-			if enclosing == nil {
-				return false
-			}
+		case *ast.ExprStmt, *ast.BlockStmt, *ast.CommClause, *ast.SelectStmt:
 		case *ast.FuncLit:
-			if enclosing == nil {
-				enclosing = node
-			}
-		case *ast.CallExpr:
-			callee, named := ast.Unparen(node.Fun).(*ast.Ident)
-			if named && callee.Name == "startL2LockOperation" {
-				return len(node.Args) > runArgIndex && ast.Unparen(node.Args[runArgIndex]) == enclosing
-			}
+			return isL2LockWorkerRun(node, ancestors[:i])
+		default:
+			return false
 		}
 	}
 	return false
+}
+
+// isL2LockWorkerRun requires an inline run argument and a synchronous worker start.
+func isL2LockWorkerRun(run *ast.FuncLit, ancestors []ast.Node) bool {
+	const runArgIndex = 2
+	for i := len(ancestors) - 1; i > 0; i-- {
+		if _, parens := ancestors[i].(*ast.ParenExpr); parens {
+			continue
+		}
+		call, ok := ancestors[i].(*ast.CallExpr)
+		if !ok || len(call.Args) <= runArgIndex || ast.Unparen(call.Args[runArgIndex]) != run {
+			return false
+		}
+		callee, named := ast.Unparen(call.Fun).(*ast.Ident)
+		return named && callee.Name == "startL2LockOperation" && isSynchronousWorkerStart(ancestors[i-1])
+	}
+	return false
+}
+
+// isSynchronousWorkerStart permits only the statement forms used to start bounded workers.
+func isSynchronousWorkerStart(parent ast.Node) bool {
+	switch parent.(type) {
+	case *ast.ExprStmt, *ast.AssignStmt, *ast.ReturnStmt:
+		return true
+	default:
+		return false
+	}
 }
 
 // TestSetL1IfCurrentCallsAreBoundedFixtures accepts worker calls and flags escaping calls.
@@ -351,6 +384,39 @@ func test() {
 	requireUnboundedFillCall(t, "go_statement_test.go", goStatement, 4)
 }
 
+// TestSetL1IfCurrentCallsAreBoundedWorkerFixtures catches detached starts and method values.
+func TestSetL1IfCurrentCallsAreBoundedWorkerFixtures(t *testing.T) {
+	t.Parallel()
+	const goStart = `package twotier
+func test() {
+	go startL2LockOperation(t, nil, func() error {
+		view.setL1IfCurrent("n:a", 1, epoch)
+		return nil
+	})
+}
+`
+	const deferStart = `package twotier
+func test() {
+	defer startL2LockOperation(t, nil, func() error {
+		view.setL1IfCurrent("n:a", 1, epoch)
+		return nil
+	})
+}
+`
+	const methodValue = `package twotier
+func test() {
+	startL2LockOperation(t, nil, func() error {
+		install := view.setL1IfCurrent
+		install("n:a", 1, epoch)
+		return nil
+	})
+}
+`
+	requireUnboundedFillCall(t, "go_start_test.go", goStart, 4)
+	requireUnboundedFillCall(t, "defer_start_test.go", deferStart, 4)
+	requireUnboundedFillCall(t, "method_value_test.go", methodValue, 4)
+}
+
 // requireBoundedFillCallFixture checks that the worker's synchronous run call is accepted.
 func requireBoundedFillCallFixture(t *testing.T) {
 	t.Helper()
@@ -364,9 +430,23 @@ func test() {
 	}
 }
 `
-	positions, err := unboundedFillCalls("clean_test.go", []byte(clean))
-	require.NoError(t, err)
-	require.Empty(t, positions)
+	const selectCase = `package twotier
+func test() {
+	install := startL2LockOperation(t, nil, func() error {
+		select {
+		case <-requested:
+			(view.setL1IfCurrent)("n:a", 1, epoch)
+		case <-ctx.Done():
+		}
+		return nil
+	})
+}
+`
+	for _, source := range [...]string{clean, selectCase} {
+		positions, err := unboundedFillCalls("clean_test.go", []byte(source))
+		require.NoError(t, err)
+		require.Empty(t, positions)
+	}
 }
 
 // requireUnboundedFillCall checks that the fixture reports only the planted call.

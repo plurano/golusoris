@@ -172,10 +172,14 @@ func (t *Typed[V]) Get(ctx context.Context, k string, loader Loader[V]) (V, erro
 }
 
 // l1Snapshot reads one generation and its typed L1 value atomically against
-// Set, Delete, and prefix invalidation.
+// Set, Delete, and prefix invalidation. A covering pending write makes shared-L2 reads miss L1.
 func (t *Typed[V]) l1Snapshot(key string) (uint64, V, bool) {
 	t.tt.mutation.RLock()
 	defer t.tt.mutation.RUnlock()
+	if !t.tt.l1Only && t.tt.fillFenced(key) {
+		var zero V
+		return t.tt.epoch, zero, false
+	}
 	raw, ok := t.tt.l1.GetIfPresent(key)
 	if !ok {
 		var zero V
@@ -315,6 +319,7 @@ func (t *TwoTier) isCurrentEpoch(epoch uint64) bool {
 }
 
 // setL2IfCurrent fences loader fills superseded before they acquire the write locks.
+// The local write barrier orders this fill before a successful local write returns, and peers can see the L2 change while the barrier waits.
 func (t *TwoTier) setL2IfCurrent(ctx context.Context, key string, raw []byte, epoch uint64) error {
 	stripe := l2StripeIndex(key)
 	defer t.lockL2Key(stripe)()
