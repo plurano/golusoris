@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -19,31 +20,157 @@ import (
 // TestSetL1IfCurrentCallsAreBounded catches test calls that can stall under mutation.
 func TestSetL1IfCurrentCallsAreBounded(t *testing.T) {
 	t.Parallel()
+	for _, source := range readBoundedWaitTestSources(t) {
+		positions, err := unboundedFillCalls(source.name, source.data)
+		require.NoError(t, err)
+		for _, position := range positions {
+			t.Errorf("cache/twotier: %s: setL1IfCurrent call must be inside a startL2LockOperation worker", position)
+		}
+	}
+}
+
+type boundedWaitTestSource struct {
+	name string
+	data []byte
+}
+
+// readBoundedWaitTestSources includes test files behind build tags in both source checks.
+func readBoundedWaitTestSources(t *testing.T) []boundedWaitTestSource {
+	t.Helper()
 	entries, err := os.ReadDir(".")
 	if err != nil {
 		t.Fatalf("cache/twotier: list test sources: %v", err)
 	}
+	sources := make([]boundedWaitTestSource, 0, len(entries))
 	for _, entry := range entries {
 		name := entry.Name()
 		if entry.IsDir() || !strings.HasSuffix(name, "_test.go") {
 			continue
 		}
-		checkBoundedFillCalls(t, name)
+		data, readErr := os.ReadFile(name)
+		if readErr != nil {
+			t.Fatalf("cache/twotier: read test source %s: %v", name, readErr)
+		}
+		sources = append(sources, boundedWaitTestSource{name: name, data: data})
+	}
+	return sources
+}
+
+// TestL2LockTestsArmWatchdog catches lock regression tests without a synchronous-call deadline.
+func TestL2LockTestsArmWatchdog(t *testing.T) {
+	t.Parallel()
+	positions, err := missingL2LockWatchdogs(readBoundedWaitTestSources(t))
+	require.NoError(t, err)
+	for _, position := range positions {
+		t.Errorf("cache/twotier: %s: lock regression test must start with armL2LockWatchdog after optional t.Parallel()", position)
 	}
 }
 
-// checkBoundedFillCalls reports every unbounded call in a test source.
-func checkBoundedFillCalls(t *testing.T, name string) {
-	t.Helper()
-	src, err := os.ReadFile(name)
+// missingL2LockWatchdogs reports tests that reach a lock worker without arming a watchdog.
+func missingL2LockWatchdogs(sources []boundedWaitTestSource) ([]token.Position, error) {
+	files := token.NewFileSet()
+	decls, err := l2LockTestDecls(files, sources)
 	if err != nil {
-		t.Fatalf("cache/twotier: read test source %s: %v", name, err)
+		return nil, err
 	}
-	positions, scanErr := unboundedFillCalls(name, src)
-	require.NoError(t, scanErr)
-	for _, position := range positions {
-		t.Errorf("cache/twotier: %s: setL1IfCurrent call must be inside a startL2LockOperation worker", position)
+	helpers := l2LockHelpers(decls)
+	var positions []token.Position
+	for _, decl := range decls {
+		if strings.HasPrefix(decl.Name.Name, "Test") && callsL2LockHelper(decl.Body, helpers) && !startsWithL2LockWatchdog(decl.Body.List) {
+			positions = append(positions, files.PositionFor(decl.Pos(), false))
+		}
 	}
+	return positions, nil
+}
+
+// l2LockTestDecls gathers function bodies before resolving calls across test files.
+func l2LockTestDecls(files *token.FileSet, sources []boundedWaitTestSource) ([]*ast.FuncDecl, error) {
+	var decls []*ast.FuncDecl
+	for _, source := range sources {
+		file, err := parser.ParseFile(files, source.name, source.data, parser.SkipObjectResolution)
+		if err != nil {
+			return nil, fmt.Errorf("cache/twotier: parse test source %s: %w", source.name, err)
+		}
+		for _, decl := range file.Decls {
+			if function, ok := decl.(*ast.FuncDecl); ok && function.Body != nil {
+				decls = append(decls, function)
+			}
+		}
+	}
+	return decls, nil
+}
+
+// l2LockHelpers propagates worker reachability until a pass adds no helpers.
+func l2LockHelpers(decls []*ast.FuncDecl) map[string]bool {
+	helpers := map[string]bool{"startL2LockOperation": true}
+	for range decls {
+		added := false
+		for _, decl := range decls {
+			name := decl.Name.Name
+			if helpers[name] || strings.HasPrefix(name, "Test") || !callsL2LockHelper(decl.Body, helpers) {
+				continue
+			}
+			helpers[name] = true
+			added = true
+		}
+		if !added {
+			break
+		}
+	}
+	return helpers
+}
+
+// callsL2LockHelper checks calls inside a function body, including its subtest literals.
+func callsL2LockHelper(body *ast.BlockStmt, helpers map[string]bool) bool {
+	found := false
+	ast.Inspect(body, func(node ast.Node) bool {
+		if call, ok := node.(*ast.CallExpr); ok {
+			switch callee := ast.Unparen(call.Fun).(type) {
+			case *ast.Ident:
+				found = found || helpers[callee.Name]
+			case *ast.SelectorExpr:
+				found = found || helpers[callee.Sel.Name]
+			}
+		}
+		return !found
+	})
+	return found
+}
+
+// startsWithL2LockWatchdog accepts a watchdog call before setup starts.
+func startsWithL2LockWatchdog(statements []ast.Stmt) bool {
+	if len(statements) > 0 && isL2LockParallelCall(statements[0]) {
+		statements = statements[1:]
+	}
+	if len(statements) == 0 {
+		return false
+	}
+	callee := statementCallee(statements[0])
+	name, ok := callee.(*ast.Ident)
+	return ok && name.Name == "armL2LockWatchdog"
+}
+
+// isL2LockParallelCall recognizes the optional leading t.Parallel statement.
+func isL2LockParallelCall(statement ast.Stmt) bool {
+	selector, ok := statementCallee(statement).(*ast.SelectorExpr)
+	if !ok || selector.Sel.Name != "Parallel" {
+		return false
+	}
+	receiver, named := ast.Unparen(selector.X).(*ast.Ident)
+	return named && receiver.Name == "t"
+}
+
+// statementCallee extracts the callee of a standalone call statement.
+func statementCallee(statement ast.Stmt) ast.Expr {
+	expression, ok := statement.(*ast.ExprStmt)
+	if !ok {
+		return nil
+	}
+	call, called := ast.Unparen(expression.X).(*ast.CallExpr)
+	if !called {
+		return nil
+	}
+	return ast.Unparen(call.Fun)
 }
 
 // unboundedFillCalls finds fill calls outside bounded worker literals.
@@ -119,4 +246,75 @@ func test() {
 	cleanPositions, scanErr := unboundedFillCalls("clean_test.go", []byte(clean))
 	require.NoError(t, scanErr)
 	require.Empty(t, cleanPositions)
+}
+
+// TestL2LockTestsArmWatchdogFixtures covers direct and transitive calls across test files.
+func TestL2LockTestsArmWatchdogFixtures(t *testing.T) {
+	t.Parallel()
+	const planted = `package twotier
+func TestPlanted(t *testing.T) {
+	startL2LockOperation(t, nil, run)
+}
+`
+	const helperPlanted = `package twotier
+func TestHelperPlanted(t *testing.T) {
+	helper(t)
+}
+func helper(t *testing.T) {
+	workerHelper(t)
+}
+`
+	const clean = `package twotier
+func TestClean(t *testing.T) {
+	t.Parallel()
+	armL2LockWatchdog(t)
+	startL2LockOperation(t, nil, run)
+}
+func workerHelper(t *testing.T) {
+	startL2LockOperation(t, nil, run)
+}
+`
+	positions, err := missingL2LockWatchdogs([]boundedWaitTestSource{
+		{name: "planted_test.go", data: []byte(planted)},
+		{name: "helper_planted_test.go", data: []byte(helperPlanted)},
+		{name: "clean_test.go", data: []byte(clean)},
+	})
+	require.NoError(t, err)
+	require.Len(t, positions, 2)
+	require.Equal(t, "planted_test.go:2:1", positions[0].String())
+	require.Equal(t, "helper_planted_test.go:2:1", positions[1].String())
+}
+
+// TestL2LockWatchdogExpires verifies that expiry names the blocked test and includes its stacks.
+func TestL2LockWatchdogExpires(t *testing.T) {
+	t.Parallel()
+	t.Run("blocked", func(subtest *testing.T) {
+		subtest.Parallel()
+		expired := make(chan string, 1)
+		armL2LockWatchdogFor(subtest, 10*time.Millisecond, func(message string) { expired <- message })
+		select {
+		case message := <-expired:
+			require.Contains(subtest, message, subtest.Name())
+			require.Contains(subtest, message, "still running after")
+			require.Contains(subtest, message, "goroutine ")
+		case <-time.After(l2LockTimeout):
+			subtest.Fatal("cache/twotier: watchdog did not expire")
+		}
+	})
+}
+
+// TestL2LockWatchdogStopsAtCleanup proves a completed subtest cannot trigger expiry.
+//
+//nolint:tparallel // The parent must observe the subtest after its cleanup finishes.
+func TestL2LockWatchdogStopsAtCleanup(t *testing.T) {
+	t.Parallel()
+	expired := make(chan string, 1)
+	t.Run("completed", func(subtest *testing.T) {
+		armL2LockWatchdogFor(subtest, time.Second, func(message string) { expired <- message })
+	})
+	select {
+	case message := <-expired:
+		t.Fatalf("cache/twotier: watchdog expired after cleanup: %s", message)
+	case <-time.After(1500 * time.Millisecond):
+	}
 }

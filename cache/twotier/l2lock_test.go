@@ -22,6 +22,7 @@ import (
 // TestL2CallDoesNotBlockL1Reads checks warm L1 hits while each L2 write path is stalled.
 func TestL2CallDoesNotBlockL1Reads(t *testing.T) {
 	t.Parallel()
+	armL2LockWatchdog(t)
 	cases := []struct {
 		name    string
 		op      string
@@ -47,8 +48,7 @@ func TestL2CallDoesNotBlockL1Reads(t *testing.T) {
 			ctx := subtest.Context()
 			stub := newStubL2()
 			view := NewTyped[int](newTestTwoTier(subtest, stub), "n")
-			setup := startL2LockOperation(subtest, nil, func() error { return view.Set(ctx, "b", 7) })
-			setup.requireDone(subtest, "setup Set did not finish")
+			requireL2LockSetupSet(subtest, func() error { return view.Set(ctx, "b", 7) })
 			if tc.corrupt {
 				stub.data["n:a"] = []byte("not-json")
 			}
@@ -69,6 +69,7 @@ func TestL2CallDoesNotBlockL1Reads(t *testing.T) {
 // TestLoaderFillOrderedBeforeSameKeySet protects explicit writes against older fills.
 func TestLoaderFillOrderedBeforeSameKeySet(t *testing.T) {
 	t.Parallel()
+	armL2LockWatchdog(t)
 	ctx := t.Context()
 	stub := newStubL2()
 	view := NewTyped[int](newTestTwoTier(t, stub), "n")
@@ -96,6 +97,7 @@ func TestLoaderFillOrderedBeforeSameKeySet(t *testing.T) {
 // TestPrefixInvalidationWaitsForInFlightFill protects prefix deletes against older fills.
 func TestPrefixInvalidationWaitsForInFlightFill(t *testing.T) {
 	t.Parallel()
+	armL2LockWatchdog(t)
 	ctx := t.Context()
 	stub := newStubL2()
 	view := NewTyped[int](newTestTwoTier(t, stub), "n")
@@ -126,6 +128,7 @@ func TestPrefixInvalidationWaitsForInFlightFill(t *testing.T) {
 // TestInFlightSetBlocksStaleL1Install protects reads from an older L2 result while Set commits.
 func TestInFlightSetBlocksStaleL1Install(t *testing.T) {
 	t.Parallel()
+	armL2LockWatchdog(t)
 	ctx := t.Context()
 	stub := newStubL2()
 	stub.data["n:a"] = []byte("1")
@@ -155,6 +158,7 @@ func TestInFlightSetBlocksStaleL1Install(t *testing.T) {
 // TestInFlightDeleteBlocksStaleL1Install protects a peer's newer value during a local Delete.
 func TestInFlightDeleteBlocksStaleL1Install(t *testing.T) {
 	t.Parallel()
+	armL2LockWatchdog(t)
 	ctx := t.Context()
 	stub := newStubL2()
 	stub.data["n:a"] = []byte("1")
@@ -184,6 +188,7 @@ func TestInFlightDeleteBlocksStaleL1Install(t *testing.T) {
 // TestInFlightPrefixDeleteBlocksStaleL1Install verifies that only matching keys are fenced.
 func TestInFlightPrefixDeleteBlocksStaleL1Install(t *testing.T) {
 	t.Parallel()
+	armL2LockWatchdog(t)
 	cases := []struct {
 		name     string
 		prefix   string
@@ -230,6 +235,7 @@ func TestInFlightPrefixDeleteBlocksStaleL1Install(t *testing.T) {
 // TestRefusedEmptyPrefixKeepsCommittedL1 guards a committed value against a stale fill during refusal.
 func TestRefusedEmptyPrefixKeepsCommittedL1(t *testing.T) {
 	t.Parallel()
+	armL2LockWatchdog(t)
 	ctx := t.Context()
 	stub := newStubL2()
 	stub.data["n:a"] = []byte("1")
@@ -237,16 +243,17 @@ func TestRefusedEmptyPrefixKeepsCommittedL1(t *testing.T) {
 	view := NewTyped[int](tiers, "n")
 	epoch0, _, ok := view.l1Snapshot("n:a")
 	require.False(t, ok)
-	require.NoError(t, view.Set(ctx, "a", 2))
+	requireL2LockSetupSet(t, func() error { return view.Set(ctx, "a", 2) })
 	stub.beforeWrite = func(op, key string, _ []byte) {
 		if op == "del-prefix" && key == "" {
 			requireStaleL1InstallDone(t, nil, view, epoch0)
 		}
 	}
 
-	err := tiers.InvalidatePrefix(ctx, "")
-	require.ErrorIs(t, err, errEmptyPrefix)
-	require.EqualError(t, err, `cache/twotier: L2 invalidate prefix "": cache/twotier: refusing to scan-delete an empty prefix`)
+	op := startL2LockOperation(t, nil, func() error { return tiers.InvalidatePrefix(ctx, "") })
+	waitL2LockSignal(t, op.done, "empty prefix invalidation did not finish")
+	require.ErrorIs(t, op.err, errEmptyPrefix)
+	require.EqualError(t, op.err, `cache/twotier: L2 invalidate prefix "": cache/twotier: refusing to scan-delete an empty prefix`)
 	require.Zero(t, stub.delPrefixCalls.Load())
 
 	requireStaleL1InstallDone(t, nil, view, epoch0)
@@ -259,6 +266,7 @@ func TestRefusedEmptyPrefixKeepsCommittedL1(t *testing.T) {
 // TestFencedFillEvictsOlderL1 prevents reads from going back to an older warm value.
 func TestFencedFillEvictsOlderL1(t *testing.T) {
 	t.Parallel()
+	armL2LockWatchdog(t)
 	set := func(ctx context.Context, view *Typed[int]) error { return view.Set(ctx, "a", 2) }
 	cases := [...]struct {
 		name      string
@@ -365,6 +373,7 @@ func checkFencedFillReads(t *testing.T, release func(), view *Typed[int], stub *
 // TestPanickingL2WriteClearsPendingRecord verifies that read-through can backfill L1 after a panic.
 func TestPanickingL2WriteClearsPendingRecord(t *testing.T) {
 	t.Parallel()
+	armL2LockWatchdog(t)
 	cases := []struct {
 		name string
 		op   string
@@ -448,6 +457,7 @@ func requireStaleL1InstallDone(t *testing.T, release func(), view *Typed[int], e
 // TestPeerNoticeDuringSetWriteLeavesNoStaleL1 exercises write-through across peer invalidations.
 func TestPeerNoticeDuringSetWriteLeavesNoStaleL1(t *testing.T) {
 	t.Parallel()
+	armL2LockWatchdog(t)
 	cases := []struct {
 		name       string
 		notice     Invalidation
@@ -497,6 +507,7 @@ func TestPeerNoticeDuringSetWriteLeavesNoStaleL1(t *testing.T) {
 // TestL1OnlySetKeepsL1AcrossPeerNotice checks that a successful Set stays readable from L1.
 func TestL1OnlySetKeepsL1AcrossPeerNotice(t *testing.T) {
 	t.Parallel()
+	armL2LockWatchdog(t)
 	cases := []struct {
 		name   string
 		notice Invalidation
@@ -537,6 +548,7 @@ func TestL1OnlySetKeepsL1AcrossPeerNotice(t *testing.T) {
 // TestL1OnlyFillKeepsCommittedL1DuringWrite guards warm L1 hits against delayed fills.
 func TestL1OnlyFillKeepsCommittedL1DuringWrite(t *testing.T) {
 	t.Parallel()
+	armL2LockWatchdog(t)
 	cases := [...]struct {
 		op  string
 		raw string
@@ -563,7 +575,7 @@ func TestL1OnlyFillKeepsCommittedL1DuringWrite(t *testing.T) {
 			view := NewTyped[int](tiers, "n")
 			epoch0, _, ok := view.l1Snapshot("n:a")
 			require.False(subtest, ok)
-			require.NoError(subtest, view.Set(ctx, "a", 2))
+			requireL2LockSetupSet(subtest, func() error { return view.Set(ctx, "a", 2) })
 
 			write := startL2LockOperation(subtest, release, func() error { return tc.run(ctx, view) })
 			waitL2LockSignal(subtest, entered, "write did not reach the L2 hook")
@@ -659,6 +671,33 @@ func blockL2WriteForKey(t *testing.T, operation, target, raw string) (<-chan str
 
 const l2LockTimeout = 2 * time.Second
 
+// l2LockTestDeadline leaves room above the 2 s worker bound and below the 4 m package timeout.
+const l2LockTestDeadline = 90 * time.Second
+
+// armL2LockWatchdog bounds synchronous lock calls and covers the test's subtests.
+func armL2LockWatchdog(t *testing.T) {
+	t.Helper()
+	armL2LockWatchdogFor(t, l2LockTestDeadline, panicL2LockWatchdog)
+}
+
+// armL2LockWatchdogFor captures all goroutine stacks when a test outlives its deadline.
+func armL2LockWatchdogFor(t *testing.T, deadline time.Duration, expire func(string)) {
+	t.Helper()
+	name := t.Name()
+	timer := time.AfterFunc(deadline, func() {
+		stack := make([]byte, 1<<20)
+		size := runtime.Stack(stack, true)
+		expire(fmt.Sprintf("cache/twotier: %s still running after %s: a synchronous call is blocked on mutation\n%s",
+			name, deadline, stack[:size]))
+	})
+	t.Cleanup(func() { timer.Stop() })
+}
+
+// panicL2LockWatchdog ends the test binary when a synchronous mutex wait cannot be interrupted.
+func panicL2LockWatchdog(message string) {
+	panic(message)
+}
+
 type l2LockOperation struct {
 	done        chan struct{}
 	stackPrefix string
@@ -687,6 +726,13 @@ func startL2LockOperation(t *testing.T, release func(), run func() error) *l2Loc
 	})
 	waitL2LockSignal(t, started, "operation goroutine did not start")
 	return op
+}
+
+// requireL2LockSetupSet keeps a stalled setup Set within the operation timeout.
+func requireL2LockSetupSet(t *testing.T, run func() error) {
+	t.Helper()
+	setup := startL2LockOperation(t, nil, run)
+	setup.requireDone(t, "setup Set did not finish")
 }
 
 // requireDone synchronizes with the operation before reading its error.

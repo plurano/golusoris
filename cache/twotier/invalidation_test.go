@@ -104,6 +104,7 @@ func TestInvalidation_SetMakesPeerReadNewValue(t *testing.T) {
 // TestInvalidation_PeerSetDuringLocalSetLeavesNoStaleL1 checks the shared-L2 Set fence through pubsub.
 func TestInvalidation_PeerSetDuringLocalSetLeavesNoStaleL1(t *testing.T) {
 	t.Parallel()
+	armL2LockWatchdog(t)
 	ctx := t.Context()
 	a, b, shared := newPeers(t)
 	aView := NewTyped[int](a, "n")
