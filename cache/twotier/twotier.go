@@ -192,6 +192,7 @@ func (t *Typed[V]) setL1(key string, value V) {
 }
 
 // setL1IfCurrent evicts a fenced key only with shared L2 because L1-only reads cannot see early L2 values.
+// Because the epoch is store-wide, eviction comes before its check and can cost one reload of a newer committed L1 value without installing a stale fill.
 func (t *Typed[V]) setL1IfCurrent(key string, value V, epoch uint64) {
 	t.tt.mutation.Lock()
 	defer t.tt.mutation.Unlock()

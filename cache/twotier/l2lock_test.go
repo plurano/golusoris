@@ -322,11 +322,106 @@ func TestFencedFillEvictsOlderL1(t *testing.T) {
 	}
 }
 
+// TestFencedFillEvictsNewerCommittedL1 pins review r10 F1, where a fenced fill evicts a newer commit and forces a reload without installing the old value.
+func TestFencedFillEvictsNewerCommittedL1(t *testing.T) {
+	t.Parallel()
+	armL2LockWatchdog(t)
+	ctx := t.Context()
+	stub := newStubL2()
+	stub.data["n:a"] = []byte("1")
+	stub.data["n:c"] = []byte("7")
+	view := NewTyped[int](newTestTwoTier(t, stub), "n")
+	missEpoch := warmFencedFillKeys(t, view)
+
+	requireL2LockSetupSet(t, func() error { return view.Set(ctx, "a", 2) })
+	committedEpoch, committed, present := snapshotL2LockTestKey(t, nil, view, "n:a")
+	require.True(t, present)
+	require.Equal(t, 2, committed)
+	require.NotEqual(t, missEpoch, committedEpoch)
+	expire := startL2LockOperation(t, nil, func() error {
+		stub.mu.Lock()
+		defer stub.mu.Unlock()
+		delete(stub.data, "n:a")
+		return nil
+	})
+	expire.requireDone(t, "L2 expiry did not finish")
+
+	entered, release, hook := blockL2Write(t, "set", "3")
+	stub.beforeWrite = hook
+	set := startL2LockOperation(t, release, func() error { return view.Set(ctx, "a", 3) })
+	waitL2LockSignal(t, entered, "later Set did not enter L2")
+	requireStaleL1InstallDone(t, release, view, missEpoch)
+	_, cached, kept := snapshotL2LockTestKey(t, release, view, "n:a")
+	require.False(t, kept, "fenced fill must evict a, found %d in L1", cached)
+	_, other, otherPresent := snapshotL2LockTestKey(t, release, view, "n:c")
+	require.True(t, otherPresent, "unrelated key must stay warm in L1")
+	require.Equal(t, 7, other)
+
+	gets := stub.getCalls.Load()
+	var loads atomic.Int32
+	loaded := make(chan struct{}, 1)
+	reload := startL2LockOperation(t, release, func() error {
+		value, err := view.Get(ctx, "a", func(context.Context) (int, error) {
+			if loads.Add(1) == 1 {
+				loaded <- struct{}{}
+			}
+			return 1, nil
+		})
+		return checkL2LockTestValue(value, err, 1)
+	})
+	waitL2LockSignal(t, loaded, "read after eviction did not reach the loader")
+	require.Equal(t, gets+1, stub.getCalls.Load())
+	require.EqualValues(t, 1, loads.Load())
+
+	release()
+	set.requireDone(t, "later Set did not finish after release")
+	reload.requireDone(t, "read after eviction did not finish after release")
+	require.Equal(t, gets+1, stub.getCalls.Load())
+	require.EqualValues(t, 1, loads.Load())
+	checkFencedReloadCommit(t, view, stub)
+}
+
+// snapshotL2LockTestKey bounds the read of the epoch and L1 value under mutation.
+func snapshotL2LockTestKey(t *testing.T, release func(), view *Typed[int], key string) (uint64, int, bool) {
+	t.Helper()
+	var epoch uint64
+	var value int
+	var present bool
+	snapshot := startL2LockOperation(t, release, func() error {
+		epoch, value, present = view.l1Snapshot(key)
+		return nil
+	})
+	snapshot.requireDone(t, "L1 snapshot did not finish")
+	return epoch, value, present
+}
+
+// checkFencedReloadCommit verifies the overlapping reload leaves the later Set in both tiers.
+func checkFencedReloadCommit(t *testing.T, view *Typed[int], stub *stubL2) {
+	t.Helper()
+	_, cached, present := snapshotL2LockTestKey(t, nil, view, "n:a")
+	require.True(t, present)
+	require.Equal(t, 3, cached)
+	var raw string
+	snapshot := startL2LockOperation(t, nil, func() error {
+		stub.mu.Lock()
+		defer stub.mu.Unlock()
+		raw = string(stub.data["n:a"])
+		return nil
+	})
+	snapshot.requireDone(t, "L2 snapshot did not finish")
+	require.Equal(t, "3", raw)
+	gets := stub.getCalls.Load()
+	ctx := t.Context()
+	read := startL2LockOperation(t, nil, func() error { return readCachedL2LockTestKey(ctx, view, "a", 3) })
+	read.requireDone(t, "read after later Set did not finish")
+	require.Equal(t, gets, stub.getCalls.Load(), "read after later Set reached L2")
+}
+
 // warmFencedFillKeys preserves the miss epoch so the delayed fill can replay it.
 func warmFencedFillKeys(t *testing.T, view *Typed[int]) uint64 {
 	t.Helper()
 	ctx := t.Context()
-	epoch, _, ok := view.l1Snapshot("n:a")
+	epoch, _, ok := snapshotL2LockTestKey(t, nil, view, "n:a")
 	require.False(t, ok)
 	first := startL2LockOperation(t, nil, func() error { return fillL2LockTestKey(ctx, view) })
 	first.requireDone(t, "warm read of a did not finish")
@@ -335,7 +430,7 @@ func warmFencedFillKeys(t *testing.T, view *Typed[int]) uint64 {
 		return checkL2LockTestValue(value, err, 7)
 	})
 	other.requireDone(t, "warm read of c did not finish")
-	warmEpoch, cached, present := view.l1Snapshot("n:a")
+	warmEpoch, cached, present := snapshotL2LockTestKey(t, nil, view, "n:a")
 	require.True(t, present)
 	require.Equal(t, 1, cached)
 	require.Equal(t, epoch, warmEpoch)

@@ -60,6 +60,7 @@ func (s *UserService) Load(ctx context.Context, id string) (*User, error) {
 - L2 key writes hold shared `l2Prefix` gate + key stripe. L2 prefix deletes hold gate exclusively. L2 reads take neither lock.
 - Lock order: `l2Prefix` -> key stripe -> `mutation`.
 - Pending Set or Delete fences shared-L2 read-through fills for its key. Pending prefix delete fences shared-L2 fills under its prefix. Shared-L2 fenced fill -> evict its key from L1. L1-only fill -> check epoch only. L1-only Set always publishes to L1. Shared-L2 Set publishes unless a peer notice for its key or a covering prefix arrives during its L2 write.
+- Shared-L2 fenced fill after newer L1 commit (Get read -> Set commit -> L2 expiry -> later Set pending) -> evict key. Cost = one extra L2 read or loader call, same as L1 capacity or TTL eviction. Fill installs nothing -> no stale L1 value after commit.
 - Empty prefix -> refused before fence; no L1 eviction.
 
 ## Prefix invalidation
