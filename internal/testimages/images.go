@@ -20,9 +20,9 @@ const (
 	// Pgvector is the PostgreSQL 18 image with the pgvector extension for ai/vector tests.
 	Pgvector = "pgvector/pgvector:0.8.7-pg18-trixie@sha256:ab49524d18df7200b74ac9a475e1db6297fc1eb57da4c214c63d10ecc4b754fa"
 	// Timescale is the PostgreSQL 17 TimescaleDB integration-test image.
-	Timescale = "timescale/timescaledb:2.31.0-pg17@sha256:b56a3f51991df1f79d0c1a0841cad5c5fa8058fdd6a3ee6886394a6d4c174538"
+	Timescale = "timescale/timescaledb:2.32.0-pg17@sha256:6a6b7d7a346d7c6be03a310c240706f3bbc6d7adbdf3fbc07823570b34337f5e"
 	// TimescaleApache is the Apache-2.0-only (OSS) build of the same TimescaleDB release.
-	TimescaleApache = "timescale/timescaledb:2.31.0-pg17-oss@sha256:668ee2d521ed472045f74c9e16f01318ab73120754ff8ba4cf1d76f00a26307a"
+	TimescaleApache = "timescale/timescaledb:2.32.0-pg17-oss@sha256:c9ad81cd4f28fcf3dc8667ec3daf0b08e24de123cd884c3a1bb9e79fbd8439e7"
 	// Redis is the default Redis integration-test image.
 	Redis = "redis:8-alpine@sha256:7958cfbb9d152f87dadfbc89f1b0b15938f0b81ff8982feb327476f4911935c3"
 	// Dragonfly is the Redis-compatible Dragonfly integration-test image.
@@ -32,13 +32,13 @@ const (
 	// ClickHouse is the default ClickHouse integration-test image.
 	ClickHouse = "clickhouse/clickhouse-server:24@sha256:2113951827761e37c386b37f716dbdf8522b9172488a44b97a96fe6059e172a8"
 	// Redpanda is the Kafka-compatible integration-test image.
-	Redpanda = "redpandadata/redpanda:v26.2.6@sha256:8b1076e0d61bfceb66594dc01536427ce0b529f8ead35fdab9763ab6085891ce"
+	Redpanda = "redpandadata/redpanda:v26.2.7@sha256:43545ee03966431f5451e0b3c1e651b39fbe3eb383360220311021f50133b649"
 	// VersityGW is the S3-compatible gateway that enforces SigV4 for storage tests.
 	VersityGW = "versity/versitygw:v1.11.0@sha256:8319a530d08d537426e2f855bae5280709795dc73a3f0c347973ef915d6343c5"
 	// FakeGCSServer is the GCS emulator for the storage/gcs module tests.
 	FakeGCSServer = "fsouza/fake-gcs-server:1.56.1@sha256:797ce226d62f947c009dc40246b30cfb456b8473d8241407f9d6f2c04e4d69ef"
 	// Azurite is the Azure Storage emulator for the storage/azblob module tests.
-	Azurite = "mcr.microsoft.com/azure-storage/azurite:3.37.0@sha256:830430c1da1a2d537e08f3e6764dd1f5ae00cf0346bcaf625b968ec3f0971fd5"
+	Azurite = "mcr.microsoft.com/azure-storage/azurite:3.38.0@sha256:c26024d62bf4a5b88a40968afd217234c00e1fc9a4790dc6105d1ca7979f6eec"
 	// Ryuk is the testcontainers resource-reaper image.
 	Ryuk = "testcontainers/ryuk:0.14.0@sha256:7c1a8a9a47c780ed0f983770a662f80deb115d95cce3e2daa3d12115b8cd28f0"
 	// ClamAV is the malware-scanner image; it ships its signatures, so clamd starts offline.
@@ -46,7 +46,7 @@ const (
 	// PubSubEmulator is the Google Cloud Pub/Sub emulator integration-test image.
 	PubSubEmulator = "gcr.io/google.com/cloudsdktool/google-cloud-cli:588.0.0-emulators@sha256:be2f0e582a94c9e06e7a384fe2b3b39d590eeb8da65a110eda991598c100fe80"
 	// Mailpit is the SMTP server and API emulator image for notify tests.
-	Mailpit = "axllent/mailpit:v1.32.0@sha256:0790692be935ea4420d085694f7985b1f692ca6a8771ab0e0bd8ba75ac180498"
+	Mailpit = "axllent/mailpit:v1.34.0@sha256:23a2ef85bc50853ab3093645d1d64679afd8887e89da5e48a88940c172591a4e"
 	// StripeMock is the Stripe API emulator image for payments/stripe integration tests.
 	StripeMock = "stripe/stripe-mock:v0.206.0@sha256:aeb96b83e87a893d2ac005e363ac01ffa6e59a5ad85b49c155dfc9129de02e78"
 	// Bugsink is the Sentry-compatible error reporting server image for observability tests.
