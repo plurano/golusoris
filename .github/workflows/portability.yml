@@ -49,7 +49,7 @@ jobs:
             runner: windows-2025
     steps: &portability-steps
       - name: Stop on a draft pull request
-        uses: golusoris/golusoris/.github/actions/stop-on-draft@e601567f4e1acb72525f361f80dac6d89cbad553 # #1212
+        uses: plurano/golusoris/.github/actions/stop-on-draft@e601567f4e1acb72525f361f80dac6d89cbad553 # #1212
       - name: Checkout source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -82,6 +82,11 @@ jobs:
         env:
           PYTHON: python
         run: bash scripts/ci/release-depth-evidence_test.sh
+      - name: Vacuum installer policy on this platform
+        # The spectral jobs take any runs-on; this leg proves the cache key and install paths on macOS bash 3.2 and Git Bash too.
+        if: env.CI_GATED != 'skip'
+        shell: bash
+        run: bash scripts/ci/install-vacuum_test.sh
       - name: Install cgo system libraries on Linux
         # hw/udev links libudev; media/3d links OpenAL, Vorbis, GL and X11 (go-gl/glfw).
         if: runner.os == 'Linux' && env.CI_GATED != 'skip'

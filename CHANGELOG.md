@@ -15,6 +15,40 @@ Release Please generates this file from Conventional Commits. User-visible
 changes and migration notes therefore belong in release-visible commit
 messages; the release pull request remains the single changelog authority.
 
+## [0.22.4](https://github.com/plurano/golusoris/compare/v0.22.3...v0.22.4) (2026-11-23)
+
+
+### Bug Fixes
+
+* **agents:** add the missing blank line under the persona command heading ([#1586](https://github.com/plurano/golusoris/issues/1586)) ([aa609dc](https://github.com/plurano/golusoris/commit/aa609dc50211740800d3b32b7240734ee7f8da96))
+* **cache/singleflight:** join the running callback when a canceled caller leaves ([#1591](https://github.com/plurano/golusoris/issues/1591)) ([223b791](https://github.com/plurano/golusoris/commit/223b7917c5d86f77d2ace6b946afb922070b6619)), closes [#1590](https://github.com/plurano/golusoris/issues/1590)
+* **ci:** hold the pipe test's grandchild until the test releases it ([#1574](https://github.com/plurano/golusoris/issues/1574)) ([4a1a87e](https://github.com/plurano/golusoris/commit/4a1a87e7aa87daf86c1529d4e29865f3ba309657))
+* **ci:** retry module downloads before the portability phases ([#1577](https://github.com/plurano/golusoris/issues/1577)) ([37261a3](https://github.com/plurano/golusoris/commit/37261a353df91a9474b1e37f583bd87c5dffa6a0))
+* **ci:** scope the recovered-fault scan to the pull request diff ([#1583](https://github.com/plurano/golusoris/issues/1583)) ([b1b630d](https://github.com/plurano/golusoris/commit/b1b630d65e53836bd0962291aecae7f2257d38c1)), closes [#839](https://github.com/plurano/golusoris/issues/839)
+* **deps:** update aws-sdk-go-v2 monorepo ([#1483](https://github.com/plurano/golusoris/issues/1483)) ([613ec2a](https://github.com/plurano/golusoris/commit/613ec2aa6bd891609457c0f30797c84c875154f8))
+* **deps:** update azure-sdk-for-go monorepo ([#1522](https://github.com/plurano/golusoris/issues/1522)) ([7016bcc](https://github.com/plurano/golusoris/commit/7016bccb793f67cb0c239654b9807f24d60ef17b))
+* **deps:** update golang.org/x/exp digest to b15d094 ([#1468](https://github.com/plurano/golusoris/issues/1468)) ([fff3dec](https://github.com/plurano/golusoris/commit/fff3decc7f08129df5c0534e03005e191aa91851))
+* **deps:** update module github.com/clickhouse/clickhouse-go/v2 to v2.51.0 ([#1525](https://github.com/plurano/golusoris/issues/1525)) ([61d7390](https://github.com/plurano/golusoris/commit/61d739076346efc840538dee45f7a0be8c7686d1))
+* **deps:** update module github.com/go-openapi/runtime to v0.33.5 ([#1488](https://github.com/plurano/golusoris/issues/1488)) ([5e8fd00](https://github.com/plurano/golusoris/commit/5e8fd00d1197d64272cc72620a73d5a9538faf2f))
+* **deps:** update module github.com/jackc/pgx/v5 to v5.13.0 ([#1532](https://github.com/plurano/golusoris/issues/1532)) ([7dca0c4](https://github.com/plurano/golusoris/commit/7dca0c4556738d6caa0b551f251b322fc5e2cbb1))
+* **deps:** update module github.com/redis/rueidis to v1.0.80 ([#1497](https://github.com/plurano/golusoris/issues/1497)) ([938cfca](https://github.com/plurano/golusoris/commit/938cfca2c61006753ca88d0ba859986a9e65d68a))
+* **deps:** update module github.com/sigstore/sigstore to v1.11.3 ([#1498](https://github.com/plurano/golusoris/issues/1498)) ([7760827](https://github.com/plurano/golusoris/commit/7760827001227aaf4b69361a34095ab35f42f5a7))
+* **renovate:** tidy every module that replaces the root after a Go update ([#1576](https://github.com/plurano/golusoris/issues/1576)) ([c3f998b](https://github.com/plurano/golusoris/commit/c3f998ba51a41ab4ef6d1ab592a4d1d0ad584b2a))
+* **skills:** restore finishing-a-development-branch and check SKILL.md frontmatter ([6702270](https://github.com/plurano/golusoris/commit/670227076821cc1402a18f4d31e21e34e622fddf)), closes [#1578](https://github.com/plurano/golusoris/issues/1578)
+
+## [0.22.3](https://github.com/plurano/golusoris/compare/v0.22.2...v0.22.3) (2026-11-21)
+
+
+### Bug Fixes
+
+* **ci:** ignore the parser binary and fail on new build output ([#1470](https://github.com/plurano/golusoris/issues/1470)) ([220cc46](https://github.com/plurano/golusoris/commit/220cc463e9126582c7105d57d3b18cea2088291b)), closes [#1456](https://github.com/plurano/golusoris/issues/1456)
+* **ci:** let a late release pull request run pass with a notice ([#1562](https://github.com/plurano/golusoris/issues/1562)) ([604bda3](https://github.com/plurano/golusoris/commit/604bda3a2997f9347f3be7f58359109bbd7fb57f))
+
+
+### Code Refactoring
+
+* **ci:** fold seven scripts/ci clone groups ([#1567](https://github.com/plurano/golusoris/issues/1567)) ([3439985](https://github.com/plurano/golusoris/commit/343998550b3de39b0b00685723138f611495024b))
+
 ## [0.22.2](https://github.com/golusoris/golusoris/compare/v0.22.1...v0.22.2) (2026-11-17)
 
 
