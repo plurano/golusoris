@@ -4,10 +4,10 @@ SPDX-FileCopyrightText: 2026 lusoris <lusoris@pm.me>
 SPDX-License-Identifier: CC-BY-SA-4.0
 -->
 
-# redis/rueidis — v1.0.79 snapshot
+# redis/rueidis — v1.0.80 snapshot
 
-Pinned: **v1.0.79**
-Source: [tagged source](https://github.com/redis/rueidis/tree/v1.0.79)
+Pinned: **v1.0.80**
+Source: [tagged source](https://github.com/redis/rueidis/tree/v1.0.80)
 
 ## Client construction
 
