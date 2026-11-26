@@ -102,6 +102,7 @@ type TwoTier struct {
 	l2Prefix         sync.RWMutex
 	mutation         sync.RWMutex
 	epoch            uint64
+	notices          uint64
 	group            *singleflight.Group[flightKey, []byte]
 	origin           string
 	broadcaster      Broadcaster
@@ -279,9 +280,9 @@ func (t *TwoTier) deleteL2IfCurrent(ctx context.Context, key string, epoch uint6
 	return nil
 }
 
-// Set writes v to both tiers (write-through) and tells peers to evict k. On a
-// disabled cache it is a no-op. An error wrapping [ErrBroadcast] means both
-// local tiers hold v but peers were not told.
+// Set writes v to L2, caches it in L1 if no peer notice arrives during the write,
+// and tells peers to evict k. A disabled cache is a no-op. An error wrapping
+// [ErrBroadcast] means the local write succeeded but peers were not told.
 func (t *Typed[V]) Set(ctx context.Context, k string, v V) error {
 	if t.tt == nil {
 		return nil
@@ -297,17 +298,25 @@ func (t *Typed[V]) Set(ctx context.Context, k string, v V) error {
 	return t.tt.broadcast(ctx, InvalidationKey, key)
 }
 
-// setBoth commits the new L1 value and epoch only after L2 accepts the write.
+// setBoth advances the epoch and updates L1 only after L2 accepts the write.
 func (t *Typed[V]) setBoth(ctx context.Context, key string, raw []byte, value V) error {
 	unlock := t.tt.lockL2Key(key)
 	defer unlock()
+	t.tt.mutation.RLock()
+	notices := t.tt.notices
+	t.tt.mutation.RUnlock()
 	if serr := t.tt.l2.Set(ctx, key, raw, t.tt.l2TTL); serr != nil {
 		return fmt.Errorf("cache/twotier: L2 set: %w", serr)
 	}
 	t.tt.mutation.Lock()
 	defer t.tt.mutation.Unlock()
 	t.tt.epoch++
-	t.setL1(key, value)
+	// A peer notice can signal a newer L2 value, so force the next read through L2.
+	if t.tt.notices == notices {
+		t.setL1(key, value)
+	} else {
+		t.tt.l1.Invalidate(key)
+	}
 	return nil
 }
 
@@ -433,9 +442,11 @@ func (t *TwoTier) applyInvalidation(inv Invalidation) {
 	switch inv.Kind {
 	case InvalidationKey:
 		t.epoch++
+		t.notices++
 		t.l1.Invalidate(inv.Key)
 	case InvalidationPrefix:
 		t.epoch++
+		t.notices++
 		t.evictL1Prefix(inv.Key)
 	default:
 		t.logger.Warn("cache/twotier: ignore unknown invalidation kind", slog.String("kind", string(inv.Kind)))

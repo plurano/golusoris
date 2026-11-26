@@ -32,6 +32,7 @@ type stubL2 struct {
 	failDel        bool
 	failDelPrefix  bool
 	beforeWrite    func(op, key string, val []byte)
+	afterWrite     func(op, key string, val []byte)
 }
 
 func newStubL2() *stubL2 { return &stubL2{data: make(map[string][]byte)} }
@@ -49,7 +50,7 @@ func (s *stubL2) Get(_ context.Context, key string) ([]byte, bool, error) {
 	return v, ok, nil
 }
 
-// Set allows the write hook to pause before the stub changes state.
+// Set lets tests pause on either side of the stub data change.
 func (s *stubL2) Set(_ context.Context, key string, val []byte, _ time.Duration) error {
 	s.setCalls.Add(1)
 	if s.failSet {
@@ -59,8 +60,11 @@ func (s *stubL2) Set(_ context.Context, key string, val []byte, _ time.Duration)
 		s.beforeWrite("set", key, val)
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.data[key] = val
+	s.mu.Unlock()
+	if s.afterWrite != nil {
+		s.afterWrite("set", key, val)
+	}
 	return nil
 }
 
@@ -74,8 +78,11 @@ func (s *stubL2) Del(_ context.Context, key string) error {
 		s.beforeWrite("del", key, nil)
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	delete(s.data, key)
+	s.mu.Unlock()
+	if s.afterWrite != nil {
+		s.afterWrite("del", key, nil)
+	}
 	return nil
 }
 
@@ -89,11 +96,14 @@ func (s *stubL2) DelPrefix(_ context.Context, prefix string) error {
 		s.beforeWrite("del-prefix", prefix, nil)
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	for k := range s.data {
 		if strings.HasPrefix(k, prefix) {
 			delete(s.data, k)
 		}
+	}
+	s.mu.Unlock()
+	if s.afterWrite != nil {
+		s.afterWrite("del-prefix", prefix, nil)
 	}
 	return nil
 }
