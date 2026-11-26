@@ -242,9 +242,10 @@ func viewPrefixIsolation(t *testing.T, tt *TwoTier) {
 	require.Equal(t, [2]int{1, 2}, [2]int{va, vb})
 }
 
+// TestL1Only_RefusesEmptyComposedPrefix checks that L1-only callers get the same refusal.
 func TestL1Only_RefusesEmptyComposedPrefix(t *testing.T) {
 	t.Parallel()
-	require.Error(t, newL1OnlyTwoTier(t).InvalidatePrefix(context.Background(), ""))
+	require.ErrorIs(t, newL1OnlyTwoTier(t).InvalidatePrefix(context.Background(), ""), errEmptyPrefix)
 }
 
 func TestL1Only_ExpiresWithL1TTL(t *testing.T) {

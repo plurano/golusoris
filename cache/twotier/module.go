@@ -33,6 +33,9 @@ const (
 // defaultBroadcastTimeout bounds one invalidation publish.
 const defaultBroadcastTimeout = 2 * time.Second
 
+// errEmptyPrefix keeps empty-prefix refusals identifiable across tiers.
+var errEmptyPrefix = errors.New("cache/twotier: refusing to scan-delete an empty prefix")
+
 // Options tunes the two-tier cache.
 //
 // Config key prefix: cache.twotier.*
@@ -100,7 +103,7 @@ func (noneL2) Del(context.Context, string) error                        { return
 // DelPrefix refuses an empty prefix exactly like the Redis tier.
 func (noneL2) DelPrefix(_ context.Context, prefix string) error {
 	if prefix == "" {
-		return errors.New("cache/twotier: refusing to scan-delete an empty prefix")
+		return errEmptyPrefix
 	}
 	return nil
 }
@@ -176,7 +179,7 @@ func runBoundedScan(maxRounds int, fn scanRoundFunc) error {
 // keyspace, which is never what a typed view wants.
 func (r redisL2) DelPrefix(ctx context.Context, prefix string) error {
 	if prefix == "" {
-		return errors.New("cache/twotier: refusing to scan-delete an empty prefix")
+		return errEmptyPrefix
 	}
 	seen := make(map[string]struct{})
 	for _, node := range r.client.Nodes() {

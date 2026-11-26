@@ -436,6 +436,10 @@ func (t *TwoTier) InvalidatePrefix(ctx context.Context, prefix string) error {
 
 // invalidatePrefixBoth fences matching L1 fills during L2 deletion and evicts L1 only on success.
 func (t *TwoTier) invalidatePrefixBoth(ctx context.Context, prefix string) error {
+	// A refused prefix delete must not fence fills.
+	if prefix == "" {
+		return fmt.Errorf("cache/twotier: L2 invalidate prefix %q: %w", prefix, errEmptyPrefix)
+	}
 	t.l2Prefix.Lock()
 	defer t.l2Prefix.Unlock()
 	committed := false

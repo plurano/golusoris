@@ -167,9 +167,7 @@ func TestInFlightDeleteBlocksStaleL1Install(t *testing.T) {
 	stub.afterWrite = hook
 	deleted := startL2LockOperation(t, release, func() error { return view.Delete(ctx, "a") })
 	waitL2LockSignal(t, entered, "Delete did not remove the L2 value")
-	stub.mu.Lock()
-	stub.data["n:a"] = []byte("2")
-	stub.mu.Unlock()
+	writePeerL2Value(t, stub, "n:a", "2")
 
 	first := startL2LockOperation(t, release, func() error { return readCachedL2LockTestKey(ctx, view, "a", 2) })
 	first.requireDone(t, "read during Delete did not finish")
@@ -209,9 +207,7 @@ func TestInFlightPrefixDeleteBlocksStaleL1Install(t *testing.T) {
 			stub.afterWrite = hook
 			deleted := startL2LockOperation(subtest, release, func() error { return view.InvalidatePrefix(ctx, tc.prefix) })
 			waitL2LockSignal(subtest, entered, "prefix delete did not finish its L2 write")
-			stub.mu.Lock()
-			stub.data["n:a"] = []byte("2")
-			stub.mu.Unlock()
+			writePeerL2Value(subtest, stub, "n:a", "2")
 
 			first := startL2LockOperation(subtest, release, func() error { return readCachedL2LockTestKey(ctx, view, "a", 2) })
 			first.requireDone(subtest, "read during prefix delete did not finish")
@@ -229,6 +225,35 @@ func TestInFlightPrefixDeleteBlocksStaleL1Install(t *testing.T) {
 			last.requireDone(subtest, "read after prefix delete did not finish")
 		})
 	}
+}
+
+// TestRefusedEmptyPrefixKeepsCommittedL1 guards a committed value against a stale fill during refusal.
+func TestRefusedEmptyPrefixKeepsCommittedL1(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	stub := newStubL2()
+	stub.data["n:a"] = []byte("1")
+	tiers := newTestTwoTier(t, stub)
+	view := NewTyped[int](tiers, "n")
+	epoch0, _, ok := view.l1Snapshot("n:a")
+	require.False(t, ok)
+	require.NoError(t, view.Set(ctx, "a", 2))
+	stub.beforeWrite = func(op, key string, _ []byte) {
+		if op == "del-prefix" && key == "" {
+			view.setL1IfCurrent("n:a", 1, epoch0)
+		}
+	}
+
+	err := tiers.InvalidatePrefix(ctx, "")
+	require.ErrorIs(t, err, errEmptyPrefix)
+	require.EqualError(t, err, `cache/twotier: L2 invalidate prefix "": cache/twotier: refusing to scan-delete an empty prefix`)
+	require.Zero(t, stub.delPrefixCalls.Load())
+
+	view.setL1IfCurrent("n:a", 1, epoch0)
+	gets := stub.getCalls.Load()
+	read := startL2LockOperation(t, nil, func() error { return readCachedL2LockTestKey(ctx, view, "a", 2) })
+	read.requireDone(t, "read after prefix refusal did not finish")
+	require.Equal(t, gets, stub.getCalls.Load(), "read after prefix refusal reached L2")
 }
 
 // TestFencedFillEvictsOlderL1 prevents reads from going back to an older warm value.
@@ -268,9 +293,7 @@ func TestFencedFillEvictsOlderL1(t *testing.T) {
 			write := startL2LockOperation(subtest, release, func() error { return tc.run(ctx, view) })
 			waitL2LockSignal(subtest, entered, "write did not reach L2")
 			if tc.peerWrite {
-				stub.mu.Lock()
-				stub.data["n:a"] = []byte("2")
-				stub.mu.Unlock()
+				writePeerL2Value(subtest, stub, "n:a", "2")
 			}
 			if tc.moveEpoch {
 				moveFencedFillEpoch(subtest, release, view, epoch)
@@ -398,6 +421,18 @@ func TestPanickingL2WriteClearsPendingRecord(t *testing.T) {
 			require.EqualValues(subtest, 1, loads, "second read after panic reached the loader")
 		})
 	}
+}
+
+// writePeerL2Value bounds the peer's wait for the stub mutex during a paused write.
+func writePeerL2Value(t *testing.T, stub *stubL2, key, raw string) {
+	t.Helper()
+	write := startL2LockOperation(t, nil, func() error {
+		stub.mu.Lock()
+		defer stub.mu.Unlock()
+		stub.data[key] = []byte(raw)
+		return nil
+	})
+	write.requireDone(t, "peer L2 write stalled behind the local L2 write")
 }
 
 // requireStaleL1InstallDone bounds the stale install attempt while the L2 write is paused.
