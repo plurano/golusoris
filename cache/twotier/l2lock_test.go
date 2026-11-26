@@ -240,7 +240,7 @@ func TestRefusedEmptyPrefixKeepsCommittedL1(t *testing.T) {
 	require.NoError(t, view.Set(ctx, "a", 2))
 	stub.beforeWrite = func(op, key string, _ []byte) {
 		if op == "del-prefix" && key == "" {
-			view.setL1IfCurrent("n:a", 1, epoch0)
+			requireStaleL1InstallDone(t, nil, view, epoch0)
 		}
 	}
 
@@ -249,7 +249,7 @@ func TestRefusedEmptyPrefixKeepsCommittedL1(t *testing.T) {
 	require.EqualError(t, err, `cache/twotier: L2 invalidate prefix "": cache/twotier: refusing to scan-delete an empty prefix`)
 	require.Zero(t, stub.delPrefixCalls.Load())
 
-	view.setL1IfCurrent("n:a", 1, epoch0)
+	requireStaleL1InstallDone(t, nil, view, epoch0)
 	gets := stub.getCalls.Load()
 	read := startL2LockOperation(t, nil, func() error { return readCachedL2LockTestKey(ctx, view, "a", 2) })
 	read.requireDone(t, "read after prefix refusal did not finish")
@@ -534,6 +534,64 @@ func TestL1OnlySetKeepsL1AcrossPeerNotice(t *testing.T) {
 	}
 }
 
+// TestL1OnlyFillKeepsCommittedL1DuringWrite guards warm L1 hits against delayed fills.
+func TestL1OnlyFillKeepsCommittedL1DuringWrite(t *testing.T) {
+	t.Parallel()
+	cases := [...]struct {
+		op  string
+		raw string
+		run func(context.Context, *Typed[int]) error
+	}{
+		{op: "set", raw: "3", run: func(ctx context.Context, view *Typed[int]) error {
+			return view.Set(ctx, "a", 3)
+		}},
+		{op: "del", run: func(ctx context.Context, view *Typed[int]) error {
+			return view.Delete(ctx, "a")
+		}},
+		{op: "del-prefix", run: func(ctx context.Context, view *Typed[int]) error {
+			return view.InvalidatePrefix(ctx, "a")
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.op, func(subtest *testing.T) {
+			subtest.Parallel()
+			ctx := subtest.Context()
+			entered, release, hook := blockL2Write(subtest, tc.op, tc.raw)
+			stub := &hookedNoneL2{afterWrite: hook}
+			tiers := newTestTwoTier(subtest, stub)
+			tiers.l1Only = true
+			view := NewTyped[int](tiers, "n")
+			epoch0, _, ok := view.l1Snapshot("n:a")
+			require.False(subtest, ok)
+			require.NoError(subtest, view.Set(ctx, "a", 2))
+
+			write := startL2LockOperation(subtest, release, func() error { return tc.run(ctx, view) })
+			waitL2LockSignal(subtest, entered, "write did not reach the L2 hook")
+			requireStaleL1InstallDone(subtest, release, view, epoch0)
+			requireL1OnlyCachedRead(subtest, release, view, stub, 2)
+
+			release()
+			write.requireDone(subtest, "write did not finish after release")
+			if tc.op == "set" {
+				requireL1OnlyCachedRead(subtest, nil, view, stub, 3)
+				return
+			}
+			_, _, present := view.l1Snapshot("n:a")
+			require.False(subtest, present, "delete did not remove the L1 value")
+		})
+	}
+}
+
+// requireL1OnlyCachedRead bounds a read and verifies that it stayed in L1.
+func requireL1OnlyCachedRead(t *testing.T, release func(), view *Typed[int], stub *hookedNoneL2, want int) {
+	t.Helper()
+	ctx := t.Context()
+	gets := stub.getCalls.Load()
+	read := startL2LockOperation(t, release, func() error { return readCachedL2LockTestKey(ctx, view, "a", want) })
+	read.requireDone(t, "L1-only read did not finish")
+	require.Equal(t, gets, stub.getCalls.Load(), "L1-only read reached L2")
+}
+
 // hookedNoneL2 records reads and pauses writes while retaining noneL2 semantics.
 type hookedNoneL2 struct {
 	noneL2
@@ -551,6 +609,18 @@ func (s *hookedNoneL2) Get(ctx context.Context, key string) ([]byte, bool, error
 func (s *hookedNoneL2) Set(_ context.Context, key string, val []byte, _ time.Duration) error {
 	s.afterWrite("set", key, val)
 	return nil
+}
+
+// Del pauses key deletion before it commits to L1.
+func (s *hookedNoneL2) Del(ctx context.Context, key string) error {
+	s.afterWrite("del", key, nil)
+	return s.noneL2.Del(ctx, key)
+}
+
+// DelPrefix pauses prefix deletion while preserving noneL2 refusal.
+func (s *hookedNoneL2) DelPrefix(ctx context.Context, prefix string) error {
+	s.afterWrite("del-prefix", prefix, nil)
+	return s.noneL2.DelPrefix(ctx, prefix)
 }
 
 // TestL2StripeIndex checks that boundary keys select valid, reproducible stripes.

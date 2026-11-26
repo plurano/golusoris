@@ -191,19 +191,24 @@ func (t *Typed[V]) setL1(key string, value V) {
 	}
 }
 
-// setL1IfCurrent evicts on a fenced fill so later reads cannot hit an older L1 value.
+// setL1IfCurrent evicts a fenced key only with shared L2 because L1-only reads cannot see early L2 values.
 func (t *Typed[V]) setL1IfCurrent(key string, value V, epoch uint64) {
 	t.tt.mutation.Lock()
 	defer t.tt.mutation.Unlock()
-	pending := t.tt.l2Pending[l2StripeIndex(key)]
-	prefix := t.tt.prefixPending
-	if (pending.active && pending.key == key) || (prefix.active && strings.HasPrefix(key, prefix.key)) {
+	if !t.tt.l1Only && t.tt.fillFenced(key) {
 		t.tt.l1.Invalidate(key)
 		return
 	}
 	if t.tt.epoch == epoch {
 		t.setL1(key, value)
 	}
+}
+
+// fillFenced reports whether a pending write covers the key while the caller holds mutation.
+func (t *TwoTier) fillFenced(key string) bool {
+	pending := t.l2Pending[l2StripeIndex(key)]
+	prefix := t.prefixPending
+	return (pending.active && pending.key == key) || (prefix.active && strings.HasPrefix(key, prefix.key))
 }
 
 // load runs inside singleflight: it checks L2, then falls back to the loader,

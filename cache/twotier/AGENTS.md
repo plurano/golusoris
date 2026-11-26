@@ -59,7 +59,7 @@ func (s *UserService) Load(ctx context.Context, id string) (*User, error) {
 - `mutation` covers epoch, `l2Pending`, `prefixPending`, and L1.
 - L2 key writes hold shared `l2Prefix` gate + key stripe. L2 prefix deletes hold gate exclusively. L2 reads take neither lock.
 - Lock order: `l2Prefix` -> key stripe -> `mutation`.
-- Pending Set or Delete fences read-through L1 fills for its key. Pending prefix delete fences fills under its prefix. Fenced fill -> evict its key from L1. L1-only Set always publishes to L1. Shared-L2 Set publishes unless a peer notice for its key or a covering prefix arrives during its L2 write.
+- Pending Set or Delete fences shared-L2 read-through fills for its key. Pending prefix delete fences shared-L2 fills under its prefix. Shared-L2 fenced fill -> evict its key from L1. L1-only fill -> check epoch only. L1-only Set always publishes to L1. Shared-L2 Set publishes unless a peer notice for its key or a covering prefix arrives during its L2 write.
 - Empty prefix -> refused before fence; no L1 eviction.
 
 ## Prefix invalidation
