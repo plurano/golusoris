@@ -15,6 +15,47 @@ Release Please generates this file from Conventional Commits. User-visible
 changes and migration notes therefore belong in release-visible commit
 messages; the release pull request remains the single changelog authority.
 
+## [0.22.5](https://github.com/plurano/golusoris/compare/v0.22.4...v0.22.5) (2026-11-26)
+
+
+### Bug Fixes
+
+* **ci:** move a trainer lock cutoff when Renovate bumps its pins ([#1600](https://github.com/plurano/golusoris/issues/1600)) ([8f099ee](https://github.com/plurano/golusoris/commit/8f099eeca8f1c4d473da4ac51dc6054ae2cbfd6c))
+* **ci:** name failing tests in the fault-recovery scan log ([#1601](https://github.com/plurano/golusoris/issues/1601)) ([757b1e1](https://github.com/plurano/golusoris/commit/757b1e16aee667d85e811cabbb474a8ae103ba7b))
+* **ci:** read module sum pins the way bash and Make do ([#1599](https://github.com/plurano/golusoris/issues/1599)) ([2c5ca33](https://github.com/plurano/golusoris/commit/2c5ca33b586cd593318c3d7db0783f1559635ea9))
+* **ci:** recompute release checksum pins when Renovate bumps a version ([#1604](https://github.com/plurano/golusoris/issues/1604)) ([865cce6](https://github.com/plurano/golusoris/commit/865cce6d557f45c0c30a6a30422d0165fab55b6b))
+* **ci:** regenerate Go module sums pinned in tool-versions.env ([#1596](https://github.com/plurano/golusoris/issues/1596)) ([72f560e](https://github.com/plurano/golusoris/commit/72f560ebe9a3c4405e716fbf67a2fe49814e6e49))
+* **deps:** update chromedp ([#1523](https://github.com/plurano/golusoris/issues/1523)) ([5394d63](https://github.com/plurano/golusoris/commit/5394d63030841a44840040ab54b62015c66fb679))
+* **deps:** update module charm.land/bubbletea/v2 to v2.1.2 ([#1484](https://github.com/plurano/golusoris/issues/1484)) ([84e8f30](https://github.com/plurano/golusoris/commit/84e8f30d97cbed8d82c5247bc2874d4d93468880))
+* **deps:** update module cloud.google.com/go/storage to v1.71.0 ([#1524](https://github.com/plurano/golusoris/issues/1524)) ([9e73c1c](https://github.com/plurano/golusoris/commit/9e73c1ccba5a9a4fd8bd96302ca2a7b0a592362d))
+* **deps:** update module github.com/bojanz/currency to v1.5.1 ([#1486](https://github.com/plurano/golusoris/issues/1486)) ([867eb0f](https://github.com/plurano/golusoris/commit/867eb0fb8303ed512c08dbd24056a31d359cfaaf))
+* **deps:** update module github.com/brianvoe/gofakeit/v7 to v7.18.7 ([#1487](https://github.com/plurano/golusoris/issues/1487)) ([c7729d7](https://github.com/plurano/golusoris/commit/c7729d7609b9d6f11436c992097eae997a000b9a))
+* **deps:** update module github.com/emersion/go-smtp to v0.26.0 ([#1526](https://github.com/plurano/golusoris/issues/1526)) ([fe09454](https://github.com/plurano/golusoris/commit/fe09454d84f8dfc6012793cb1ea3886d2e0630f5))
+* **deps:** update module github.com/fxamacker/cbor/v2 to v2.10.0 ([#1527](https://github.com/plurano/golusoris/issues/1527)) ([78593bc](https://github.com/plurano/golusoris/commit/78593bc519aacc20c848a2d5e99e84c5b277dd06))
+* **deps:** update module github.com/getkin/kin-openapi to v0.153.0 ([#1528](https://github.com/plurano/golusoris/issues/1528)) ([9fcef2f](https://github.com/plurano/golusoris/commit/9fcef2f64bf4048ee6a696e01f5a39ea25c402db))
+* **deps:** update module github.com/golusoris/goenvoy/arr/sonarr to v1.6.2 ([#1529](https://github.com/plurano/golusoris/issues/1529)) ([4a57a75](https://github.com/plurano/golusoris/commit/4a57a7503ff0d1211ebb07e92972895bb4030133))
+* **deps:** update module github.com/golusoris/goenvoy/arr/v2 to v2.6.3 ([#1489](https://github.com/plurano/golusoris/issues/1489)) ([1d2fe63](https://github.com/plurano/golusoris/commit/1d2fe6301b0bff66534f42347ebea16bb081d026))
+* **deps:** update module github.com/golusoris/goenvoy/metadata to v1.4.5 ([#1490](https://github.com/plurano/golusoris/issues/1490)) ([e6b48c4](https://github.com/plurano/golusoris/commit/e6b48c4fcf930a49ff7a7a933fea9abff56a2279))
+* **deps:** update module github.com/golusoris/goenvoy/metadata/anime/anilist to v1.3.7 ([#1491](https://github.com/plurano/golusoris/issues/1491)) ([9c958da](https://github.com/plurano/golusoris/commit/9c958dac4738b8954b6a0cf5d11bfa9c4c2aa73e))
+* **deps:** update module github.com/golusoris/goenvoy/metadata/tracking/trakt to v1.3.9 ([#1492](https://github.com/plurano/golusoris/issues/1492)) ([3c94e58](https://github.com/plurano/golusoris/commit/3c94e588296602bb366fb51dd568fcc0ad8dba7f))
+* **deps:** update module github.com/golusoris/goenvoy/metadata/video/tmdb to v1.3.6 ([#1493](https://github.com/plurano/golusoris/issues/1493)) ([5c9176a](https://github.com/plurano/golusoris/commit/5c9176a245f2a9dbca3d14211226a2cfd7589701))
+* **deps:** update module github.com/grafana/pyroscope-go to v1.5.0 ([#1530](https://github.com/plurano/golusoris/issues/1530)) ([27a8269](https://github.com/plurano/golusoris/commit/27a82691b33d87064d8a5a2ac1f3c12f9f0689b0))
+* **deps:** update module github.com/hajimehoshi/ebiten/v2 to v2.10.6 ([#1494](https://github.com/plurano/golusoris/issues/1494)) ([541f437](https://github.com/plurano/golusoris/commit/541f4375033e8784a281fa90dd274ca504178023))
+* **deps:** update module github.com/hekmon/transmissionrpc/v3 to v3.1.0 ([#1531](https://github.com/plurano/golusoris/issues/1531)) ([ad7f580](https://github.com/plurano/golusoris/commit/ad7f580171c06bf021ef7d9e47b4d48b18da1582))
+* **deps:** update module github.com/nats-io/nkeys to v0.4.17 ([#1495](https://github.com/plurano/golusoris/issues/1495)) ([5769216](https://github.com/plurano/golusoris/commit/5769216140fea6590f4d62e424358664557401eb))
+* **deps:** update module github.com/pion/webrtc/v4 to v4.2.27 ([#1496](https://github.com/plurano/golusoris/issues/1496)) ([2d4cc39](https://github.com/plurano/golusoris/commit/2d4cc39d2d0e447a42b323191775ad90dd315b1b))
+* **deps:** update module github.com/twmb/franz-go to v1.22.3 ([#1499](https://github.com/plurano/golusoris/issues/1499)) ([8b83c28](https://github.com/plurano/golusoris/commit/8b83c280035edb288123071d90f2a398cc6219e2))
+* **deps:** update module github.com/wneessen/go-mail to v0.8.2 ([#1500](https://github.com/plurano/golusoris/issues/1500)) ([c816a42](https://github.com/plurano/golusoris/commit/c816a423c703d9e00ae313bc32e1abe43f371a8e))
+* **deps:** update module github.com/yuin/goldmark/v2 to v2.1.16 ([#1501](https://github.com/plurano/golusoris/issues/1501)) ([2e51ad3](https://github.com/plurano/golusoris/commit/2e51ad304e1aed6b8314ff9c9fdf7e229402cb77))
+* **deps:** update module go.yaml.in/yaml/v3 to v3.0.6 ([#1502](https://github.com/plurano/golusoris/issues/1502)) ([3beccb1](https://github.com/plurano/golusoris/commit/3beccb12858227f2dff8548012540c547094aa83))
+* **deps:** update module sigs.k8s.io/controller-runtime to v0.25.3 ([#1503](https://github.com/plurano/golusoris/issues/1503)) ([d6397fc](https://github.com/plurano/golusoris/commit/d6397fc4b4dcb1d12a020f2553278b095396c8e5))
+* **web3/evm:** move gorilla/websocket past GO-2026-6278 ([#1595](https://github.com/plurano/golusoris/issues/1595)) ([a2a17b5](https://github.com/plurano/golusoris/commit/a2a17b5e845b5b3ef68bdd1e1ab494cdc88df55c))
+
+
+### Code Refactoring
+
+* **markdown:** build goldmark extensions with their constructors ([#1603](https://github.com/plurano/golusoris/issues/1603)) ([c9e47d9](https://github.com/plurano/golusoris/commit/c9e47d9b9dd74d321e53a52dbd1443ebf51fb2d6))
+
 ## [0.22.4](https://github.com/plurano/golusoris/compare/v0.22.3...v0.22.4) (2026-11-23)
 
 
