@@ -273,29 +273,27 @@ func unboundedFillCalls(filename string, src []byte) ([]token.Position, error) {
 	return positions, nil
 }
 
-// insideL2LockWorker matches a function literal passed directly to startL2LockOperation.
+// insideL2LockWorker matches a function literal passed as the run argument to startL2LockOperation.
 func insideL2LockWorker(ancestors []ast.Node) bool {
+	const runArgIndex = 2
 	for index := range len(ancestors) - 1 {
 		call, ok := ancestors[index].(*ast.CallExpr)
-		if !ok {
+		if !ok || len(call.Args) <= runArgIndex {
 			continue
 		}
 		callee, named := ast.Unparen(call.Fun).(*ast.Ident)
 		if !named || callee.Name != "startL2LockOperation" {
 			continue
 		}
-		arg, expression := ancestors[index+1].(ast.Expr)
-		if !expression {
-			continue
-		}
-		if _, literal := ast.Unparen(arg).(*ast.FuncLit); literal {
+		runArg := call.Args[runArgIndex]
+		if _, literal := ast.Unparen(runArg).(*ast.FuncLit); literal && ancestors[index+1] == runArg {
 			return true
 		}
 	}
 	return false
 }
 
-// TestSetL1IfCurrentCallsAreBoundedFixtures distinguishes a direct hook call from a worker.
+// TestSetL1IfCurrentCallsAreBoundedFixtures accepts worker calls and flags direct hook and release calls.
 func TestSetL1IfCurrentCallsAreBoundedFixtures(t *testing.T) {
 	t.Parallel()
 	const planted = `package twotier
@@ -315,6 +313,13 @@ func test() {
 	}
 }
 `
+	const release = `package twotier
+func test() {
+	startL2LockOperation(t, func() {
+		view.setL1IfCurrent("n:a", 1, epoch)
+	}, run)
+}
+`
 	positions, err := unboundedFillCalls("planted_test.go", []byte(planted))
 	require.NoError(t, err)
 	require.Len(t, positions, 1)
@@ -324,6 +329,12 @@ func test() {
 	cleanPositions, scanErr := unboundedFillCalls("clean_test.go", []byte(clean))
 	require.NoError(t, scanErr)
 	require.Empty(t, cleanPositions)
+
+	releasePositions, releaseErr := unboundedFillCalls("release_test.go", []byte(release))
+	require.NoError(t, releaseErr)
+	require.Len(t, releasePositions, 1)
+	require.Equal(t, "release_test.go", releasePositions[0].Filename)
+	require.Equal(t, 4, releasePositions[0].Line)
 }
 
 // TestL2LockTestsArmWatchdogFixtures covers direct and transitive calls across test files.

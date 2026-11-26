@@ -192,8 +192,8 @@ func (t *Typed[V]) setL1(key string, value V) {
 }
 
 // setL1IfCurrent evicts a shared-L2 fenced key like an L1 TTL or capacity eviction at that instant, even after a newer L1 commit or if the pending write fails.
-// Each separate Get flight reads L2 until L1 is filled again, installing an L2 hit in L1.
-// An expired L2 entry triggers a loader fill in both tiers, even if its value predates the last successful Set.
+// After either eviction, each separate Get flight reads L2 until L1 refills. A covering pending write evicts again. Without a fence, a changed epoch skips the install.
+// With no covering pending write and the epoch unchanged since the Get's miss, an L2 hit can fill L1 and a loader after L2 expiry can fill both tiers, even with a value older than the last successful Set.
 func (t *Typed[V]) setL1IfCurrent(key string, value V, epoch uint64) {
 	t.tt.mutation.Lock()
 	defer t.tt.mutation.Unlock()
