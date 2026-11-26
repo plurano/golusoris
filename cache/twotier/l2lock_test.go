@@ -231,6 +231,114 @@ func TestInFlightPrefixDeleteBlocksStaleL1Install(t *testing.T) {
 	}
 }
 
+// TestFencedFillEvictsOlderL1 prevents reads from going back to an older warm value.
+func TestFencedFillEvictsOlderL1(t *testing.T) {
+	t.Parallel()
+	set := func(ctx context.Context, view *Typed[int]) error { return view.Set(ctx, "a", 2) }
+	cases := [...]struct {
+		name      string
+		op        string
+		raw       string
+		peerWrite bool
+		moveEpoch bool
+		run       func(context.Context, *Typed[int]) error
+	}{
+		{name: "set", op: "set", raw: "2", run: set},
+		{name: "del", op: "del", peerWrite: true, run: func(ctx context.Context, view *Typed[int]) error {
+			return view.Delete(ctx, "a")
+		}},
+		{name: "del-prefix", op: "del-prefix", peerWrite: true, run: func(ctx context.Context, view *Typed[int]) error {
+			return view.InvalidatePrefix(ctx, "a")
+		}},
+		{name: "set-epoch-moved", op: "set", raw: "2", moveEpoch: true, run: set},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(subtest *testing.T) {
+			subtest.Parallel()
+			ctx := subtest.Context()
+			stub := newStubL2()
+			stub.data["n:a"] = []byte("1")
+			stub.data["n:c"] = []byte("7")
+			tiers := newTestTwoTier(subtest, stub)
+			view := NewTyped[int](tiers, "n")
+			epoch := warmFencedFillKeys(subtest, view)
+
+			entered, release, hook := blockL2Write(subtest, tc.op, tc.raw)
+			stub.afterWrite = hook
+			write := startL2LockOperation(subtest, release, func() error { return tc.run(ctx, view) })
+			waitL2LockSignal(subtest, entered, "write did not reach L2")
+			if tc.peerWrite {
+				stub.mu.Lock()
+				stub.data["n:a"] = []byte("2")
+				stub.mu.Unlock()
+			}
+			if tc.moveEpoch {
+				moveFencedFillEpoch(subtest, release, view, epoch)
+			}
+
+			install := startL2LockOperation(subtest, release, func() error {
+				view.setL1IfCurrent("n:a", 2, epoch)
+				return nil
+			})
+			install.requireDone(subtest, "fenced fill did not finish")
+			checkFencedFillReads(subtest, release, view, stub)
+
+			release()
+			write.requireDone(subtest, "write did not finish after release")
+			last := startL2LockOperation(subtest, nil, func() error { return readCachedL2LockTestKey(ctx, view, "a", 2) })
+			last.requireDone(subtest, "read after write did not finish")
+		})
+	}
+}
+
+// warmFencedFillKeys preserves the miss epoch so the delayed fill can replay it.
+func warmFencedFillKeys(t *testing.T, view *Typed[int]) uint64 {
+	t.Helper()
+	ctx := t.Context()
+	epoch, _, ok := view.l1Snapshot("n:a")
+	require.False(t, ok)
+	first := startL2LockOperation(t, nil, func() error { return fillL2LockTestKey(ctx, view) })
+	first.requireDone(t, "warm read of a did not finish")
+	other := startL2LockOperation(t, nil, func() error {
+		value, err := view.Get(ctx, "c", func(context.Context) (int, error) { return 7, nil })
+		return checkL2LockTestValue(value, err, 7)
+	})
+	other.requireDone(t, "warm read of c did not finish")
+	warmEpoch, cached, present := view.l1Snapshot("n:a")
+	require.True(t, present)
+	require.Equal(t, 1, cached)
+	require.Equal(t, epoch, warmEpoch)
+	return epoch
+}
+
+// moveFencedFillEpoch uses an unrelated notice so the pending write still fences the fill.
+func moveFencedFillEpoch(t *testing.T, release func(), view *Typed[int], epoch uint64) {
+	t.Helper()
+	const unrelatedKey = "n:z"
+	require.NotEqual(t, l2StripeIndex("n:a"), l2StripeIndex(unrelatedKey))
+	var movedEpoch uint64
+	notice := startL2LockOperation(t, release, func() error {
+		view.tt.applyInvalidation(Invalidation{Origin: "peer", Kind: InvalidationKey, Key: unrelatedKey})
+		movedEpoch, _, _ = view.l1Snapshot("n:a")
+		return nil
+	})
+	notice.requireDone(t, "unrelated peer notice did not finish")
+	require.NotEqual(t, epoch, movedEpoch)
+}
+
+// checkFencedFillReads uses L2 calls to distinguish a per-key eviction from an L1 hit or a full flush.
+func checkFencedFillReads(t *testing.T, release func(), view *Typed[int], stub *stubL2) {
+	t.Helper()
+	ctx := t.Context()
+	before := stub.getCalls.Load()
+	read := startL2LockOperation(t, release, func() error { return readCachedL2LockTestKey(ctx, view, "a", 2) })
+	read.requireDone(t, "read after fenced fill did not finish")
+	require.Equal(t, before+1, stub.getCalls.Load(), "read after fenced fill must reach L2")
+	other := startL2LockOperation(t, release, func() error { return readCachedL2LockTestKey(ctx, view, "c", 7) })
+	other.requireDone(t, "read of unrelated key did not finish")
+	require.Equal(t, before+1, stub.getCalls.Load(), "unrelated key must stay warm in L1")
+}
+
 // TestPanickingL2WriteClearsPendingRecord verifies that read-through can backfill L1 after a panic.
 func TestPanickingL2WriteClearsPendingRecord(t *testing.T) {
 	t.Parallel()

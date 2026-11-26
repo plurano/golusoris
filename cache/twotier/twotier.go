@@ -191,14 +191,17 @@ func (t *Typed[V]) setL1(key string, value V) {
 	}
 }
 
-// setL1IfCurrent fences stale L2 results while a Set, Delete, or matching prefix delete is in flight.
+// setL1IfCurrent evicts on a fenced fill so later reads cannot hit an older L1 value.
 func (t *Typed[V]) setL1IfCurrent(key string, value V, epoch uint64) {
 	t.tt.mutation.Lock()
 	defer t.tt.mutation.Unlock()
 	pending := t.tt.l2Pending[l2StripeIndex(key)]
 	prefix := t.tt.prefixPending
-	if t.tt.epoch == epoch && (!pending.active || pending.key != key) &&
-		(!prefix.active || !strings.HasPrefix(key, prefix.key)) {
+	if (pending.active && pending.key == key) || (prefix.active && strings.HasPrefix(key, prefix.key)) {
+		t.tt.l1.Invalidate(key)
+		return
+	}
+	if t.tt.epoch == epoch {
 		t.setL1(key, value)
 	}
 }
