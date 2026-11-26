@@ -11,6 +11,7 @@ import (
 	"go/token"
 	"go/types"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -273,22 +274,24 @@ func unboundedFillCalls(filename string, src []byte) ([]token.Position, error) {
 	return positions, nil
 }
 
-// insideL2LockWorker matches a function literal passed as the run argument to startL2LockOperation.
+// insideL2LockWorker requires a run literal in the nearest enclosing startL2LockOperation call.
 func insideL2LockWorker(ancestors []ast.Node) bool {
 	const runArgIndex = 2
-	for index := range len(ancestors) - 1 {
-		call, ok := ancestors[index].(*ast.CallExpr)
-		if !ok || len(call.Args) <= runArgIndex {
+	for index, ancestor := range slices.Backward(ancestors) {
+		call, ok := ancestor.(*ast.CallExpr)
+		if !ok {
 			continue
 		}
 		callee, named := ast.Unparen(call.Fun).(*ast.Ident)
 		if !named || callee.Name != "startL2LockOperation" {
 			continue
 		}
-		runArg := call.Args[runArgIndex]
-		if _, literal := ast.Unparen(runArg).(*ast.FuncLit); literal && ancestors[index+1] == runArg {
-			return true
+		if len(call.Args) <= runArgIndex || index+1 == len(ancestors) {
+			return false
 		}
+		runArg := call.Args[runArgIndex]
+		_, literal := ast.Unparen(runArg).(*ast.FuncLit)
+		return literal && ancestors[index+1] == runArg
 	}
 	return false
 }
@@ -320,6 +323,16 @@ func test() {
 	}, run)
 }
 `
+	const nestedRelease = `package twotier
+func test() {
+	startL2LockOperation(t, nil, func() error {
+		startL2LockOperation(t, func() {
+			view.setL1IfCurrent("n:a", 1, epoch)
+		}, run)
+		return nil
+	})
+}
+`
 	positions, err := unboundedFillCalls("planted_test.go", []byte(planted))
 	require.NoError(t, err)
 	require.Len(t, positions, 1)
@@ -335,6 +348,12 @@ func test() {
 	require.Len(t, releasePositions, 1)
 	require.Equal(t, "release_test.go", releasePositions[0].Filename)
 	require.Equal(t, 4, releasePositions[0].Line)
+
+	nestedPositions, nestedErr := unboundedFillCalls("nested_release_test.go", []byte(nestedRelease))
+	require.NoError(t, nestedErr)
+	require.Len(t, nestedPositions, 1)
+	require.Equal(t, "nested_release_test.go", nestedPositions[0].Filename)
+	require.Equal(t, 5, nestedPositions[0].Line)
 }
 
 // TestL2LockTestsArmWatchdogFixtures covers direct and transitive calls across test files.

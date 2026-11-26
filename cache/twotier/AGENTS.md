@@ -58,7 +58,10 @@ func (s *UserService) Load(ctx context.Context, id string) (*User, error) {
 
 - `mutation` covers epoch, `l2Pending`, `prefixPending`, and L1.
 - L2 key writes hold shared `l2Prefix` gate + key stripe. L2 prefix deletes hold gate exclusively. L2 reads take neither lock.
-- Lock order: `l2Prefix` -> key stripe -> `mutation`.
+- Loader fill or repair L2 write -> shared `l2FillGate` + `l2FillOrder` fill stripe through epoch check and write.
+- Lock order: `l2Prefix` -> key stripe -> fill gate -> fill stripe -> `mutation`.
+- Peer notice -> skip `l2Prefix` and key stripe. Key notice -> shared fill gate + fill stripe. Prefix notice (including empty prefix) -> exclusive fill gate.
+- Peer notice -> waits for in-flight loader fill or repair L2 write of its key (prefix notice: all keys), never for Set, Delete or prefix-delete writes.
 - Pending Set or Delete fences shared-L2 read-through fills for its key. Pending prefix delete fences shared-L2 fills under its prefix. Shared-L2 fenced fill -> evict its key from L1. L1-only fill -> check epoch only. L1-only Set always publishes to L1. Shared-L2 Set publishes unless a peer notice for its key or a covering prefix arrives during its L2 write.
 - Shared-L2 fenced fill -> same key state as L1 TTL or capacity eviction at that instant, even after newer L1 commit. Pending Set, Delete, or prefix delete success or failure -> eviction holds.
   After either eviction, each separate Get flight -> read L2 until next L1 install.
@@ -84,7 +87,9 @@ func (s *UserService) Load(ctx context.Context, id string) (*User, error) {
 
 - Each mutation sends one `Invalidation{Origin, Kind: key|prefix, Key}` — never per-key fan-out
   for a prefix. Receiver drops own origin, bumps epoch (fences in-flight loads), evicts L1 only;
-  L2 already holds sender's write. Notices run synchronously in bus subscriber goroutine.
+  L2 already holds sender's write.
+- Fill write -> notice completion -> next peer write ordering requires synchronous notice delivery.
+- Asynchronous bus -> single-peer-write limit (#1609).
 - Broadcast bounded by `invalidation.timeout`. Failure -> `Set` / `Delete` / `InvalidatePrefix`
   return error wrapping `ErrBroadcast` (+ cause); local change stays.
 - Delivery at most once: lost, malformed or pre-subscription notice leaves peer L1 stale

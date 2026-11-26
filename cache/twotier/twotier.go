@@ -107,6 +107,8 @@ type TwoTier struct {
 	l2TTL            time.Duration
 	l2Order          [l2StripeCount]sync.Mutex
 	l2Prefix         sync.RWMutex
+	l2FillGate       sync.RWMutex
+	l2FillOrder      [l2StripeCount]sync.Mutex
 	mutation         sync.RWMutex
 	epoch            uint64
 	l2Pending        [l2StripeCount]pendingWrite
@@ -269,6 +271,30 @@ func (t *TwoTier) lockL2Key(stripe int) func() {
 	}
 }
 
+// lockL2FillKey orders key notices with loader fills and repairs on the same stripe.
+func (t *TwoTier) lockL2FillKey(stripe int) func() {
+	t.l2FillGate.RLock()
+	lock := &t.l2FillOrder[stripe]
+	lock.Lock()
+	return func() {
+		lock.Unlock()
+		t.l2FillGate.RUnlock()
+	}
+}
+
+// lockInvalidationFill fences the notice against fills on its key stripe or across all stripes for a prefix.
+func (t *TwoTier) lockInvalidationFill(inv Invalidation) func() {
+	switch inv.Kind {
+	case InvalidationKey:
+		return t.lockL2FillKey(l2StripeIndex(inv.Key))
+	case InvalidationPrefix:
+		t.l2FillGate.Lock()
+		return t.l2FillGate.Unlock
+	default:
+		return func() {}
+	}
+}
+
 // beginPendingWrite fences L1 fills without holding mutation during L2 I/O.
 func (t *TwoTier) beginPendingWrite(pending *pendingWrite, key string) {
 	t.mutation.Lock()
@@ -292,8 +318,9 @@ func (t *TwoTier) isCurrentEpoch(epoch uint64) bool {
 
 // setL2IfCurrent fences loader fills superseded before they acquire the write locks.
 func (t *TwoTier) setL2IfCurrent(ctx context.Context, key string, raw []byte, epoch uint64) error {
-	unlock := t.lockL2Key(l2StripeIndex(key))
-	defer unlock()
+	stripe := l2StripeIndex(key)
+	defer t.lockL2Key(stripe)()
+	defer t.lockL2FillKey(stripe)()
 	if !t.isCurrentEpoch(epoch) {
 		return nil
 	}
@@ -305,8 +332,9 @@ func (t *TwoTier) setL2IfCurrent(ctx context.Context, key string, raw []byte, ep
 
 // deleteL2IfCurrent prevents corruption repair from deleting a superseding write.
 func (t *TwoTier) deleteL2IfCurrent(ctx context.Context, key string, epoch uint64) error {
-	unlock := t.lockL2Key(l2StripeIndex(key))
-	defer unlock()
+	stripe := l2StripeIndex(key)
+	defer t.lockL2Key(stripe)()
+	defer t.lockL2FillKey(stripe)()
 	if !t.isCurrentEpoch(epoch) {
 		return nil
 	}
@@ -511,6 +539,7 @@ func (t *TwoTier) applyInvalidation(inv Invalidation) {
 	if inv.Origin == t.origin {
 		return
 	}
+	defer t.lockInvalidationFill(inv)()
 	t.mutation.Lock()
 	defer t.mutation.Unlock()
 	switch inv.Kind {

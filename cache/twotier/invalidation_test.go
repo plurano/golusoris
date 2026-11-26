@@ -126,6 +126,78 @@ func TestInvalidation_PeerSetDuringLocalSetLeavesNoStaleL1(t *testing.T) {
 	require.Equal(t, int32(1), shared.getCalls.Load()-gets, "L2 reads after local Set")
 }
 
+// TestInvalidation_PeerDeleteWinsAfterBlockedFill covers key and prefix notices during an L2 fill.
+func TestInvalidation_PeerDeleteWinsAfterBlockedFill(t *testing.T) {
+	t.Parallel()
+	armL2LockWatchdog(t)
+	cases := [...]struct {
+		name   string
+		mutate func(context.Context, *Typed[int]) error
+	}{
+		{name: "key", mutate: func(ctx context.Context, view *Typed[int]) error {
+			return view.Set(ctx, "k", 2)
+		}},
+		{name: "prefix", mutate: func(ctx context.Context, view *Typed[int]) error {
+			return view.InvalidatePrefix(ctx, "k")
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(subtest *testing.T) {
+			subtest.Parallel()
+			checkPeerDeleteAfterBlockedFill(subtest, tc.mutate)
+		})
+	}
+}
+
+// checkPeerDeleteAfterBlockedFill lets the peer attempt both mutations before releasing the older fill.
+func checkPeerDeleteAfterBlockedFill(t *testing.T, mutate func(context.Context, *Typed[int]) error) {
+	t.Helper()
+	ctx := t.Context()
+	a, b, shared := newPeers(t)
+	aView, bView := NewTyped[int](a, "n"), NewTyped[int](b, "n")
+	entered, release, hook := blockL2WriteForKey(t, "set", "n:k", "1")
+	shared.beforeWrite = hook
+	fill := startL2LockOperation(t, release, func() error {
+		value, err := aView.Get(ctx, "k", func(context.Context) (int, error) { return 1, nil })
+		return checkL2LockTestValue(value, err, 1)
+	})
+	waitL2LockSignal(t, entered, "loader fill did not reach its L2 write")
+	peer := startL2LockOperation(t, release, func() error {
+		if err := mutate(ctx, bView); err != nil {
+			return err
+		}
+		return bView.Delete(ctx, "k")
+	})
+	// Give an unfenced peer time to finish its Delete while the older fill is paused.
+	const peerDeleteWindow = time.Second
+	select {
+	case <-peer.done:
+	case <-time.After(peerDeleteWindow):
+	}
+	release()
+	fill.requireDone(t, "loader fill did not finish after release")
+	peer.requireDone(t, "peer mutations did not finish after release")
+	_, found, err := shared.Get(ctx, "n:k")
+	require.NoError(t, err)
+	require.False(t, found, "older fill recreated the deleted L2 entry")
+	requirePeerReload(t, ctx, aView)
+	// Clear the first reload from shared L2 so the second replica checks its own L1.
+	require.NoError(t, shared.Del(ctx, "n:k"))
+	requirePeerReload(t, ctx, bView)
+}
+
+// requirePeerReload verifies a fresh Get reaches the origin after the peer Delete.
+func requirePeerReload(t *testing.T, ctx context.Context, view *Typed[int]) {
+	t.Helper()
+	var loads atomic.Int32
+	reload := startL2LockOperation(t, nil, func() error {
+		value, err := view.Get(ctx, "k", countingLoader(&loads, 3))
+		return checkL2LockTestValue(value, err, 3)
+	})
+	reload.requireDone(t, "Get after peer Delete did not finish")
+	require.EqualValues(t, 1, loads.Load(), "Get after peer Delete must call the loader")
+}
+
 func TestInvalidation_PrefixEvictsPeerMatchesOnly(t *testing.T) {
 	t.Parallel()
 	a, b, _ := newPeers(t)
