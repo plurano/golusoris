@@ -88,6 +88,12 @@ type flightKey struct {
 
 const l2StripeCount = 64
 
+// pendingSet records a Set without allocation because stripe locks admit one Set per stripe.
+type pendingSet struct {
+	key           string
+	active, dirty bool
+}
+
 // TwoTier is the untyped two-tier cache. It is created by the fx module and
 // shared across the app; callers obtain a type-safe view via [Typed].
 //
@@ -103,7 +109,7 @@ type TwoTier struct {
 	l2Prefix         sync.RWMutex
 	mutation         sync.RWMutex
 	epoch            uint64
-	notices          uint64
+	l2Pending        [l2StripeCount]pendingSet
 	group            *singleflight.Group[flightKey, []byte]
 	origin           string
 	broadcaster      Broadcaster
@@ -184,10 +190,12 @@ func (t *Typed[V]) setL1(key string, value V) {
 	}
 }
 
+// setL1IfCurrent prevents a pre-Set L2 read from overwriting a value another Get returned.
 func (t *Typed[V]) setL1IfCurrent(key string, value V, epoch uint64) {
 	t.tt.mutation.Lock()
 	defer t.tt.mutation.Unlock()
-	if t.tt.epoch == epoch {
+	pending := t.tt.l2Pending[l2StripeIndex(key)]
+	if t.tt.epoch == epoch && (!pending.active || pending.key != key) {
 		t.setL1(key, value)
 	}
 }
@@ -282,9 +290,10 @@ func (t *TwoTier) deleteL2IfCurrent(ctx context.Context, key string, epoch uint6
 }
 
 // Set writes v to L2 and tells peers to evict k. An L1-only cache always
-// publishes v to L1. With shared L2, Set publishes v to L1 if no peer notice
-// arrives during the write. A disabled cache is a no-op. An error wrapping
-// [ErrBroadcast] means the local write succeeded but peers were not told.
+// publishes v to L1. With shared L2, Set publishes v to L1 unless a peer notice
+// for k or a prefix covering k arrives during the write. A disabled cache is a
+// no-op. An error wrapping [ErrBroadcast] means the local write succeeded but
+// peers were not told.
 func (t *Typed[V]) Set(ctx context.Context, k string, v V) error {
 	if t.tt == nil {
 		return nil
@@ -304,17 +313,21 @@ func (t *Typed[V]) Set(ctx context.Context, k string, v V) error {
 func (t *Typed[V]) setBoth(ctx context.Context, key string, raw []byte, value V) error {
 	unlock := t.tt.lockL2Key(key)
 	defer unlock()
-	t.tt.mutation.RLock()
-	notices := t.tt.notices
-	t.tt.mutation.RUnlock()
-	if serr := t.tt.l2.Set(ctx, key, raw, t.tt.l2TTL); serr != nil {
-		return fmt.Errorf("cache/twotier: L2 set: %w", serr)
-	}
+	stripe := l2StripeIndex(key)
+	t.tt.mutation.Lock()
+	t.tt.l2Pending[stripe] = pendingSet{key: key, active: true}
+	t.tt.mutation.Unlock()
+	err := t.tt.l2.Set(ctx, key, raw, t.tt.l2TTL)
 	t.tt.mutation.Lock()
 	defer t.tt.mutation.Unlock()
+	pending := t.tt.l2Pending[stripe]
+	t.tt.l2Pending[stripe] = pendingSet{}
+	if err != nil {
+		return fmt.Errorf("cache/twotier: L2 set: %w", err)
+	}
 	t.tt.epoch++
 	// L1-only caches have no newer L2 value to read after a peer notice.
-	if t.tt.l1Only || t.tt.notices == notices {
+	if t.tt.l1Only || !pending.dirty {
 		t.setL1(key, value)
 	} else {
 		t.tt.l1.Invalidate(key)
@@ -444,11 +457,19 @@ func (t *TwoTier) applyInvalidation(inv Invalidation) {
 	switch inv.Kind {
 	case InvalidationKey:
 		t.epoch++
-		t.notices++
+		pending := &t.l2Pending[l2StripeIndex(inv.Key)]
+		if pending.active && pending.key == inv.Key {
+			pending.dirty = true
+		}
 		t.l1.Invalidate(inv.Key)
 	case InvalidationPrefix:
 		t.epoch++
-		t.notices++
+		for i := range l2StripeCount {
+			pending := &t.l2Pending[i]
+			if pending.active && strings.HasPrefix(pending.key, inv.Key) {
+				pending.dirty = true
+			}
+		}
 		t.evictL1Prefix(inv.Key)
 	default:
 		t.logger.Warn("cache/twotier: ignore unknown invalidation kind", slog.String("kind", string(inv.Kind)))

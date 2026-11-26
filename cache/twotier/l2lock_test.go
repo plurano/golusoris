@@ -123,18 +123,50 @@ func TestPrefixInvalidationWaitsForInFlightFill(t *testing.T) {
 	require.True(t, loaded)
 }
 
+// TestInFlightSetBlocksStaleL1Install protects reads from an older L2 result while Set commits.
+func TestInFlightSetBlocksStaleL1Install(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	stub := newStubL2()
+	stub.data["n:a"] = []byte("1")
+	tiers := newTestTwoTier(t, stub)
+	view := NewTyped[int](tiers, "n")
+	epoch, _, ok := view.l1Snapshot("n:a")
+	require.False(t, ok)
+
+	entered, release, hook := blockL2Write(t, "set", "2")
+	stub.afterWrite = hook
+	set := startL2LockOperation(t, release, func() error { return view.Set(ctx, "a", 2) })
+	waitL2LockSignal(t, entered, "Set did not write to L2")
+	first := startL2LockOperation(t, release, func() error { return readCachedL2LockTestKey(ctx, view, "a", 2) })
+	first.requireDone(t, "read during Set did not finish")
+	view.setL1IfCurrent("n:a", 1, epoch)
+	second := startL2LockOperation(t, release, func() error { return readCachedL2LockTestKey(ctx, view, "a", 2) })
+	second.requireDone(t, "read after stale install attempt did not finish")
+
+	release()
+	set.requireDone(t, "Set did not finish after release")
+	gets := stub.getCalls.Load()
+	last := startL2LockOperation(t, nil, func() error { return readCachedL2LockTestKey(ctx, view, "a", 2) })
+	last.requireDone(t, "read after Set did not finish")
+	require.Equal(t, gets, stub.getCalls.Load(), "read after Set reached L2")
+}
+
 // TestPeerNoticeDuringSetWriteLeavesNoStaleL1 exercises write-through across peer invalidations.
 func TestPeerNoticeDuringSetWriteLeavesNoStaleL1(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
-		name     string
-		notice   Invalidation
-		want     int
-		wantGets int32
+		name       string
+		notice     Invalidation
+		want       int
+		wantGets   int32
+		peerWrites bool
 	}{
-		{name: "key-notice", notice: Invalidation{Origin: "peer", Kind: InvalidationKey, Key: "n:a"}, want: 2, wantGets: 1},
+		{name: "key-notice", notice: Invalidation{Origin: "peer", Kind: InvalidationKey, Key: "n:a"}, want: 2, wantGets: 1, peerWrites: true},
 		{name: "no-notice", want: 1},
-		{name: "prefix-notice", notice: Invalidation{Origin: "peer", Kind: InvalidationPrefix, Key: "n:"}, want: 2, wantGets: 1},
+		{name: "prefix-notice", notice: Invalidation{Origin: "peer", Kind: InvalidationPrefix, Key: "n:"}, want: 2, wantGets: 1, peerWrites: true},
+		{name: "unrelated-key-notice", notice: Invalidation{Origin: "peer", Kind: InvalidationKey, Key: "n:b"}, want: 1},
+		{name: "non-covering-prefix-notice", notice: Invalidation{Origin: "peer", Kind: InvalidationPrefix, Key: "n:b"}, want: 1},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(subtest *testing.T) {
@@ -149,9 +181,11 @@ func TestPeerNoticeDuringSetWriteLeavesNoStaleL1(t *testing.T) {
 			waitL2LockSignal(subtest, entered, "Set did not write to L2")
 			if tc.notice.Kind != "" {
 				peer := startL2LockOperation(subtest, release, func() error {
-					stub.mu.Lock()
-					stub.data["n:a"] = []byte("2")
-					stub.mu.Unlock()
+					if tc.peerWrites {
+						stub.mu.Lock()
+						stub.data["n:a"] = []byte("2")
+						stub.mu.Unlock()
+					}
 					tiers.applyInvalidation(tc.notice)
 					return nil
 				})
