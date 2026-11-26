@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -164,6 +165,65 @@ func TestPeerNoticeDuringSetWriteLeavesNoStaleL1(t *testing.T) {
 			require.Equal(subtest, tc.wantGets, stub.getCalls.Load()-gets, "L2 reads after Set")
 		})
 	}
+}
+
+// TestL1OnlySetKeepsL1AcrossPeerNotice checks that a successful Set stays readable from L1.
+func TestL1OnlySetKeepsL1AcrossPeerNotice(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name   string
+		notice Invalidation
+	}{
+		{name: "same-key-notice", notice: Invalidation{Origin: "peer", Kind: InvalidationKey, Key: "n:a"}},
+		{name: "unrelated-key-notice", notice: Invalidation{Origin: "peer", Kind: InvalidationKey, Key: "n:b"}},
+		{name: "prefix-notice", notice: Invalidation{Origin: "peer", Kind: InvalidationPrefix, Key: "n:"}},
+		{name: "no-notice"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(subtest *testing.T) {
+			subtest.Parallel()
+			ctx := subtest.Context()
+			entered, release, hook := blockL2Write(subtest, "set", "1")
+			stub := &hookedNoneL2{afterWrite: hook}
+			tiers := newTestTwoTier(subtest, stub)
+			tiers.l1Only = true
+			view := NewTyped[int](tiers, "n")
+			set := startL2LockOperation(subtest, release, func() error { return view.Set(ctx, "a", 1) })
+			waitL2LockSignal(subtest, entered, "Set did not reach the L2 hook")
+			if tc.notice.Kind != "" {
+				peer := startL2LockOperation(subtest, release, func() error {
+					tiers.applyInvalidation(tc.notice)
+					return nil
+				})
+				peer.requireDone(subtest, "peer invalidation stalled behind the local L2 write")
+			}
+			release()
+			set.requireDone(subtest, "Set did not finish after release")
+			gets := stub.getCalls.Load()
+			read := startL2LockOperation(subtest, nil, func() error { return readCachedL2LockTestKey(ctx, view, "a", 1) })
+			read.requireDone(subtest, "read after Set did not finish")
+			require.Equal(subtest, gets, stub.getCalls.Load(), "read after Set reached L2")
+		})
+	}
+}
+
+// hookedNoneL2 records reads and pauses writes while retaining noneL2 semantics.
+type hookedNoneL2 struct {
+	noneL2
+	getCalls   atomic.Int32
+	afterWrite func(op, key string, val []byte)
+}
+
+// Get counts read attempts so tests can verify that L1 serves the value.
+func (s *hookedNoneL2) Get(ctx context.Context, key string) ([]byte, bool, error) {
+	s.getCalls.Add(1)
+	return s.noneL2.Get(ctx, key)
+}
+
+// Set pauses the caller so a test can deliver a peer notice before the L1 commit.
+func (s *hookedNoneL2) Set(_ context.Context, key string, val []byte, _ time.Duration) error {
+	s.afterWrite("set", key, val)
+	return nil
 }
 
 // TestL2StripeIndex checks that boundary keys select valid, reproducible stripes.

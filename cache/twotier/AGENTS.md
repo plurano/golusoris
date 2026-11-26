@@ -59,7 +59,7 @@ func (s *UserService) Load(ctx context.Context, id string) (*User, error) {
 - `mutation` covers epoch, peer notices, and L1.
 - L2 key writes hold shared `l2Prefix` gate + key stripe. L2 prefix deletes hold gate exclusively. L2 reads take neither lock.
 - Lock order: `l2Prefix` -> key stripe -> `mutation`.
-- Set publishes to L1 only when no peer notice arrived during its L2 write.
+- L1-only Set always publishes to L1. Shared-L2 Set publishes to L1 only when no peer notice arrived during its L2 write.
 
 ## Prefix invalidation
 

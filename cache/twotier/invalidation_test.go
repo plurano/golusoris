@@ -309,6 +309,7 @@ func TestListen_NoBroadcasterIsNoop(t *testing.T) {
 // typedNilClient is a non-nil interface holding a nil client.
 type typedNilClient struct{ rueidis.Client }
 
+// TestNew_ValidatesModesAndInvalidation checks constructor dependencies and the selected cache mode.
 func TestNew_ValidatesModesAndInvalidation(t *testing.T) {
 	t.Parallel()
 	l1, err := memory.NewForTest(10, 0)
@@ -339,6 +340,10 @@ func TestNew_ValidatesModesAndInvalidation(t *testing.T) {
 	}
 	tt, err := New(l1, Options{L2: L2None, L1TTL: time.Minute, Invalidation: enabled}, logger, WithBroadcaster(broadcaster), nil)
 	require.NoError(t, err)
+	require.True(t, tt.l1Only)
 	require.Equal(t, defaultBroadcastTimeout, tt.broadcastTimeout)
 	require.NotEmpty(t, tt.origin)
+	redisCache, err := New(l1, Options{L2: L2Redis}, logger, WithRedis(typedNilClient{}))
+	require.NoError(t, err)
+	require.False(t, redisCache.l1Only)
 }

@@ -268,6 +268,7 @@ func New(l1 *memory.Cache, opts Options, logger *slog.Logger, options ...Option)
 	tt := &TwoTier{
 		l1:               l1,
 		l2:               tier,
+		l1Only:           opts.L2 == L2None,
 		logger:           logger,
 		l1TTL:            opts.L1TTL,
 		l2TTL:            opts.L2TTL,

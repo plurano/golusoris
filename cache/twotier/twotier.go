@@ -95,6 +95,7 @@ const l2StripeCount = 64
 type TwoTier struct {
 	l1               *memory.Cache
 	l2               l2
+	l1Only           bool
 	logger           *slog.Logger
 	l1TTL            time.Duration
 	l2TTL            time.Duration
@@ -280,8 +281,9 @@ func (t *TwoTier) deleteL2IfCurrent(ctx context.Context, key string, epoch uint6
 	return nil
 }
 
-// Set writes v to L2, caches it in L1 if no peer notice arrives during the write,
-// and tells peers to evict k. A disabled cache is a no-op. An error wrapping
+// Set writes v to L2 and tells peers to evict k. An L1-only cache always
+// publishes v to L1. With shared L2, Set publishes v to L1 if no peer notice
+// arrives during the write. A disabled cache is a no-op. An error wrapping
 // [ErrBroadcast] means the local write succeeded but peers were not told.
 func (t *Typed[V]) Set(ctx context.Context, k string, v V) error {
 	if t.tt == nil {
@@ -311,8 +313,8 @@ func (t *Typed[V]) setBoth(ctx context.Context, key string, raw []byte, value V)
 	t.tt.mutation.Lock()
 	defer t.tt.mutation.Unlock()
 	t.tt.epoch++
-	// A peer notice can signal a newer L2 value, so force the next read through L2.
-	if t.tt.notices == notices {
+	// L1-only caches have no newer L2 value to read after a peer notice.
+	if t.tt.l1Only || t.tt.notices == notices {
 		t.setL1(key, value)
 	} else {
 		t.tt.l1.Invalidate(key)
