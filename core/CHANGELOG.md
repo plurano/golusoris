@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.4](https://github.com/plurano/golusoris/compare/core/v0.12.3...core/v0.12.4) (2026-11-26)
+
+
+### Bug Fixes
+
+* **deps:** update module go.yaml.in/yaml/v3 to v3.0.6 ([#1502](https://github.com/plurano/golusoris/issues/1502)) ([3beccb1](https://github.com/plurano/golusoris/commit/3beccb12858227f2dff8548012540c547094aa83))
+
 ## [0.12.3](https://github.com/golusoris/golusoris/compare/core/v0.12.2...core/v0.12.3) (2026-11-15)
 
 
