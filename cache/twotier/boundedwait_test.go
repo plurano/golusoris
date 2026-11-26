@@ -9,6 +9,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"go/types"
 	"os"
 	"strings"
 	"testing"
@@ -34,7 +35,7 @@ type boundedWaitTestSource struct {
 	data []byte
 }
 
-// readBoundedWaitTestSources includes test files behind build tags in both source checks.
+// readBoundedWaitTestSources includes test files behind build tags in the source checks.
 func readBoundedWaitTestSources(t *testing.T) []boundedWaitTestSource {
 	t.Helper()
 	entries, err := os.ReadDir(".")
@@ -63,6 +64,78 @@ func TestL2LockTestsArmWatchdog(t *testing.T) {
 	require.NoError(t, err)
 	for _, position := range positions {
 		t.Errorf("cache/twotier: %s: lock regression test must start with armL2LockWatchdog after optional t.Parallel()", position)
+	}
+}
+
+// TestL2StubHooksOnlyCallAllowedFunctions keeps test assertions off the stub's worker goroutine.
+func TestL2StubHooksOnlyCallAllowedFunctions(t *testing.T) {
+	t.Parallel()
+	for _, source := range readBoundedWaitTestSources(t) {
+		calls, err := disallowedL2HookCalls(source.name, source.data)
+		require.NoError(t, err)
+		for _, call := range calls {
+			t.Errorf("cache/twotier: %s: L2 stub hook call to %s is outside the allow-list", call.position, call.callee)
+		}
+	}
+}
+
+type l2HookCall struct {
+	position token.Position
+	callee   string
+}
+
+// disallowedL2HookCalls checks every matching hook body, including its nested callbacks.
+func disallowedL2HookCalls(filename string, src []byte) ([]l2HookCall, error) {
+	files := token.NewFileSet()
+	file, err := parser.ParseFile(files, filename, src, parser.SkipObjectResolution)
+	if err != nil {
+		return nil, fmt.Errorf("cache/twotier: parse test source %s: %w", filename, err)
+	}
+	var calls []l2HookCall
+	ast.Inspect(file, func(node ast.Node) bool {
+		hook, ok := node.(*ast.FuncLit)
+		if !ok || !isL2StubHookType(hook.Type) {
+			return true
+		}
+		ast.Inspect(hook.Body, func(child ast.Node) bool {
+			if call, called := child.(*ast.CallExpr); called {
+				callee := types.ExprString(ast.Unparen(call.Fun))
+				if !isAllowedL2HookCall(callee) {
+					calls = append(calls, l2HookCall{position: files.PositionFor(call.Pos(), false), callee: callee})
+				}
+			}
+			return true
+		})
+		return false
+	})
+	return calls, nil
+}
+
+// isL2StubHookType matches the stub signature with grouped, separate, or unnamed parameters.
+func isL2StubHookType(signature *ast.FuncType) bool {
+	var parameters [3]ast.Expr
+	if signature.Params.NumFields() != len(parameters) || signature.Results.NumFields() != 0 {
+		return false
+	}
+	index := 0
+	for _, field := range signature.Params.List {
+		for range max(1, len(field.Names)) {
+			parameters[index] = ast.Unparen(field.Type)
+			index++
+		}
+	}
+	value, isArrayType := parameters[2].(*ast.ArrayType)
+	return types.ExprString(parameters[0]) == "string" && types.ExprString(parameters[1]) == "string" &&
+		isArrayType && value.Len == nil && types.ExprString(ast.Unparen(value.Elt)) == "byte"
+}
+
+// isAllowedL2HookCall limits the hook to the calls the current stubs need.
+func isAllowedL2HookCall(callee string) bool {
+	switch callee {
+	case "tryStaleL1Install", "panicOnce.Do", "panic", "string", "signal":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -283,6 +356,34 @@ func workerHelper(t *testing.T) {
 	require.Len(t, positions, 2)
 	require.Equal(t, "planted_test.go:2:1", positions[0].String())
 	require.Equal(t, "helper_planted_test.go:2:1", positions[1].String())
+}
+
+// TestL2StubHooksOnlyCallAllowedFunctionsFixtures plants direct and nested test failures.
+func TestL2StubHooksOnlyCallAllowedFunctionsFixtures(t *testing.T) {
+	t.Parallel()
+	const source = `package twotier
+func test() {
+	stub.beforeWrite = func(op, key string, _ []byte) {
+		waitL2LockSignal(t, done, "worker stalled")
+	}
+	stub.afterWrite = func(string, string, []byte) {
+		panicOnce.Do(func() { t.Fatal("worker failed") })
+	}
+	hook := func(op string, key string, _ []byte) {
+		signal()
+		<-blocked
+	}
+}
+`
+	calls, err := disallowedL2HookCalls("fixture_test.go", []byte(source))
+	require.NoError(t, err)
+	require.Len(t, calls, 2)
+	require.Equal(t, "fixture_test.go", calls[0].position.Filename)
+	require.Equal(t, 4, calls[0].position.Line)
+	require.Equal(t, "waitL2LockSignal", calls[0].callee)
+	require.Equal(t, "fixture_test.go", calls[1].position.Filename)
+	require.Equal(t, 7, calls[1].position.Line)
+	require.Equal(t, "t.Fatal", calls[1].callee)
 }
 
 // TestL2LockWatchdogExpires verifies that expiry names the blocked test and includes its stacks.

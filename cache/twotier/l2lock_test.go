@@ -244,23 +244,52 @@ func TestRefusedEmptyPrefixKeepsCommittedL1(t *testing.T) {
 	epoch0, _, ok := view.l1Snapshot("n:a")
 	require.False(t, ok)
 	requireL2LockSetupSet(t, func() error { return view.Set(ctx, "a", 2) })
+	installRequested := make(chan struct{})
+	requestInstall := sync.OnceFunc(func() { close(installRequested) })
+	install := startL2LockOperation(t, nil, func() error {
+		select {
+		case <-installRequested:
+			view.setL1IfCurrent("n:a", 1, epoch0)
+		case <-ctx.Done():
+		}
+		return nil
+	})
+	hookFinished := make(chan bool, 1)
 	stub.beforeWrite = func(op, key string, _ []byte) {
 		if op == "del-prefix" && key == "" {
-			requireStaleL1InstallDone(t, nil, view, epoch0)
+			select {
+			case hookFinished <- tryStaleL1Install(requestInstall, install.done):
+			default:
+			}
 		}
 	}
 
 	op := startL2LockOperation(t, nil, func() error { return tiers.InvalidatePrefix(ctx, "") })
-	waitL2LockSignal(t, op.done, "empty prefix invalidation did not finish")
+	// Give the hook its own timeout before timing out the invalidation.
+	require.True(t, l2LockSignalReceived(op.done, 2*l2LockTimeout), "cache/twotier: empty prefix invalidation did not finish")
+	select {
+	case finished := <-hookFinished:
+		require.True(t, finished, "cache/twotier: stale L1 install attempt did not finish in the DelPrefix hook")
+		require.NoError(t, install.err)
+		t.Fatal("cache/twotier: empty prefix reached DelPrefix")
+	default:
+	}
 	require.ErrorIs(t, op.err, errEmptyPrefix)
 	require.EqualError(t, op.err, `cache/twotier: L2 invalidate prefix "": cache/twotier: refusing to scan-delete an empty prefix`)
 	require.Zero(t, stub.delPrefixCalls.Load())
 
-	requireStaleL1InstallDone(t, nil, view, epoch0)
+	requestInstall()
+	install.requireDone(t, "stale L1 install attempt did not finish")
 	gets := stub.getCalls.Load()
 	read := startL2LockOperation(t, nil, func() error { return readCachedL2LockTestKey(ctx, view, "a", 2) })
 	read.requireDone(t, "read after prefix refusal did not finish")
 	require.Equal(t, gets, stub.getCalls.Load(), "read after prefix refusal reached L2")
+}
+
+// tryStaleL1Install lets the stub hook time out and return even if its caller holds mutation.
+func tryStaleL1Install(request func(), done <-chan struct{}) bool {
+	request()
+	return l2LockSignalReceived(done, l2LockTimeout)
 }
 
 // TestFencedFillEvictsOlderL1 prevents reads from going back to an older warm value.
@@ -885,19 +914,28 @@ type l2LockOperation struct {
 	err         error
 }
 
+var errL2LockWorkerExited = errors.New("cache/twotier: test worker exited before its operation returned")
+
 // startL2LockOperation registers cleanup before waiting for the background operation.
 func startL2LockOperation(t *testing.T, release func(), run func() error) *l2LockOperation {
 	t.Helper()
 	started := make(chan struct{})
 	op := &l2LockOperation{done: make(chan struct{})}
 	go func() {
-		defer close(op.done)
+		returned := false
+		defer func() {
+			if !returned {
+				op.err = errL2LockWorkerExited
+			}
+			close(op.done)
+		}()
 		var stack [128]byte
 		size := runtime.Stack(stack[:], false)
 		prefix, _, _ := bytes.Cut(stack[:size], []byte(" ["))
 		op.stackPrefix = "\n" + string(prefix) + " ["
 		close(started)
 		op.err = run()
+		returned = true
 	}()
 	t.Cleanup(func() {
 		if release != nil {
@@ -907,6 +945,36 @@ func startL2LockOperation(t *testing.T, release func(), run func() error) *l2Loc
 	})
 	waitL2LockSignal(t, started, "operation goroutine did not start")
 	return op
+}
+
+// TestL2LockOperationReportsWorkerExit distinguishes Goexit from either kind of return.
+func TestL2LockOperationReportsWorkerExit(t *testing.T) {
+	t.Parallel()
+	armL2LockWatchdog(t)
+	wrapped := fmt.Errorf("cache/twotier: planted worker failure: %w", errL2LockWorkerExited)
+	cases := [...]struct {
+		name string
+		run  func() error
+		want error
+	}{
+		{name: "goexit", run: func() error {
+			runtime.Goexit()
+			return nil
+		}, want: errL2LockWorkerExited},
+		{name: "nil-return", run: func() error { return nil }},
+		{name: "wrapped-error-return", run: func() error { return wrapped }, want: wrapped},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(subtest *testing.T) {
+			subtest.Parallel()
+			op := startL2LockOperation(subtest, nil, tc.run)
+			waitL2LockSignal(subtest, op.done, "worker operation did not finish")
+			require.ErrorIs(subtest, op.err, tc.want)
+			if tc.want != nil {
+				require.Same(subtest, tc.want, op.err)
+			}
+		})
+	}
 }
 
 // requireL2LockSetupSet keeps a stalled setup Set within the operation timeout.
@@ -969,10 +1037,18 @@ func (op *l2LockOperation) blockedIn(stack []byte, waitReason, frame string) boo
 // waitL2LockSignal bounds test and cleanup waits for worker signals.
 func waitL2LockSignal(t *testing.T, signal <-chan struct{}, timeoutMessage string) {
 	t.Helper()
+	if !l2LockSignalReceived(signal, l2LockTimeout) {
+		t.Fatal(timeoutMessage)
+	}
+}
+
+// l2LockSignalReceived lets worker hooks time out without touching testing.T.
+func l2LockSignalReceived(signal <-chan struct{}, timeout time.Duration) bool {
 	select {
 	case <-signal:
-	case <-time.After(l2LockTimeout):
-		t.Fatal(timeoutMessage)
+		return true
+	case <-time.After(timeout):
+		return false
 	}
 }
 
