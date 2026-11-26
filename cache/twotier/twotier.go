@@ -108,7 +108,6 @@ type TwoTier struct {
 	l2Order          [l2StripeCount]sync.Mutex
 	l2Prefix         sync.RWMutex
 	l2FillGate       sync.RWMutex
-	l2FillOrder      [l2StripeCount]sync.Mutex
 	mutation         sync.RWMutex
 	epoch            uint64
 	l2Pending        [l2StripeCount]pendingWrite
@@ -271,23 +270,16 @@ func (t *TwoTier) lockL2Key(stripe int) func() {
 	}
 }
 
-// lockL2FillKey orders key notices with loader fills and repairs on the same stripe.
-func (t *TwoTier) lockL2FillKey(stripe int) func() {
+// lockL2Fill keeps peer notices behind the epoch check and L2 write of a fill or repair.
+func (t *TwoTier) lockL2Fill() func() {
 	t.l2FillGate.RLock()
-	lock := &t.l2FillOrder[stripe]
-	lock.Lock()
-	return func() {
-		lock.Unlock()
-		t.l2FillGate.RUnlock()
-	}
+	return t.l2FillGate.RUnlock
 }
 
-// lockInvalidationFill fences the notice against fills on its key stripe or across all stripes for a prefix.
+// lockInvalidationFill makes key and prefix notices wait for in-flight L2 fills and repairs across all stripes.
 func (t *TwoTier) lockInvalidationFill(inv Invalidation) func() {
 	switch inv.Kind {
-	case InvalidationKey:
-		return t.lockL2FillKey(l2StripeIndex(inv.Key))
-	case InvalidationPrefix:
+	case InvalidationKey, InvalidationPrefix:
 		t.l2FillGate.Lock()
 		return t.l2FillGate.Unlock
 	default:
@@ -320,7 +312,7 @@ func (t *TwoTier) isCurrentEpoch(epoch uint64) bool {
 func (t *TwoTier) setL2IfCurrent(ctx context.Context, key string, raw []byte, epoch uint64) error {
 	stripe := l2StripeIndex(key)
 	defer t.lockL2Key(stripe)()
-	defer t.lockL2FillKey(stripe)()
+	defer t.lockL2Fill()()
 	if !t.isCurrentEpoch(epoch) {
 		return nil
 	}
@@ -334,7 +326,7 @@ func (t *TwoTier) setL2IfCurrent(ctx context.Context, key string, raw []byte, ep
 func (t *TwoTier) deleteL2IfCurrent(ctx context.Context, key string, epoch uint64) error {
 	stripe := l2StripeIndex(key)
 	defer t.lockL2Key(stripe)()
-	defer t.lockL2FillKey(stripe)()
+	defer t.lockL2Fill()()
 	if !t.isCurrentEpoch(epoch) {
 		return nil
 	}

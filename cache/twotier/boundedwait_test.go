@@ -133,7 +133,7 @@ func isL2StubHookType(signature *ast.FuncType) bool {
 // isAllowedL2HookCall limits the hook to the calls the current stubs need.
 func isAllowedL2HookCall(callee string) bool {
 	switch callee {
-	case "tryStaleL1Install", "panicOnce.Do", "panic", "string", "signal":
+	case "tryStaleL1Install", "panicOnce.Do", "panic", "string", "signal", "fillHook":
 		return true
 	default:
 		return false
@@ -274,10 +274,14 @@ func unboundedFillCalls(filename string, src []byte) ([]token.Position, error) {
 	return positions, nil
 }
 
-// insideL2LockWorker requires a run literal in the nearest enclosing startL2LockOperation call.
+// insideL2LockWorker requires the nearest function literal to be the nearest worker's run argument.
 func insideL2LockWorker(ancestors []ast.Node) bool {
 	const runArgIndex = 2
-	for index, ancestor := range slices.Backward(ancestors) {
+	var enclosing *ast.FuncLit
+	for _, ancestor := range slices.Backward(ancestors) {
+		if literal, isLiteral := ancestor.(*ast.FuncLit); isLiteral && enclosing == nil {
+			enclosing = literal
+		}
 		call, ok := ancestor.(*ast.CallExpr)
 		if !ok {
 			continue
@@ -286,17 +290,15 @@ func insideL2LockWorker(ancestors []ast.Node) bool {
 		if !named || callee.Name != "startL2LockOperation" {
 			continue
 		}
-		if len(call.Args) <= runArgIndex || index+1 == len(ancestors) {
+		if len(call.Args) <= runArgIndex || enclosing == nil {
 			return false
 		}
-		runArg := call.Args[runArgIndex]
-		_, literal := ast.Unparen(runArg).(*ast.FuncLit)
-		return literal && ancestors[index+1] == runArg
+		return ast.Unparen(call.Args[runArgIndex]) == enclosing
 	}
 	return false
 }
 
-// TestSetL1IfCurrentCallsAreBoundedFixtures accepts worker calls and flags direct hook and release calls.
+// TestSetL1IfCurrentCallsAreBoundedFixtures accepts worker calls and flags escaping callbacks.
 func TestSetL1IfCurrentCallsAreBoundedFixtures(t *testing.T) {
 	t.Parallel()
 	const planted = `package twotier
@@ -333,27 +335,35 @@ func test() {
 	})
 }
 `
-	positions, err := unboundedFillCalls("planted_test.go", []byte(planted))
-	require.NoError(t, err)
-	require.Len(t, positions, 1)
-	require.Equal(t, "planted_test.go", positions[0].Filename)
-	require.Equal(t, 4, positions[0].Line)
+	const nestedCallback = `package twotier
+func test() {
+	startL2LockOperation(t, nil, func() error {
+		t.Cleanup(func() {
+			view.setL1IfCurrent("n:a", 1, epoch)
+		})
+		return nil
+	})
+}
+`
+	requireUnboundedFillCall(t, "planted_test.go", planted, 4)
 
 	cleanPositions, scanErr := unboundedFillCalls("clean_test.go", []byte(clean))
 	require.NoError(t, scanErr)
 	require.Empty(t, cleanPositions)
 
-	releasePositions, releaseErr := unboundedFillCalls("release_test.go", []byte(release))
-	require.NoError(t, releaseErr)
-	require.Len(t, releasePositions, 1)
-	require.Equal(t, "release_test.go", releasePositions[0].Filename)
-	require.Equal(t, 4, releasePositions[0].Line)
+	requireUnboundedFillCall(t, "release_test.go", release, 4)
+	requireUnboundedFillCall(t, "nested_release_test.go", nestedRelease, 5)
+	requireUnboundedFillCall(t, "nested_callback_test.go", nestedCallback, 5)
+}
 
-	nestedPositions, nestedErr := unboundedFillCalls("nested_release_test.go", []byte(nestedRelease))
-	require.NoError(t, nestedErr)
-	require.Len(t, nestedPositions, 1)
-	require.Equal(t, "nested_release_test.go", nestedPositions[0].Filename)
-	require.Equal(t, 5, nestedPositions[0].Line)
+// requireUnboundedFillCall checks that the fixture reports only the planted call.
+func requireUnboundedFillCall(t *testing.T, filename, src string, line int) {
+	t.Helper()
+	positions, err := unboundedFillCalls(filename, []byte(src))
+	require.NoError(t, err)
+	require.Len(t, positions, 1, filename)
+	require.Equal(t, filename, positions[0].Filename)
+	require.Equal(t, line, positions[0].Line)
 }
 
 // TestL2LockTestsArmWatchdogFixtures covers direct and transitive calls across test files.

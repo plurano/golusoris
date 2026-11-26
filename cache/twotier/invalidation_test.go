@@ -8,7 +8,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -43,13 +45,37 @@ func newPeer(t *testing.T, shared l2, b Broadcaster) *TwoTier {
 // newPeers returns two listening replicas sharing one L2 and one in-process bus.
 func newPeers(t *testing.T) (a, b *TwoTier, shared *stubL2) {
 	t.Helper()
+	return newPeersWithBroadcastSignal(t, nil)
+}
+
+// newPeersWithBroadcastSignal can observe broadcasts from the second replica.
+func newPeersWithBroadcastSignal(t *testing.T, signal func()) (a, b *TwoTier, shared *stubL2) {
+	t.Helper()
 	shared = newStubL2()
 	broadcaster, err := NewBusBroadcaster(pubsub.New(), "", nil)
 	require.NoError(t, err)
-	a, b = newPeer(t, shared, broadcaster), newPeer(t, shared, broadcaster)
+	var peerBroadcaster Broadcaster = broadcaster
+	if signal != nil {
+		peerBroadcaster = &signalingBroadcaster{Broadcaster: broadcaster, signal: signal}
+	}
+	a, b = newPeer(t, shared, broadcaster), newPeer(t, shared, peerBroadcaster)
 	t.Cleanup(a.Listen())
 	t.Cleanup(b.Listen())
 	return a, b, shared
+}
+
+type signalingBroadcaster struct {
+	Broadcaster
+	signal func()
+}
+
+// Broadcast signals entry before delegating to the synchronous bus.
+func (b *signalingBroadcaster) Broadcast(ctx context.Context, inv Invalidation) error {
+	b.signal()
+	if err := b.Broadcaster.Broadcast(ctx, inv); err != nil {
+		return fmt.Errorf("cache/twotier: test broadcast: %w", err)
+	}
+	return nil
 }
 
 // cacheOn makes peer hold 1 for key "k" in its L1.
@@ -126,16 +152,20 @@ func TestInvalidation_PeerSetDuringLocalSetLeavesNoStaleL1(t *testing.T) {
 	require.Equal(t, int32(1), shared.getCalls.Load()-gets, "L2 reads after local Set")
 }
 
-// TestInvalidation_PeerDeleteWinsAfterBlockedFill covers key and prefix notices during an L2 fill.
+// TestInvalidation_PeerDeleteWinsAfterBlockedFill covers same-stripe key, other-stripe key, and prefix notices.
 func TestInvalidation_PeerDeleteWinsAfterBlockedFill(t *testing.T) {
 	t.Parallel()
 	armL2LockWatchdog(t)
+	const otherKey = "z"
 	cases := [...]struct {
 		name   string
 		mutate func(context.Context, *Typed[int]) error
 	}{
 		{name: "key", mutate: func(ctx context.Context, view *Typed[int]) error {
 			return view.Set(ctx, "k", 2)
+		}},
+		{name: "other-stripe", mutate: func(ctx context.Context, view *Typed[int]) error {
+			return view.Set(ctx, otherKey, 2)
 		}},
 		{name: "prefix", mutate: func(ctx context.Context, view *Typed[int]) error {
 			return view.InvalidatePrefix(ctx, "k")
@@ -144,19 +174,30 @@ func TestInvalidation_PeerDeleteWinsAfterBlockedFill(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(subtest *testing.T) {
 			subtest.Parallel()
+			if tc.name == "other-stripe" {
+				require.NotEqual(subtest, l2StripeIndex("n:k"), l2StripeIndex("n:"+otherKey))
+			}
 			checkPeerDeleteAfterBlockedFill(subtest, tc.mutate)
 		})
 	}
 }
 
-// checkPeerDeleteAfterBlockedFill lets the peer attempt both mutations before releasing the older fill.
+// checkPeerDeleteAfterBlockedFill holds the older fill until the peer notice has had a chance to block.
 func checkPeerDeleteAfterBlockedFill(t *testing.T, mutate func(context.Context, *Typed[int]) error) {
 	t.Helper()
 	ctx := t.Context()
-	a, b, shared := newPeers(t)
+	broadcastStarted := make(chan struct{})
+	a, b, shared := newPeersWithBroadcastSignal(t, sync.OnceFunc(func() { close(broadcastStarted) }))
 	aView, bView := NewTyped[int](a, "n"), NewTyped[int](b, "n")
-	entered, release, hook := blockL2WriteForKey(t, "set", "n:k", "1")
-	shared.beforeWrite = hook
+	entered, release, fillHook := blockL2WriteForKey(t, "set", "n:k", "1")
+	deleteReached := make(chan struct{})
+	signal := sync.OnceFunc(func() { close(deleteReached) })
+	shared.beforeWrite = func(op, key string, raw []byte) {
+		fillHook(op, key, raw)
+		if op == "del" && key == "n:k" {
+			signal()
+		}
+	}
 	fill := startL2LockOperation(t, release, func() error {
 		value, err := aView.Get(ctx, "k", func(context.Context) (int, error) { return 1, nil })
 		return checkL2LockTestValue(value, err, 1)
@@ -164,16 +205,12 @@ func checkPeerDeleteAfterBlockedFill(t *testing.T, mutate func(context.Context, 
 	waitL2LockSignal(t, entered, "loader fill did not reach its L2 write")
 	peer := startL2LockOperation(t, release, func() error {
 		if err := mutate(ctx, bView); err != nil {
-			return err
+			return fmt.Errorf("cache/twotier: mutate peer before delete: %w", err)
 		}
 		return bView.Delete(ctx, "k")
 	})
-	// Give an unfenced peer time to finish its Delete while the older fill is paused.
-	const peerDeleteWindow = time.Second
-	select {
-	case <-peer.done:
-	case <-time.After(peerDeleteWindow):
-	}
+	waitL2LockSignal(t, broadcastStarted, "peer did not start its first notice while the fill was paused")
+	requirePeerNoticeFenced(t, deleteReached, peer.done)
 	release()
 	fill.requireDone(t, "loader fill did not finish after release")
 	peer.requireDone(t, "peer mutations did not finish after release")
@@ -184,6 +221,22 @@ func checkPeerDeleteAfterBlockedFill(t *testing.T, mutate func(context.Context, 
 	// Clear the first reload from shared L2 so the second replica checks its own L1.
 	require.NoError(t, shared.Del(ctx, "n:k"))
 	requirePeerReload(t, ctx, bView)
+}
+
+// requirePeerNoticeFenced checks for peer progress while its first notice should be blocked.
+func requirePeerNoticeFenced(t *testing.T, deleteReached, peerDone <-chan struct{}) {
+	t.Helper()
+	// Start the window at broadcast entry so an unfenced peer can reach L2 before fill release.
+	const peerDeleteWindow = time.Second
+	var earlyProgress string
+	select {
+	case <-deleteReached:
+		earlyProgress = "peer Delete reached shared L2"
+	case <-peerDone:
+		earlyProgress = "peer worker returned"
+	case <-time.After(peerDeleteWindow):
+	}
+	require.Empty(t, earlyProgress, "missing loader-fill fence: peer progressed before fill release")
 }
 
 // requirePeerReload verifies a fresh Get reaches the origin after the peer Delete.
