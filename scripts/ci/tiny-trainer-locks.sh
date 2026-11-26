@@ -15,9 +15,14 @@ MAX_LOCK_TARGETS=3
 MAX_LOCK_CONTEXTS=4
 MAX_DOCKERFILE_LINES=256
 AUDIT_PYTHON_VERSION=3.11.16
-# Resolve as of this upload cutoff so --check compares the lock with its inputs,
-# not with whatever PyPI published since; move it forward deliberately with --write.
-LOCK_EXCLUDE_NEWER=2026-10-20T00:00:00Z
+# Per-context upload cutoffs keep --check reproducible; scripts/ci/regenerate.py moves one
+# to the regen time minus the Renovate minimumReleaseAge when Renovate changes that context's pins.
+GEMMA_LOCK_EXCLUDE_NEWER=2026-11-22T00:41:02Z
+LITERT_LOCK_EXCLUDE_NEWER=2026-10-20T00:00:00Z
+SIDECAR_LOCK_EXCLUDE_NEWER=2026-10-17T00:00:00Z
+AUDIT_LOCK_EXCLUDE_NEWER=2026-10-20T00:00:00Z
+LOCK_TARGETS=(ai/tiny/trainers/gemma ai/tiny/trainers/litert ai/tiny/serve/tflite/sidecar)
+LOCK_CUTOFF_NAMES=(GEMMA_LOCK_EXCLUDE_NEWER LITERT_LOCK_EXCLUDE_NEWER SIDECAR_LOCK_EXCLUDE_NEWER)
 # certifi below 2026.10.19 trusts compromised emSign roots (PYSEC-2026-4320); only certifi moves past the cutoff.
 LOCK_CERTIFI_EXCLUDE_NEWER=certifi=2026-10-21T00:00:00Z
 tiny_trainer_lock_tmp=
@@ -32,7 +37,7 @@ compile_lock() {
 	local source="$1"
 	local python_version="$2"
 	local work="$3"
-	local cutoff="${4:-$LOCK_EXCLUDE_NEWER}"
+	local cutoff="$4"
 	mkdir -p "$work"
 	install -m 0644 "$source" "$work/requirements.in"
 	docker run --rm \
@@ -153,30 +158,54 @@ extract_dockerfile_python_version() {
 	printf '%s\n' "$version"
 }
 
+# Return 0 when the mode flag names a supported subcommand, or 1 otherwise.
+lock_mode_valid() {
+	case "$1" in
+		--check | --write | --audit | --contexts) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+# Print tab-separated cutoff variable, lockfile, and input source rows.
+print_lock_contexts() {
+	local index
+	for index in "${!LOCK_TARGETS[@]}"; do
+		printf '%s\t%s\t%s\n' \
+			"${LOCK_CUTOFF_NAMES[$index]}" \
+			"${LOCK_TARGETS[$index]}/requirements.lock" \
+			"file:${LOCK_TARGETS[$index]}/requirements.in"
+	done
+	printf '%s\t%s\t%s\n' \
+		AUDIT_LOCK_EXCLUDE_NEWER \
+		scripts/ci/tiny-trainer-pip-audit.lock \
+		"pin:pip-audit==$PIP_AUDIT_VERSION"
+}
+
+# Validate the CLI mode and check, write, audit, or list lock contexts.
 main() {
 	local mode="${1:---check}"
-	if [[ "$mode" != --check && "$mode" != --write && "$mode" != --audit ]]; then
-		printf 'usage: %s [--check|--write|--audit]\n' "${0##*/}" >&2
+	if ! lock_mode_valid "$mode"; then
+		printf 'usage: %s [--check|--write|--audit|--contexts]\n' "${0##*/}" >&2
 		return 2
 	fi
-	local root index target python_version cutoff work version
+	if [[ "$mode" == --contexts ]]; then
+		print_lock_contexts
+		return
+	fi
+	local root index target python_version cutoff work version name
 	root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 	tiny_trainer_lock_tmp="$(mktemp -d "${TMPDIR:-/tmp}/tiny-trainer-locks.XXXXXX")"
-	local -a targets=(
-		"ai/tiny/trainers/gemma"
-		"ai/tiny/trainers/litert"
-		"ai/tiny/serve/tflite/sidecar"
-	)
+	local -a targets=("${LOCK_TARGETS[@]}")
 	local -a versions=()
 	for target in "${targets[@]}"; do
 		version="$(extract_dockerfile_python_version "$root/$target/Dockerfile")"
 		versions+=("$version")
 	done
-	local -a cutoffs=(
-		"$LOCK_EXCLUDE_NEWER"
-		"$LOCK_EXCLUDE_NEWER"
-		2026-10-17T00:00:00Z
-	)
+	local -a cutoffs=()
+	: "$GEMMA_LOCK_EXCLUDE_NEWER" "$LITERT_LOCK_EXCLUDE_NEWER" "$SIDECAR_LOCK_EXCLUDE_NEWER"
+	for name in "${LOCK_CUTOFF_NAMES[@]}"; do
+		cutoffs+=("${!name}")
+	done
 	if ((${#targets[@]} != MAX_LOCK_TARGETS || ${#versions[@]} != MAX_LOCK_TARGETS || ${#cutoffs[@]} != MAX_LOCK_TARGETS)); then
 		printf 'lock authority must contain exactly %d target entries\n' "$MAX_LOCK_TARGETS" >&2
 		return 1
@@ -197,7 +226,8 @@ main() {
 	done
 	printf 'pip-audit==%s\n' "$PIP_AUDIT_VERSION" >"$tiny_trainer_lock_tmp/pip-audit.in"
 	work="$tiny_trainer_lock_tmp/pip-audit"
-	compile_lock "$tiny_trainer_lock_tmp/pip-audit.in" "$AUDIT_PYTHON_VERSION" "$work"
+	compile_lock "$tiny_trainer_lock_tmp/pip-audit.in" "$AUDIT_PYTHON_VERSION" "$work" \
+		"$AUDIT_LOCK_EXCLUDE_NEWER"
 	materialize_lock "$mode" "$work/requirements.lock" \
 		"$root/scripts/ci/tiny-trainer-pip-audit.lock"
 	printf 'tiny trainer locks: %s (%d contexts)\n' "${mode#--}" "$MAX_LOCK_CONTEXTS"
