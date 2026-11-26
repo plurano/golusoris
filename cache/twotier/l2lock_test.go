@@ -140,7 +140,7 @@ func TestInFlightSetBlocksStaleL1Install(t *testing.T) {
 	waitL2LockSignal(t, entered, "Set did not write to L2")
 	first := startL2LockOperation(t, release, func() error { return readCachedL2LockTestKey(ctx, view, "a", 2) })
 	first.requireDone(t, "read during Set did not finish")
-	view.setL1IfCurrent("n:a", 1, epoch)
+	requireStaleL1InstallDone(t, release, view, epoch)
 	second := startL2LockOperation(t, release, func() error { return readCachedL2LockTestKey(ctx, view, "a", 2) })
 	second.requireDone(t, "read after stale install attempt did not finish")
 
@@ -150,6 +150,156 @@ func TestInFlightSetBlocksStaleL1Install(t *testing.T) {
 	last := startL2LockOperation(t, nil, func() error { return readCachedL2LockTestKey(ctx, view, "a", 2) })
 	last.requireDone(t, "read after Set did not finish")
 	require.Equal(t, gets, stub.getCalls.Load(), "read after Set reached L2")
+}
+
+// TestInFlightDeleteBlocksStaleL1Install protects a peer's newer value during a local Delete.
+func TestInFlightDeleteBlocksStaleL1Install(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	stub := newStubL2()
+	stub.data["n:a"] = []byte("1")
+	tiers := newTestTwoTier(t, stub)
+	view := NewTyped[int](tiers, "n")
+	epoch, _, ok := view.l1Snapshot("n:a")
+	require.False(t, ok)
+
+	entered, release, hook := blockL2Write(t, "del", "")
+	stub.afterWrite = hook
+	deleted := startL2LockOperation(t, release, func() error { return view.Delete(ctx, "a") })
+	waitL2LockSignal(t, entered, "Delete did not remove the L2 value")
+	stub.mu.Lock()
+	stub.data["n:a"] = []byte("2")
+	stub.mu.Unlock()
+
+	first := startL2LockOperation(t, release, func() error { return readCachedL2LockTestKey(ctx, view, "a", 2) })
+	first.requireDone(t, "read during Delete did not finish")
+	requireStaleL1InstallDone(t, release, view, epoch)
+	second := startL2LockOperation(t, release, func() error { return readCachedL2LockTestKey(ctx, view, "a", 2) })
+	second.requireDone(t, "read after stale install attempt did not finish")
+
+	release()
+	deleted.requireDone(t, "Delete did not finish after release")
+	last := startL2LockOperation(t, nil, func() error { return readCachedL2LockTestKey(ctx, view, "a", 2) })
+	last.requireDone(t, "read after Delete did not finish")
+}
+
+// TestInFlightPrefixDeleteBlocksStaleL1Install verifies that only matching keys are fenced.
+func TestInFlightPrefixDeleteBlocksStaleL1Install(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name     string
+		prefix   string
+		want     int
+		wantGets int32
+	}{
+		{name: "covering-prefix", prefix: "a", want: 2, wantGets: 1},
+		{name: "non-covering-prefix", prefix: "b", want: 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(subtest *testing.T) {
+			subtest.Parallel()
+			ctx := subtest.Context()
+			stub := newStubL2()
+			stub.data["n:a"] = []byte("1")
+			view := NewTyped[int](newTestTwoTier(subtest, stub), "n")
+			epoch, _, ok := view.l1Snapshot("n:a")
+			require.False(subtest, ok)
+
+			entered, release, hook := blockL2WriteForKey(subtest, "del-prefix", view.key(tc.prefix), "")
+			stub.afterWrite = hook
+			deleted := startL2LockOperation(subtest, release, func() error { return view.InvalidatePrefix(ctx, tc.prefix) })
+			waitL2LockSignal(subtest, entered, "prefix delete did not finish its L2 write")
+			stub.mu.Lock()
+			stub.data["n:a"] = []byte("2")
+			stub.mu.Unlock()
+
+			first := startL2LockOperation(subtest, release, func() error { return readCachedL2LockTestKey(ctx, view, "a", 2) })
+			first.requireDone(subtest, "read during prefix delete did not finish")
+			requireStaleL1InstallDone(subtest, release, view, epoch)
+			gets := stub.getCalls.Load()
+			second := startL2LockOperation(subtest, release, func() error {
+				return readCachedL2LockTestKey(ctx, view, "a", tc.want)
+			})
+			second.requireDone(subtest, "read after stale install attempt did not finish")
+			require.Equal(subtest, tc.wantGets, stub.getCalls.Load()-gets, "L2 reads after stale install attempt")
+
+			release()
+			deleted.requireDone(subtest, "prefix delete did not finish after release")
+			last := startL2LockOperation(subtest, nil, func() error { return readCachedL2LockTestKey(ctx, view, "a", tc.want) })
+			last.requireDone(subtest, "read after prefix delete did not finish")
+		})
+	}
+}
+
+// TestPanickingL2WriteClearsPendingRecord verifies that read-through can backfill L1 after a panic.
+func TestPanickingL2WriteClearsPendingRecord(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		op   string
+		run  func(context.Context, *Typed[int]) error
+	}{
+		{name: "set", op: "set", run: func(ctx context.Context, view *Typed[int]) error {
+			return view.Set(ctx, "a", 2)
+		}},
+		{name: "delete", op: "del", run: func(ctx context.Context, view *Typed[int]) error {
+			return view.Delete(ctx, "a")
+		}},
+		{name: "prefix-delete", op: "del-prefix", run: func(ctx context.Context, view *Typed[int]) error {
+			return view.InvalidatePrefix(ctx, "a")
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(subtest *testing.T) {
+			subtest.Parallel()
+			ctx := subtest.Context()
+			stub := newStubL2()
+			view := NewTyped[int](newTestTwoTier(subtest, stub), "n")
+			var panicOnce sync.Once
+			stub.beforeWrite = func(op, _ string, _ []byte) {
+				if op == tc.op {
+					panicOnce.Do(func() { panic("injected L2 write panic") })
+				}
+			}
+			write := startL2LockOperation(subtest, nil, func() (result error) {
+				defer func() {
+					if cause := recover(); cause != nil {
+						result = fmt.Errorf("cache/twotier: recovered L2 write panic: %v", cause)
+					}
+				}()
+				return tc.run(ctx, view)
+			})
+			waitL2LockSignal(subtest, write.done, "panicking write did not finish")
+			require.EqualError(subtest, write.err, "cache/twotier: recovered L2 write panic: injected L2 write panic")
+
+			var loads int32
+			read := func() error {
+				value, err := view.Get(ctx, "a", func(context.Context) (int, error) {
+					loads++
+					return 1, nil
+				})
+				return checkL2LockTestValue(value, err, 1)
+			}
+			first := startL2LockOperation(subtest, nil, read)
+			first.requireDone(subtest, "first read after panic did not finish")
+			require.EqualValues(subtest, 1, loads, "origin loads on first read")
+			gets := stub.getCalls.Load()
+			second := startL2LockOperation(subtest, nil, read)
+			second.requireDone(subtest, "second read after panic did not finish")
+			require.Equal(subtest, gets, stub.getCalls.Load(), "second read after panic reached L2")
+			require.EqualValues(subtest, 1, loads, "second read after panic reached the loader")
+		})
+	}
+}
+
+// requireStaleL1InstallDone bounds the stale install attempt while the L2 write is paused.
+func requireStaleL1InstallDone(t *testing.T, release func(), view *Typed[int], epoch uint64) {
+	t.Helper()
+	install := startL2LockOperation(t, release, func() error {
+		view.setL1IfCurrent("n:a", 1, epoch)
+		return nil
+	})
+	install.requireDone(t, "stale L1 install attempt did not finish")
 }
 
 // TestPeerNoticeDuringSetWriteLeavesNoStaleL1 exercises write-through across peer invalidations.
@@ -271,8 +421,14 @@ func TestL2StripeIndex(t *testing.T) {
 	}
 }
 
-// blockL2Write pauses one matching call outside the stub mutex so other calls can proceed.
+// blockL2Write targets the test key shared by the existing lock scenarios.
 func blockL2Write(t *testing.T, operation, raw string) (<-chan struct{}, func(), func(string, string, []byte)) {
+	t.Helper()
+	return blockL2WriteForKey(t, operation, "n:a", raw)
+}
+
+// blockL2WriteForKey pauses a matching call outside the stub mutex so other calls can proceed.
+func blockL2WriteForKey(t *testing.T, operation, target, raw string) (<-chan struct{}, func(), func(string, string, []byte)) {
 	t.Helper()
 	entered := make(chan struct{})
 	signal := sync.OnceFunc(func() { close(entered) })
@@ -280,7 +436,7 @@ func blockL2Write(t *testing.T, operation, raw string) (<-chan struct{}, func(),
 	release := sync.OnceFunc(func() { close(blocked) })
 	t.Cleanup(release)
 	hook := func(op, key string, val []byte) {
-		if op == operation && key == "n:a" && string(val) == raw {
+		if op == operation && key == target && string(val) == raw {
 			signal()
 			<-blocked
 		}

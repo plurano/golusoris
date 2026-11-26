@@ -88,8 +88,8 @@ type flightKey struct {
 
 const l2StripeCount = 64
 
-// pendingSet records a Set without allocation because stripe locks admit one Set per stripe.
-type pendingSet struct {
+// pendingWrite fits in a fixed array without allocation because stripe locks admit one key writer per stripe.
+type pendingWrite struct {
 	key           string
 	active, dirty bool
 }
@@ -109,7 +109,8 @@ type TwoTier struct {
 	l2Prefix         sync.RWMutex
 	mutation         sync.RWMutex
 	epoch            uint64
-	l2Pending        [l2StripeCount]pendingSet
+	l2Pending        [l2StripeCount]pendingWrite
+	prefixPending    pendingWrite // The exclusive prefix gate admits one prefix delete at a time.
 	group            *singleflight.Group[flightKey, []byte]
 	origin           string
 	broadcaster      Broadcaster
@@ -190,12 +191,14 @@ func (t *Typed[V]) setL1(key string, value V) {
 	}
 }
 
-// setL1IfCurrent prevents a pre-Set L2 read from overwriting a value another Get returned.
+// setL1IfCurrent fences stale L2 results while a Set, Delete, or matching prefix delete is in flight.
 func (t *Typed[V]) setL1IfCurrent(key string, value V, epoch uint64) {
 	t.tt.mutation.Lock()
 	defer t.tt.mutation.Unlock()
 	pending := t.tt.l2Pending[l2StripeIndex(key)]
-	if t.tt.epoch == epoch && (!pending.active || pending.key != key) {
+	prefix := t.tt.prefixPending
+	if t.tt.epoch == epoch && (!pending.active || pending.key != key) &&
+		(!prefix.active || !strings.HasPrefix(key, prefix.key)) {
 		t.setL1(key, value)
 	}
 }
@@ -246,14 +249,28 @@ func l2StripeIndex(key string) int {
 }
 
 // lockL2Key keeps each key's L2 writes ordered with same-key writes and prefix deletes.
-func (t *TwoTier) lockL2Key(key string) func() {
+func (t *TwoTier) lockL2Key(stripe int) func() {
 	t.l2Prefix.RLock()
-	stripe := &t.l2Order[l2StripeIndex(key)]
-	stripe.Lock()
+	lock := &t.l2Order[stripe]
+	lock.Lock()
 	return func() {
-		stripe.Unlock()
+		lock.Unlock()
 		t.l2Prefix.RUnlock()
 	}
+}
+
+// beginPendingWrite fences L1 fills without holding mutation during L2 I/O.
+func (t *TwoTier) beginPendingWrite(pending *pendingWrite, key string) {
+	t.mutation.Lock()
+	*pending = pendingWrite{key: key, active: true}
+	t.mutation.Unlock()
+}
+
+// clearPendingWrite removes the fence when an L2 panic interrupts the commit.
+func (t *TwoTier) clearPendingWrite(pending *pendingWrite) {
+	t.mutation.Lock()
+	*pending = pendingWrite{}
+	t.mutation.Unlock()
 }
 
 // isCurrentEpoch checks the fence without holding mutation during L2 I/O.
@@ -265,7 +282,7 @@ func (t *TwoTier) isCurrentEpoch(epoch uint64) bool {
 
 // setL2IfCurrent fences loader fills superseded before they acquire the write locks.
 func (t *TwoTier) setL2IfCurrent(ctx context.Context, key string, raw []byte, epoch uint64) error {
-	unlock := t.lockL2Key(key)
+	unlock := t.lockL2Key(l2StripeIndex(key))
 	defer unlock()
 	if !t.isCurrentEpoch(epoch) {
 		return nil
@@ -278,7 +295,7 @@ func (t *TwoTier) setL2IfCurrent(ctx context.Context, key string, raw []byte, ep
 
 // deleteL2IfCurrent prevents corruption repair from deleting a superseding write.
 func (t *TwoTier) deleteL2IfCurrent(ctx context.Context, key string, epoch uint64) error {
-	unlock := t.lockL2Key(key)
+	unlock := t.lockL2Key(l2StripeIndex(key))
 	defer unlock()
 	if !t.isCurrentEpoch(epoch) {
 		return nil
@@ -311,23 +328,29 @@ func (t *Typed[V]) Set(ctx context.Context, k string, v V) error {
 
 // setBoth advances the epoch and updates L1 only after L2 accepts the write.
 func (t *Typed[V]) setBoth(ctx context.Context, key string, raw []byte, value V) error {
-	unlock := t.tt.lockL2Key(key)
-	defer unlock()
 	stripe := l2StripeIndex(key)
-	t.tt.mutation.Lock()
-	t.tt.l2Pending[stripe] = pendingSet{key: key, active: true}
-	t.tt.mutation.Unlock()
+	unlock := t.tt.lockL2Key(stripe)
+	defer unlock()
+	pending := &t.tt.l2Pending[stripe]
+	committed := false
+	t.tt.beginPendingWrite(pending, key)
+	defer func() {
+		if !committed {
+			t.tt.clearPendingWrite(pending)
+		}
+	}()
 	err := t.tt.l2.Set(ctx, key, raw, t.tt.l2TTL)
 	t.tt.mutation.Lock()
 	defer t.tt.mutation.Unlock()
-	pending := t.tt.l2Pending[stripe]
-	t.tt.l2Pending[stripe] = pendingSet{}
+	dirty := pending.dirty
+	*pending = pendingWrite{}
+	committed = true
 	if err != nil {
 		return fmt.Errorf("cache/twotier: L2 set: %w", err)
 	}
 	t.tt.epoch++
 	// L1-only caches have no newer L2 value to read after a peer notice.
-	if t.tt.l1Only || !pending.dirty {
+	if t.tt.l1Only || !dirty {
 		t.setL1(key, value)
 	} else {
 		t.tt.l1.Invalidate(key)
@@ -349,15 +372,27 @@ func (t *Typed[V]) Delete(ctx context.Context, k string) error {
 	return t.tt.broadcast(ctx, InvalidationKey, key)
 }
 
-// deleteBoth preserves the L1 entry and epoch if L2 deletion fails.
+// deleteBoth fences fills for the key during L2 deletion and evicts L1 only on success.
 func (t *TwoTier) deleteBoth(ctx context.Context, key string) error {
-	unlock := t.lockL2Key(key)
+	stripe := l2StripeIndex(key)
+	unlock := t.lockL2Key(stripe)
 	defer unlock()
-	if derr := t.l2.Del(ctx, key); derr != nil {
-		return fmt.Errorf("cache/twotier: L2 delete: %w", derr)
-	}
+	pending := &t.l2Pending[stripe]
+	committed := false
+	t.beginPendingWrite(pending, key)
+	defer func() {
+		if !committed {
+			t.clearPendingWrite(pending)
+		}
+	}()
+	err := t.l2.Del(ctx, key)
 	t.mutation.Lock()
 	defer t.mutation.Unlock()
+	*pending = pendingWrite{}
+	committed = true
+	if err != nil {
+		return fmt.Errorf("cache/twotier: L2 delete: %w", err)
+	}
 	t.epoch++
 	t.l1.Invalidate(key)
 	return nil
@@ -396,15 +431,25 @@ func (t *TwoTier) InvalidatePrefix(ctx context.Context, prefix string) error {
 	return t.broadcast(ctx, InvalidationPrefix, prefix)
 }
 
-// invalidatePrefixBoth excludes key writers until both tiers and the epoch reflect the deletion.
+// invalidatePrefixBoth fences matching L1 fills during L2 deletion and evicts L1 only on success.
 func (t *TwoTier) invalidatePrefixBoth(ctx context.Context, prefix string) error {
 	t.l2Prefix.Lock()
 	defer t.l2Prefix.Unlock()
-	if derr := t.l2.DelPrefix(ctx, prefix); derr != nil {
-		return fmt.Errorf("cache/twotier: L2 invalidate prefix %q: %w", prefix, derr)
-	}
+	committed := false
+	t.beginPendingWrite(&t.prefixPending, prefix)
+	defer func() {
+		if !committed {
+			t.clearPendingWrite(&t.prefixPending)
+		}
+	}()
+	err := t.l2.DelPrefix(ctx, prefix)
 	t.mutation.Lock()
 	defer t.mutation.Unlock()
+	t.prefixPending = pendingWrite{}
+	committed = true
+	if err != nil {
+		return fmt.Errorf("cache/twotier: L2 invalidate prefix %q: %w", prefix, err)
+	}
 	t.epoch++
 	t.evictL1Prefix(prefix)
 	return nil
