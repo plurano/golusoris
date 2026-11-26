@@ -67,6 +67,7 @@ for value in \
 	"$BUF_VERSION" \
 	"v$SHELLCHECK_VERSION" \
 	"$ACTIONLINT_VERSION" \
+	"$SHFMT_VERSION" \
 	"v$GORELEASER_VERSION" \
 	"v$SYFT_VERSION" \
 	"v$COSIGN_VERSION" \
@@ -155,6 +156,7 @@ for variable in \
 	CONTROLLER_GEN_VERSION \
 	GO_MUTESTING_VERSION \
 	HELM_VERSION \
+	SHFMT_VERSION \
 	ACTIONLINT_VERSION; do
 	if ! grep -Fq "\$(${variable})" "$repo_root/Makefile"; then
 		printf 'tools-bootstrap does not consume %s\n' "$variable" >&2
@@ -701,7 +703,10 @@ for workflow in "${custom_semgrep_workflows[@]}"; do
 		exit 1
 	fi
 done
-if ! grep -Fq 'SEMGREP_IMAGE_DIGEST' "$repo_root/.github/workflows/security-scan.yml"; then
+if ! grep -Fq 'bash scripts/ci/semgrep-registry.sh' \
+	"$repo_root/.github/workflows/security-scan.yml" || \
+	! grep -Fq 'tools/tool-versions.env' "$repo_root/scripts/ci/semgrep-registry.sh" || \
+	! grep -Fq "@\${SEMGREP_IMAGE_DIGEST}" "$repo_root/scripts/ci/semgrep-registry.sh"; then
 	printf 'registry Semgrep workflow does not consume the image digest authority\n' >&2
 	exit 1
 fi
