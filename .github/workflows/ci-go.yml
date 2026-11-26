@@ -7,7 +7,7 @@
 # Apps call it with:
 #   jobs:
 #     ci:
-#       uses: golusoris/golusoris/.github/workflows/ci-go.yml@main
+#       uses: plurano/golusoris/.github/workflows/ci-go.yml@main
 #       with:
 #         runs-on: ubuntu-26.04
 #         working-directory: .
@@ -59,7 +59,7 @@ on:
         description: Exact govulncheck version
         type: string
         # renovate: datasource=go depName=golang.org/x/vuln versioning=semver
-        default: v1.9.0
+        default: v1.10.0
       apidiff-version:
         description: Exact go-apidiff version
         type: string
@@ -198,7 +198,7 @@ jobs:
             mode=(--install)
           fi
           bash "$ci_root/scripts/ci/verify-system-packages.sh" "${mode[@]}" "${packages[@]}"
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7
         with:
           go-version-file: ${{ inputs.go-version-file }}
           cache: true
@@ -294,7 +294,7 @@ jobs:
             mode=(--install)
           fi
           bash "$ci_root/scripts/ci/verify-system-packages.sh" "${mode[@]}" "${packages[@]}"
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7
         with:
           go-version-file: ${{ inputs.go-version-file }}
           cache: true
@@ -399,7 +399,7 @@ jobs:
             mode=(--install)
           fi
           bash "$ci_root/scripts/ci/verify-system-packages.sh" "${mode[@]}" "${packages[@]}"
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7
         with:
           go-version-file: ${{ inputs.go-version-file }}
           cache: true
@@ -492,7 +492,7 @@ jobs:
             mode=(--install)
           fi
           bash "$ci_root/scripts/ci/verify-system-packages.sh" "${mode[@]}" "${packages[@]}"
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7
         with:
           go-version-file: ${{ inputs.go-version-file }}
           cache: true
@@ -616,7 +616,7 @@ jobs:
             mode=(--install)
           fi
           bash "$ci_root/scripts/ci/verify-system-packages.sh" "${mode[@]}" "${packages[@]}"
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7
         with:
           go-version-file: ${{ inputs.go-version-file }}
           cache: true
@@ -668,11 +668,23 @@ jobs:
             scripts/ci
           path: .golusoris-ci
           persist-credentials: false
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7
         with:
           go-version-file: .golusoris-ci/go.mod
           cache: false
+      - name: Compute the vacuum cache key
+        id: vacuum-key
+        run: |
+          key="$(bash .golusoris-ci/scripts/ci/install-vacuum.sh --cache-key)"
+          printf 'key=%s\n' "$key" >> "$GITHUB_OUTPUT"
+      - name: Cache verified vacuum
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/vacuum-cache
+          key: ${{ steps.vacuum-key.outputs.key }}
       - name: Install vacuum (module sum pinned)
+        env:
+          VACUUM_CACHE_DIR: ${{ runner.temp }}/vacuum-cache
         run: bash .golusoris-ci/scripts/ci/install-vacuum.sh "$RUNNER_TEMP/vacuum-bin"
       - name: Verify default OpenAPI ruleset contract
         run: VACUUM="$RUNNER_TEMP/vacuum-bin/vacuum" bash .golusoris-ci/scripts/ci/openapi-ruleset-test.sh
@@ -742,7 +754,7 @@ jobs:
             mode=(--install)
           fi
           bash "$ci_root/scripts/ci/verify-system-packages.sh" "${mode[@]}" "${packages[@]}"
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7
         with:
           go-version-file: ${{ inputs.go-version-file }}
           cache: true

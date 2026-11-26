@@ -34,3 +34,4 @@ _ = shared // true if this goroutine shared someone else's in-flight call
 
 - Don't pass request-scoped data via ctx into fn — context belongs to first caller; later callers share result, not context.
 - Don't use as rate-limiter — singleflight collapses concurrent identical calls, not sequential ones.
+- fn passed to DoCancelable must honour ctx; a canceled starter waits for fn to return.
