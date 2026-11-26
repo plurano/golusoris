@@ -171,7 +171,7 @@ lefthook install          # writes .git/hooks/{pre-commit,commit-msg,post-commit
 | `pre-commit` (parallel, staged `*.go` only) | `gofumpt -l`, `gci list`, `golangci-lint run --config .golangci.yml` and `go vet` on the packages of the staged files; `praetorctl compile-context --verify`, `praetorctl audit`, `reuse lint`, `gitleaks git --staged` |
 | `commit-msg` | Conventional Commits subject (`<type>(<scope>): <description>`), the DCO `Signed-off-by:` trailer, and no model or coding-tool attribution (`scripts/ci/check-attribution.sh`) |
 | `post-commit` | `praetorctl state sync .`, `praetorctl dedupe cadence --threshold=20 --record .` |
-| `pre-push` | all primary-module build/vet + `go test -short` (no `-race`); `GO_MODULE_GROUP=primary scripts/ci/go-modules.sh vuln`; `praetorctl audit` |
+| `pre-push` | all primary-module build/vet + `go test -short` (no `-race`); `GO_MODULE_GROUP=primary scripts/ci/go-modules.sh vuln`; `praetorctl audit`; registry Semgrep on pushed files (scripts/hooks/semgrep.sh, skipped without Docker) |
 | `agent-checkpoint-tool` / `agent-checkpoint-stop` | Bounded checkpoint evaluator (`.config/lefthook/scripts/checkpoint.py`); disabled until a reviewed `.config/agent/checkpoint.json` is added locally — not part of this adoption |
 
 `go test -short` skips the testcontainers-backed helpers in `testutil/`
