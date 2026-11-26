@@ -152,6 +152,83 @@ func TestInvalidation_PeerSetDuringLocalSetLeavesNoStaleL1(t *testing.T) {
 	require.Equal(t, int32(1), shared.getCalls.Load()-gets, "L2 reads after local Set")
 }
 
+type localMutationCase struct {
+	name   string
+	op     string
+	raw    string
+	mutate func(context.Context, *Typed[int]) error
+}
+
+// TestLocalMutationWaitsForOlderFill checks the local barrier before a synchronous peer Delete.
+func TestLocalMutationWaitsForOlderFill(t *testing.T) {
+	t.Parallel()
+	armL2LockWatchdog(t)
+	cases := [...]localMutationCase{
+		{name: "set", op: "set", raw: "2", mutate: func(ctx context.Context, view *Typed[int]) error {
+			return view.Set(ctx, "z", 2)
+		}},
+		{name: "delete", op: "del", mutate: func(ctx context.Context, view *Typed[int]) error {
+			return view.Delete(ctx, "z")
+		}},
+		{name: "prefix", op: "del-prefix", mutate: func(ctx context.Context, view *Typed[int]) error {
+			return view.InvalidatePrefix(ctx, "z")
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(subtest *testing.T) {
+			subtest.Parallel()
+			require.NotEqual(subtest, l2StripeIndex("n:k"), l2StripeIndex("n:z"))
+			checkLocalMutationAfterBlockedFill(subtest, tc)
+		})
+	}
+}
+
+// checkLocalMutationAfterBlockedFill holds a fill gate reader until the local barrier queues.
+func checkLocalMutationAfterBlockedFill(t *testing.T, tc localMutationCase) {
+	t.Helper()
+	ctx := t.Context()
+	a, b, shared := newPeers(t)
+	aView, bView := NewTyped[int](a, "n"), NewTyped[int](b, "n")
+	entered, releaseFill, fillHook := blockL2WriteForKey(t, "set", "n:k", "1")
+	written, finishWrite, mutationHook := blockL2WriteForKey(t, tc.op, "n:z", tc.raw)
+	shared.beforeWrite = fillHook
+	shared.afterWrite = mutationHook
+	defer finishWrite()
+	fill := startOlderPeerFill(t, releaseFill, aView)
+	waitL2LockSignal(t, entered, "loader fill did not reach its L2 write")
+	mutation := startL2LockOperation(t, releaseFill, func() error { return tc.mutate(ctx, aView) })
+	if tc.op == "del-prefix" {
+		mutation.requireBlocked(t, "sync.RWMutex.Lock", ").invalidatePrefixBoth(")
+		releaseFill()
+		fill.requireDone(t, "loader fill did not finish before the prefix write")
+	}
+	waitL2LockSignal(t, written, "local mutation did not write to shared L2")
+	releaseReader := releaseFill
+	if tc.op == "del-prefix" {
+		// The prefix lock already drained the real fill, so hold a reader to isolate the post-commit barrier.
+		require.True(t, a.l2FillGate.TryRLock(), "could not hold a fill gate reader during the prefix commit")
+		releaseReader = sync.OnceFunc(a.l2FillGate.RUnlock)
+		defer releaseReader()
+	}
+	finishWrite()
+	requireFillGateWriter(t, &a.l2FillGate, func() {
+		select {
+		case <-mutation.done:
+			t.Fatalf("local %s returned before the older fill wrote L2", tc.name)
+		default:
+		}
+	}, "local mutation never queued on the fill gate")
+	releaseReader()
+	fill.requireDone(t, "loader fill did not finish after release")
+	mutation.requireDone(t, "local mutation did not finish after release")
+	peer := startL2LockOperation(t, nil, func() error { return bView.Delete(ctx, "k") })
+	peer.requireDone(t, "peer Delete did not finish")
+	_, found, err := shared.Get(ctx, "n:k")
+	require.NoError(t, err)
+	require.False(t, found, "older fill recreated the deleted L2 entry")
+	requirePeerReload(t, ctx, aView)
+}
+
 // TestInvalidation_PeerDeleteWinsAfterBlockedFill covers same-stripe key, other-stripe key, and prefix notices.
 func TestInvalidation_PeerDeleteWinsAfterBlockedFill(t *testing.T) {
 	t.Parallel()
@@ -182,7 +259,7 @@ func TestInvalidation_PeerDeleteWinsAfterBlockedFill(t *testing.T) {
 	}
 }
 
-// checkPeerDeleteAfterBlockedFill holds the older fill until the peer notice has had a chance to block.
+// checkPeerDeleteAfterBlockedFill holds the older fill until the peer notice queues on its fill gate.
 func checkPeerDeleteAfterBlockedFill(t *testing.T, mutate func(context.Context, *Typed[int]) error) {
 	t.Helper()
 	ctx := t.Context()
@@ -198,10 +275,7 @@ func checkPeerDeleteAfterBlockedFill(t *testing.T, mutate func(context.Context, 
 			signal()
 		}
 	}
-	fill := startL2LockOperation(t, release, func() error {
-		value, err := aView.Get(ctx, "k", func(context.Context) (int, error) { return 1, nil })
-		return checkL2LockTestValue(value, err, 1)
-	})
+	fill := startOlderPeerFill(t, release, aView)
 	waitL2LockSignal(t, entered, "loader fill did not reach its L2 write")
 	peer := startL2LockOperation(t, release, func() error {
 		if err := mutate(ctx, bView); err != nil {
@@ -210,7 +284,9 @@ func checkPeerDeleteAfterBlockedFill(t *testing.T, mutate func(context.Context, 
 		return bView.Delete(ctx, "k")
 	})
 	waitL2LockSignal(t, broadcastStarted, "peer did not start its first notice while the fill was paused")
-	requirePeerNoticeFenced(t, deleteReached, peer.done)
+	requireFillGateWriter(t, &a.l2FillGate, func() {
+		requirePeerNoticeFenced(t, deleteReached, peer.done)
+	}, "peer notice never queued on the receiving fill gate")
 	release()
 	fill.requireDone(t, "loader fill did not finish after release")
 	peer.requireDone(t, "peer mutations did not finish after release")
@@ -223,18 +299,55 @@ func checkPeerDeleteAfterBlockedFill(t *testing.T, mutate func(context.Context, 
 	requirePeerReload(t, ctx, bView)
 }
 
+// startOlderPeerFill runs the same loader fill for the local barrier and peer notice tests.
+func startOlderPeerFill(t *testing.T, release func(), view *Typed[int]) *l2LockOperation {
+	t.Helper()
+	ctx := t.Context()
+	return startL2LockOperation(t, release, func() error {
+		value, err := view.Get(ctx, "k", func(context.Context) (int, error) { return 1, nil })
+		return checkL2LockTestValue(value, err, 1)
+	})
+}
+
+// requireFillGateWriter observes a queued writer while the test holds a fill gate reader.
+func requireFillGateWriter(t *testing.T, gate *sync.RWMutex, requirePending func(), timeoutMessage string) {
+	t.Helper()
+	// Give the worker time to queue between lock attempts.
+	const fillGatePollInterval = time.Millisecond
+	// Bound observations even if the worker never queues.
+	const fillGatePollLimit = int(l2LockTimeout / fillGatePollInterval)
+	ticks := time.NewTicker(fillGatePollInterval)
+	defer ticks.Stop()
+	deadline := time.NewTimer(l2LockTimeout)
+	defer deadline.Stop()
+poll:
+	for range fillGatePollLimit {
+		requirePending()
+		if !gate.TryRLock() {
+			requirePending()
+			return
+		}
+		gate.RUnlock()
+		select {
+		case <-deadline.C:
+			break poll
+		case <-ticks.C:
+		}
+	}
+	requirePending()
+	t.Fatal(timeoutMessage)
+}
+
 // requirePeerNoticeFenced checks for peer progress while its first notice should be blocked.
 func requirePeerNoticeFenced(t *testing.T, deleteReached, peerDone <-chan struct{}) {
 	t.Helper()
-	// Start the window at broadcast entry so an unfenced peer can reach L2 before fill release.
-	const peerDeleteWindow = time.Second
 	var earlyProgress string
 	select {
 	case <-deleteReached:
 		earlyProgress = "peer Delete reached shared L2"
 	case <-peerDone:
 		earlyProgress = "peer worker returned"
-	case <-time.After(peerDeleteWindow):
+	default:
 	}
 	require.Empty(t, earlyProgress, "missing loader-fill fence: peer progressed before fill release")
 }

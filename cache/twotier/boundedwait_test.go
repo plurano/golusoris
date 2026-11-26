@@ -274,47 +274,37 @@ func unboundedFillCalls(filename string, src []byte) ([]token.Position, error) {
 	return positions, nil
 }
 
-// insideL2LockWorker requires the nearest function literal to be the nearest worker's run argument.
+// insideL2LockWorker accepts synchronous calls in the nearest worker's run literal.
 func insideL2LockWorker(ancestors []ast.Node) bool {
 	const runArgIndex = 2
 	var enclosing *ast.FuncLit
 	for _, ancestor := range slices.Backward(ancestors) {
-		if literal, isLiteral := ancestor.(*ast.FuncLit); isLiteral && enclosing == nil {
-			enclosing = literal
+		switch node := ancestor.(type) {
+		case *ast.GoStmt:
+			if enclosing == nil {
+				return false
+			}
+		case *ast.FuncLit:
+			if enclosing == nil {
+				enclosing = node
+			}
+		case *ast.CallExpr:
+			callee, named := ast.Unparen(node.Fun).(*ast.Ident)
+			if named && callee.Name == "startL2LockOperation" {
+				return len(node.Args) > runArgIndex && ast.Unparen(node.Args[runArgIndex]) == enclosing
+			}
 		}
-		call, ok := ancestor.(*ast.CallExpr)
-		if !ok {
-			continue
-		}
-		callee, named := ast.Unparen(call.Fun).(*ast.Ident)
-		if !named || callee.Name != "startL2LockOperation" {
-			continue
-		}
-		if len(call.Args) <= runArgIndex || enclosing == nil {
-			return false
-		}
-		return ast.Unparen(call.Args[runArgIndex]) == enclosing
 	}
 	return false
 }
 
-// TestSetL1IfCurrentCallsAreBoundedFixtures accepts worker calls and flags escaping callbacks.
+// TestSetL1IfCurrentCallsAreBoundedFixtures accepts worker calls and flags escaping calls.
 func TestSetL1IfCurrentCallsAreBoundedFixtures(t *testing.T) {
 	t.Parallel()
 	const planted = `package twotier
 func test() {
 	stub.beforeWrite = func() {
 		view.setL1IfCurrent("n:a", 1, epoch)
-	}
-}
-`
-	const clean = `package twotier
-func test() {
-	stub.beforeWrite = func() {
-		startL2LockOperation(t, nil, func() error {
-			view.setL1IfCurrent("n:a", 1, epoch)
-			return nil
-		})
 	}
 }
 `
@@ -345,15 +335,38 @@ func test() {
 	})
 }
 `
+	const goStatement = `package twotier
+func test() {
+	startL2LockOperation(t, nil, func() error {
+		go view.setL1IfCurrent("n:a", 1, epoch)
+		return nil
+	})
+}
+`
+	requireBoundedFillCallFixture(t)
 	requireUnboundedFillCall(t, "planted_test.go", planted, 4)
-
-	cleanPositions, scanErr := unboundedFillCalls("clean_test.go", []byte(clean))
-	require.NoError(t, scanErr)
-	require.Empty(t, cleanPositions)
-
 	requireUnboundedFillCall(t, "release_test.go", release, 4)
 	requireUnboundedFillCall(t, "nested_release_test.go", nestedRelease, 5)
 	requireUnboundedFillCall(t, "nested_callback_test.go", nestedCallback, 5)
+	requireUnboundedFillCall(t, "go_statement_test.go", goStatement, 4)
+}
+
+// requireBoundedFillCallFixture checks that the worker's synchronous run call is accepted.
+func requireBoundedFillCallFixture(t *testing.T) {
+	t.Helper()
+	const clean = `package twotier
+func test() {
+	stub.beforeWrite = func() {
+		startL2LockOperation(t, nil, func() error {
+			view.setL1IfCurrent("n:a", 1, epoch)
+			return nil
+		})
+	}
+}
+`
+	positions, err := unboundedFillCalls("clean_test.go", []byte(clean))
+	require.NoError(t, err)
+	require.Empty(t, positions)
 }
 
 // requireUnboundedFillCall checks that the fixture reports only the planted call.

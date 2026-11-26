@@ -60,8 +60,8 @@ func (s *UserService) Load(ctx context.Context, id string) (*User, error) {
 - L2 key writes hold shared `l2Prefix` gate + key stripe. L2 prefix deletes hold gate exclusively. L2 reads take neither lock.
 - Loader fill or repair L2 write -> shared `l2FillGate` through epoch check and write.
 - Lock order: `l2Prefix` -> key stripe -> fill gate -> `mutation`.
-- Peer notice (key, prefix, empty prefix) -> exclusive fill gate -> waits for every in-flight loader fill or repair L2 write on this instance, as at base. Set, Delete and prefix-delete writes skip fill gate.
-- Slow fill L2 write -> delays every peer notice. Fill gate wait has no deadline. L2 call uses Get context.
+- Peer notice (key, prefix, empty prefix) -> exclusive fill gate -> waits for every in-flight loader fill or repair L2 write on this instance, as at base. Successful local Set, Delete, prefix delete -> after commit, before broadcast: exclusive fill gate, released at once -> returns after every fill or repair L2 call that passed its epoch check before commit, as at base.
+- Slow fill L2 write -> delays every peer notice. Fill gate wait has no deadline. L2 call uses Get context. Local write latency includes slowest in-flight fill L2 call; queued barrier blocks new fills (writer preference).
 - Pending Set or Delete fences shared-L2 read-through fills for its key. Pending prefix delete fences shared-L2 fills under its prefix. Shared-L2 fenced fill -> evict its key from L1. L1-only fill -> check epoch only. L1-only Set always publishes to L1. Shared-L2 Set publishes unless a peer notice for its key or a covering prefix arrives during its L2 write.
 - Shared-L2 fenced fill -> same key state as L1 TTL or capacity eviction at that instant, even after newer L1 commit. Pending Set, Delete, or prefix delete success or failure -> eviction holds.
   After either eviction, each separate Get flight -> read L2 until next L1 install.

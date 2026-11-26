@@ -276,6 +276,12 @@ func (t *TwoTier) lockL2Fill() func() {
 	return t.l2FillGate.RUnlock
 }
 
+// waitForL2Fills drains L2 fills and repairs that passed their epoch check before the local commit.
+func (t *TwoTier) waitForL2Fills() {
+	t.l2FillGate.Lock()
+	defer t.l2FillGate.Unlock()
+}
+
 // lockInvalidationFill makes key and prefix notices wait for in-flight L2 fills and repairs across all stripes.
 func (t *TwoTier) lockInvalidationFill(inv Invalidation) func() {
 	switch inv.Kind {
@@ -340,7 +346,7 @@ func (t *TwoTier) deleteL2IfCurrent(ctx context.Context, key string, epoch uint6
 // publishes v to L1. With shared L2, Set publishes v to L1 unless a peer notice
 // for k or a prefix covering k arrives during the write. A disabled cache is a
 // no-op. An error wrapping [ErrBroadcast] means the local write succeeded but
-// peers were not told.
+// peers were not told. After committing, Set waits for older L2 fills and repairs before broadcasting.
 func (t *Typed[V]) Set(ctx context.Context, k string, v V) error {
 	if t.tt == nil {
 		return nil
@@ -353,6 +359,7 @@ func (t *Typed[V]) Set(ctx context.Context, k string, v V) error {
 	if err := t.setBoth(ctx, key, raw, v); err != nil {
 		return err
 	}
+	t.tt.waitForL2Fills()
 	return t.tt.broadcast(ctx, InvalidationKey, key)
 }
 
@@ -390,7 +397,7 @@ func (t *Typed[V]) setBoth(ctx context.Context, key string, raw []byte, value V)
 
 // Delete removes k from both tiers and tells peers to evict it. On a disabled
 // cache it is a no-op. An error wrapping [ErrBroadcast] means k is gone
-// locally but peers were not told.
+// locally but peers were not told. After committing, Delete waits for older L2 fills and repairs before broadcasting.
 func (t *Typed[V]) Delete(ctx context.Context, k string) error {
 	if t.tt == nil {
 		return nil
@@ -399,6 +406,7 @@ func (t *Typed[V]) Delete(ctx context.Context, k string) error {
 	if err := t.tt.deleteBoth(ctx, key); err != nil {
 		return err
 	}
+	t.tt.waitForL2Fills()
 	return t.tt.broadcast(ctx, InvalidationKey, key)
 }
 
@@ -451,6 +459,7 @@ func (t *Typed[V]) InvalidatePrefix(ctx context.Context, prefix string) error {
 // matching keys are Invalidated individually and forgotten from singleflight.
 // L2 prefix eviction is delegated to the [l2] adapter. Peers are told to
 // evict the prefix; an error wrapping [ErrBroadcast] means they were not.
+// After committing, InvalidatePrefix waits for older L2 fills and repairs before broadcasting.
 func (t *TwoTier) InvalidatePrefix(ctx context.Context, prefix string) error {
 	if t == nil {
 		return nil
@@ -458,6 +467,7 @@ func (t *TwoTier) InvalidatePrefix(ctx context.Context, prefix string) error {
 	if err := t.invalidatePrefixBoth(ctx, prefix); err != nil {
 		return err
 	}
+	t.waitForL2Fills()
 	return t.broadcast(ctx, InvalidationPrefix, prefix)
 }
 
