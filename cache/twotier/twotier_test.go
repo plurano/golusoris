@@ -31,6 +31,7 @@ type stubL2 struct {
 	failSet        bool
 	failDel        bool
 	failDelPrefix  bool
+	failAfterHook  bool
 	beforeWrite    func(op, key string, val []byte)
 	afterWrite     func(op, key string, val []byte)
 }
@@ -59,6 +60,9 @@ func (s *stubL2) Set(_ context.Context, key string, val []byte, _ time.Duration)
 	if s.beforeWrite != nil {
 		s.beforeWrite("set", key, val)
 	}
+	if s.failAfterHook {
+		return errStub
+	}
 	s.mu.Lock()
 	s.data[key] = val
 	s.mu.Unlock()
@@ -77,6 +81,9 @@ func (s *stubL2) Del(_ context.Context, key string) error {
 	if s.beforeWrite != nil {
 		s.beforeWrite("del", key, nil)
 	}
+	if s.failAfterHook {
+		return errStub
+	}
 	s.mu.Lock()
 	delete(s.data, key)
 	s.mu.Unlock()
@@ -94,6 +101,9 @@ func (s *stubL2) DelPrefix(_ context.Context, prefix string) error {
 	}
 	if s.beforeWrite != nil {
 		s.beforeWrite("del-prefix", prefix, nil)
+	}
+	if s.failAfterHook {
+		return errStub
 	}
 	s.mu.Lock()
 	for k := range s.data {

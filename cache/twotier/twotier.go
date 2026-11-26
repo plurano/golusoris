@@ -193,6 +193,7 @@ func (t *Typed[V]) setL1(key string, value V) {
 
 // setL1IfCurrent evicts a fenced key only with shared L2 because L1-only reads cannot see early L2 values.
 // Because the epoch is store-wide, eviction comes before its check and can cost one reload of a newer committed L1 value without installing a stale fill.
+// The eviction holds whether the pending write succeeds or fails.
 func (t *Typed[V]) setL1IfCurrent(key string, value V, epoch uint64) {
 	t.tt.mutation.Lock()
 	defer t.tt.mutation.Unlock()
@@ -381,7 +382,7 @@ func (t *Typed[V]) Delete(ctx context.Context, k string) error {
 	return t.tt.broadcast(ctx, InvalidationKey, key)
 }
 
-// deleteBoth fences fills for the key during L2 deletion and evicts L1 only on success.
+// deleteBoth fences fills during L2 deletion and evicts L1 on success. A fenced fill can evict L1 during the write via [Typed.setL1IfCurrent].
 func (t *TwoTier) deleteBoth(ctx context.Context, key string) error {
 	stripe := l2StripeIndex(key)
 	unlock := t.lockL2Key(stripe)
@@ -440,7 +441,7 @@ func (t *TwoTier) InvalidatePrefix(ctx context.Context, prefix string) error {
 	return t.broadcast(ctx, InvalidationPrefix, prefix)
 }
 
-// invalidatePrefixBoth fences matching L1 fills during L2 deletion and evicts L1 only on success.
+// invalidatePrefixBoth fences matching fills during L2 deletion and evicts matching L1 entries on success. A fenced fill can evict its key during the write via [Typed.setL1IfCurrent].
 func (t *TwoTier) invalidatePrefixBoth(ctx context.Context, prefix string) error {
 	// A refused prefix delete must not fence fills.
 	if prefix == "" {

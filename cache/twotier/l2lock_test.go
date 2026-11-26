@@ -381,6 +381,92 @@ func TestFencedFillEvictsNewerCommittedL1(t *testing.T) {
 	checkFencedReloadCommit(t, view, stub)
 }
 
+// TestFencedFillEvictionOutlivesFailedWrite covers the review case where a fenced fill evicts a newer L1 commit during a write that later fails.
+func TestFencedFillEvictionOutlivesFailedWrite(t *testing.T) {
+	t.Parallel()
+	armL2LockWatchdog(t)
+	cases := [...]struct {
+		name string
+		op   string
+		raw  string
+		run  func(context.Context, *Typed[int]) error
+	}{
+		{name: "set", op: "set", raw: "3", run: func(ctx context.Context, view *Typed[int]) error {
+			return view.Set(ctx, "a", 3)
+		}},
+		{name: "delete", op: "del", run: func(ctx context.Context, view *Typed[int]) error {
+			return view.Delete(ctx, "a")
+		}},
+		{name: "prefix", op: "del-prefix", run: func(ctx context.Context, view *Typed[int]) error {
+			return view.InvalidatePrefix(ctx, "a")
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(subtest *testing.T) {
+			subtest.Parallel()
+			ctx := subtest.Context()
+			stub := newStubL2()
+			stub.data["n:a"] = []byte("1")
+			stub.data["n:c"] = []byte("7")
+			view := NewTyped[int](newTestTwoTier(subtest, stub), "n")
+			missEpoch := warmFencedFillKeys(subtest, view)
+
+			requireL2LockSetupSet(subtest, func() error { return view.Set(ctx, "a", 2) })
+			committedEpoch, committed, present := snapshotL2LockTestKey(subtest, nil, view, "n:a")
+			require.True(subtest, present)
+			require.Equal(subtest, 2, committed)
+			require.NotEqual(subtest, missEpoch, committedEpoch)
+
+			entered, release, hook := blockL2Write(subtest, tc.op, tc.raw)
+			stub.beforeWrite = hook
+			stub.failAfterHook = true
+			write := startL2LockOperation(subtest, release, func() error { return tc.run(ctx, view) })
+			waitL2LockSignal(subtest, entered, "later write did not enter L2")
+			requireStaleL1InstallDone(subtest, release, view, missEpoch)
+			requireFencedFillEviction(subtest, release, view)
+
+			release()
+			waitL2LockSignal(subtest, write.done, "later write did not finish after release")
+			require.ErrorIs(subtest, write.err, errStub)
+			checkFailedFencedFillReload(subtest, view, stub)
+		})
+	}
+}
+
+// requireFencedFillEviction checks that the fenced fill evicted only its key.
+func requireFencedFillEviction(t *testing.T, release func(), view *Typed[int]) {
+	t.Helper()
+	_, cached, kept := snapshotL2LockTestKey(t, release, view, "n:a")
+	require.False(t, kept, "fenced fill must evict a, found %d in L1", cached)
+	_, other, otherPresent := snapshotL2LockTestKey(t, release, view, "n:c")
+	require.True(t, otherPresent, "unrelated key must stay warm in L1")
+	require.Equal(t, 7, other)
+}
+
+// checkFailedFencedFillReload verifies the failed write leaves the key cold until one L2 read warms it again.
+func checkFailedFencedFillReload(t *testing.T, view *Typed[int], stub *stubL2) {
+	t.Helper()
+	requireFencedFillEviction(t, nil, view)
+	var raw string
+	snapshot := startL2LockOperation(t, nil, func() error {
+		stub.mu.Lock()
+		defer stub.mu.Unlock()
+		raw = string(stub.data["n:a"])
+		return nil
+	})
+	snapshot.requireDone(t, "L2 snapshot did not finish")
+	require.Equal(t, "2", raw)
+	gets := stub.getCalls.Load()
+	ctx := t.Context()
+	read := func() error { return readCachedL2LockTestKey(ctx, view, "a", 2) }
+	first := startL2LockOperation(t, nil, read)
+	first.requireDone(t, "read after failed write did not finish")
+	require.Equal(t, gets+1, stub.getCalls.Load(), "first read after failed write must reach L2")
+	second := startL2LockOperation(t, nil, read)
+	second.requireDone(t, "second read after failed write did not finish")
+	require.Equal(t, gets+1, stub.getCalls.Load(), "second read after failed write must hit L1")
+}
+
 // snapshotL2LockTestKey bounds the read of the epoch and L1 value under mutation.
 func snapshotL2LockTestKey(t *testing.T, release func(), view *Typed[int], key string) (uint64, int, bool) {
 	t.Helper()
