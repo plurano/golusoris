@@ -233,6 +233,24 @@ func TestInFlightPrefixDeleteBlocksStaleL1Install(t *testing.T) {
 }
 
 // TestRefusedEmptyPrefixKeepsCommittedL1 guards a committed value against a stale fill during refusal.
+func TestRefusedEmptyPrefixDoesNotWaitForMutationLock(t *testing.T) {
+	t.Parallel()
+	armL2LockWatchdog(t)
+	ctx := t.Context()
+	stub := newStubL2()
+	tiers := newTestTwoTier(t, stub)
+
+	// Hold the guard before starting invalidation so even a transient
+	// pending-write fence would block. Release it on timeout as well.
+	tiers.mutation.Lock()
+	defer tiers.mutation.Unlock()
+
+	op := startL2LockOperation(t, nil, func() error { return tiers.InvalidatePrefix(ctx, "") })
+	require.True(t, l2LockSignalReceived(op.done, l2LockTimeout), "cache/twotier: empty prefix refusal did not finish while the mutation lock was held")
+	require.ErrorIs(t, op.err, errEmptyPrefix)
+	require.Zero(t, stub.delPrefixCalls.Load())
+}
+
 func TestRefusedEmptyPrefixKeepsCommittedL1(t *testing.T) {
 	t.Parallel()
 	armL2LockWatchdog(t)
