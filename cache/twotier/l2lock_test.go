@@ -232,7 +232,7 @@ func TestInFlightPrefixDeleteBlocksStaleL1Install(t *testing.T) {
 	}
 }
 
-// TestRefusedEmptyPrefixKeepsCommittedL1 guards a committed value against a stale fill during refusal.
+// TestRefusedEmptyPrefixDoesNotWaitForMutationLock verifies that empty-prefix invalidation returns errEmptyPrefix while the mutation lock is held, without calling L2 prefix deletion.
 func TestRefusedEmptyPrefixDoesNotWaitForMutationLock(t *testing.T) {
 	t.Parallel()
 	armL2LockWatchdog(t)
@@ -251,6 +251,7 @@ func TestRefusedEmptyPrefixDoesNotWaitForMutationLock(t *testing.T) {
 	require.Zero(t, stub.delPrefixCalls.Load())
 }
 
+// TestRefusedEmptyPrefixKeepsCommittedL1 guards a committed value against a stale fill during refusal.
 func TestRefusedEmptyPrefixKeepsCommittedL1(t *testing.T) {
 	t.Parallel()
 	armL2LockWatchdog(t)
