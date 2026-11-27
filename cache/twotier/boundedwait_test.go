@@ -12,6 +12,7 @@ import (
 	"go/types"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -330,7 +331,7 @@ func isSynchronousWorkerStart(ancestors []ast.Node) bool {
 		case *ast.FuncDecl:
 			return i+1 < len(ancestors) && ancestors[i+1] == node.Body
 		case *ast.FuncLit:
-			if i < 2 || !isSubtestRunLiteral(node, ancestors[i-1], ancestors[i-2]) {
+			if i < 2 || !isSubtestRunLiteral(node, ancestors[:i]) {
 				return false
 			}
 			i--
@@ -341,13 +342,13 @@ func isSynchronousWorkerStart(ancestors []ast.Node) bool {
 	return false
 }
 
-// isSubtestRunLiteral recognizes an inline subtest in a direct ident.Run call statement.
-func isSubtestRunLiteral(run *ast.FuncLit, parent, grandparent ast.Node) bool {
-	call, ok := parent.(*ast.CallExpr)
+// isSubtestRunLiteral requires a direct Run call on a resolved *testing.T parameter.
+func isSubtestRunLiteral(run *ast.FuncLit, ancestors []ast.Node) bool {
+	call, ok := ancestors[len(ancestors)-1].(*ast.CallExpr)
 	if !ok || len(call.Args) != 2 || call.Args[1] != run {
 		return false
 	}
-	statement, standalone := grandparent.(*ast.ExprStmt)
+	statement, standalone := ancestors[len(ancestors)-2].(*ast.ExprStmt)
 	if !standalone || statement.X != call {
 		return false
 	}
@@ -355,8 +356,157 @@ func isSubtestRunLiteral(run *ast.FuncLit, parent, grandparent ast.Node) bool {
 	if !selected || selector.Sel.Name != "Run" {
 		return false
 	}
-	_, named := selector.X.(*ast.Ident)
-	return named
+	receiver, named := selector.X.(*ast.Ident)
+	return named && receiver.Name != "_" && isTestingRunReceiver(receiver, ancestors[:len(ancestors)-2])
+}
+
+// isTestingRunReceiver resolves the parameter and its type qualifier at their respective use sites.
+func isTestingRunReceiver(receiver *ast.Ident, ancestors []ast.Node) bool {
+	binding, outer := subtestBinding(receiver, ancestors)
+	parameter, ok := binding.(*ast.Field)
+	if !ok {
+		return false
+	}
+	pointer, isPointer := ast.Unparen(parameter.Type).(*ast.StarExpr)
+	if !isPointer {
+		return false
+	}
+	selector, selected := ast.Unparen(pointer.X).(*ast.SelectorExpr)
+	if !selected || selector.Sel.Name != "T" {
+		return false
+	}
+	qualifier, named := selector.X.(*ast.Ident)
+	if !named {
+		return false
+	}
+	importScope, _ := subtestBinding(qualifier, outer)
+	file, atFile := importScope.(*ast.File)
+	return atFile && importsTestingAs(file, qualifier.Name)
+}
+
+// subtestBinding walks inward-to-outward without the parser's deprecated object resolver.
+func subtestBinding(name *ast.Ident, ancestors []ast.Node) (ast.Node, []ast.Node) {
+	for i, ancestor := range slices.Backward(ancestors) {
+		var signature *ast.FuncType
+		switch scope := ancestor.(type) {
+		case *ast.FuncDecl:
+			if scope.Recv != nil || scope.Type.TypeParams != nil {
+				return nil, nil
+			}
+			signature = scope.Type
+		case *ast.FuncLit:
+			signature = scope.Type
+		case *ast.File:
+			return scope, nil
+		default:
+			if runNameShadowed(scope, name) {
+				return nil, nil
+			}
+			continue
+		}
+		if parameter := runFieldNamed(signature.Params, name.Name); parameter != nil {
+			return parameter, ancestors[:i]
+		}
+		if runFieldNamed(signature.Results, name.Name) != nil {
+			return nil, nil
+		}
+	}
+	return nil, nil
+}
+
+func runFieldNamed(fields *ast.FieldList, name string) *ast.Field {
+	if fields == nil {
+		return nil
+	}
+	for _, field := range fields.List {
+		if hasRunName(field.Names, name) {
+			return field
+		}
+	}
+	return nil
+}
+
+func importsTestingAs(file *ast.File, name string) bool {
+	for _, spec := range file.Imports {
+		path, err := strconv.Unquote(spec.Path.Value)
+		if err != nil || path != "testing" {
+			continue
+		}
+		importName := "testing"
+		if spec.Name != nil {
+			importName = spec.Name.Name
+		}
+		if importName == name {
+			return true
+		}
+	}
+	return false
+}
+
+// runNameShadowed checks binders in the statement forms allowed to own a worker.
+func runNameShadowed(scope ast.Node, name *ast.Ident) bool {
+	switch node := scope.(type) {
+	case *ast.BlockStmt:
+		return runNameDeclaredBefore(node.List, name)
+	case *ast.CaseClause:
+		return runNameDeclaredBefore(node.Body, name)
+	case *ast.IfStmt:
+		return declaresRunName(node.Init, name.Name)
+	case *ast.ForStmt:
+		return declaresRunName(node.Init, name.Name)
+	case *ast.SwitchStmt:
+		return declaresRunName(node.Init, name.Name)
+	case *ast.RangeStmt:
+		return node.Tok == token.DEFINE && (isRunName(node.Key, name.Name) || isRunName(node.Value, name.Name))
+	default:
+		return false
+	}
+}
+
+func runNameDeclaredBefore(statements []ast.Stmt, name *ast.Ident) bool {
+	for _, statement := range statements {
+		if statement.End() > name.Pos() {
+			break
+		}
+		if declaresRunName(statement, name.Name) {
+			return true
+		}
+	}
+	return false
+}
+
+func declaresRunName(statement ast.Stmt, name string) bool {
+	switch node := statement.(type) {
+	case *ast.AssignStmt:
+		return node.Tok == token.DEFINE && slices.ContainsFunc(node.Lhs, func(expr ast.Expr) bool { return isRunName(expr, name) })
+	case *ast.DeclStmt:
+		declaration, ok := node.Decl.(*ast.GenDecl)
+		return !ok || slices.ContainsFunc(declaration.Specs, func(spec ast.Spec) bool { return runSpecHasName(spec, name) })
+	case *ast.LabeledStmt:
+		return true // A label can wrap a declaration in this block.
+	default:
+		return false
+	}
+}
+
+func runSpecHasName(spec ast.Spec, name string) bool {
+	switch node := spec.(type) {
+	case *ast.ValueSpec:
+		return hasRunName(node.Names, name)
+	case *ast.TypeSpec:
+		return node.Name.Name == name
+	default:
+		return true
+	}
+}
+
+func hasRunName(idents []*ast.Ident, name string) bool {
+	return slices.ContainsFunc(idents, func(ident *ast.Ident) bool { return ident.Name == name })
+}
+
+func isRunName(expr ast.Expr, name string) bool {
+	ident, named := expr.(*ast.Ident)
+	return named && ident.Name == name
 }
 
 // TestSetL1IfCurrentCallsAreBoundedFixtures accepts worker calls and flags escaping calls.
@@ -492,16 +642,98 @@ func test() {
 	}
 }
 
+func TestSetL1IfCurrentCallsAreBoundedSubtestFixtures(t *testing.T) {
+	t.Parallel()
+	const detached = `package twotier
+import "testing"
+type detachedRunner struct{}
+func (detachedRunner) Run(_ string, run func(*testing.T)) { go run(nil) }
+func test(t detachedRunner) {
+	t.Run("detached", func(row *testing.T) {
+		startL2LockOperation(row, nil, func() error {
+			view.setL1IfCurrent("n:a", 1, epoch)
+			return nil
+		})
+	})
+}
+`
+	const shadowed = `package twotier
+import "testing"
+func test(t *testing.T) {
+	{
+		t := detachedRunner{}
+		t.Run("shadowed", func(row *testing.T) {
+			startL2LockOperation(row, nil, func() error {
+				view.setL1IfCurrent("n:a", 1, epoch)
+				return nil
+			})
+		})
+	}
+}
+`
+	const fakeTesting = `package twotier
+import "example.invalid/testing"
+func test(t *testing.T) {
+	t.Run("foreign", func(row *testing.T) {
+		startL2LockOperation(row, nil, func() error {
+			view.setL1IfCurrent("n:a", 1, epoch)
+			return nil
+		})
+	})
+}
+`
+	requireUnboundedFillCall(t, "detached_subtest_test.go", detached, 8)
+	requireUnboundedFillCall(t, "shadowed_subtest_test.go", shadowed, 8)
+	requireUnboundedFillCall(t, "fake_testing_subtest_test.go", fakeTesting, 6)
+}
+
+func TestSetL1IfCurrentCallsAreBoundedNestedSubtestFixtures(t *testing.T) {
+	t.Parallel()
+	const shadowed = `package twotier
+import "testing"
+func test(root *testing.T) {
+	root.Run("outer", func(row *testing.T) {
+		if row := (detachedRunner{}); enabled {
+			row.Run("detached", func(child *testing.T) {
+				startL2LockOperation(child, nil, func() error {
+					view.setL1IfCurrent("n:a", 1, epoch)
+					return nil
+				})
+			})
+		}
+	})
+}
+`
+	const detachedOuter = `package twotier
+import "testing"
+func test(t detachedRunner) {
+	t.Run("detached", func(row *testing.T) {
+		row.Run("nested", func(child *testing.T) {
+			startL2LockOperation(child, nil, func() error {
+				view.setL1IfCurrent("n:a", 1, epoch)
+				return nil
+			})
+		})
+	})
+}
+`
+	requireUnboundedFillCall(t, "nested_shadowed_subtest_test.go", shadowed, 8)
+	requireUnboundedFillCall(t, "nested_detached_subtest_test.go", detachedOuter, 7)
+}
+
 // requireBoundedFillCallFixture checks that the worker's synchronous run call is accepted.
 func requireBoundedFillCallFixture(t *testing.T) {
 	t.Helper()
 	const subtest = `package twotier
-func test() {
+import "testing"
+func test(root *testing.T) {
 	for _, tc := range cases {
-		t.Run(tc.name, func(row *testing.T) {
-			startL2LockOperation(row, nil, func() error {
-				view.setL1IfCurrent("n:a", 1, epoch)
-				return nil
+		root.Run(tc.name, func(row *testing.T) {
+			row.Run("nested", func(child *testing.T) {
+				startL2LockOperation(child, nil, func() error {
+					view.setL1IfCurrent("n:a", 1, epoch)
+					return nil
+				})
 			})
 		})
 	}

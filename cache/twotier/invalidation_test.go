@@ -251,6 +251,78 @@ func warmWriterWithOlderRead(t *testing.T, view *Typed[pausedL1InstallValue], sh
 	return older, release
 }
 
+// TestWriterReplicaReadsPendingL2ValueAcrossFencedGets keeps three reads in the same pending Set epoch.
+func TestWriterReplicaReadsPendingL2ValueAcrossFencedGets(t *testing.T) {
+	t.Parallel()
+	armL2LockWatchdog(t)
+	ctx := t.Context()
+	shared := newStubL2()
+	shared.data["n:a"] = []byte("1")
+	view := NewTyped[int](newPeer(t, shared, nil), "n")
+	beforeWrite, publish, beforeHook := blockL2Write(t, "set", "2")
+	afterWrite, commit, afterHook := blockL2Write(t, "set", "2")
+	shared.beforeWrite, shared.afterWrite = beforeHook, afterHook
+	oldCaptured, newCaptured, releaseOld, releaseNew := blockFencedL2Reads(shared)
+	release := func() {
+		publish()
+		commit()
+		releaseOld()
+		releaseNew()
+	}
+	defer release()
+
+	set := startL2LockOperation(t, release, func() error { return view.Set(ctx, "a", 2) })
+	waitL2LockSignal(t, beforeWrite, "pending Set did not reach its pre-publication hook")
+	older := startL2LockOperation(t, release, func() error { return readCachedL2LockTestKey(ctx, view, "a", 1) })
+	waitL2LockSignal(t, oldCaptured, "first fenced Get did not capture L2 value 1")
+	publish()
+	waitL2LockSignal(t, afterWrite, "pending Set did not publish L2 value 2")
+
+	readNew := func() error { return readCachedL2LockTestKey(ctx, view, "a", 2) }
+	second := startL2LockOperation(t, release, readNew)
+	third := startL2LockOperation(t, release, readNew)
+	waitL2LockSignal(t, newCaptured, "later fenced Gets did not read L2 past the held first Get")
+	waitL2LockSignal(t, newCaptured, "both later fenced Gets must read L2 independently while the first Get is held")
+	releaseNew()
+	second.requireDone(t, "second fenced Get did not finish while the first Get was held")
+	third.requireDone(t, "third fenced Get did not finish while the first Get was held")
+	requireOperationRunning(t, older, "first fenced Get returned before its L2 hook was released")
+	releaseOld()
+	older.requireDone(t, "first fenced Get did not return its captured L2 value")
+
+	requireOperationRunning(t, set, "Set committed before its L2 hook was released")
+	requireColdFencedTiers(t, release, view, shared, "2", true)
+	require.EqualValues(t, 3, shared.getCalls.Load(), "physical L2 reads")
+	require.EqualValues(t, 1, shared.setCalls.Load(), "only the pending Set wrote to L2")
+	require.Zero(t, shared.delCalls.Load(), "fenced Gets deleted from L2")
+	commit()
+	set.requireDone(t, "Set did not finish after its L2 hook was released")
+}
+
+// blockFencedL2Reads holds each captured value outside the stub mutex so all three Gets overlap.
+func blockFencedL2Reads(shared *stubL2) (oldCaptured, newCaptured <-chan struct{}, releaseOld, releaseNew func()) {
+	oldRead, newReads := make(chan struct{}), make(chan struct{}, 2)
+	oldBlocked, newBlocked := make(chan struct{}), make(chan struct{})
+	signalOld := sync.OnceFunc(func() { close(oldRead) })
+	shared.afterGet = func(key string, raw []byte, found bool) {
+		if key != "n:a" || !found {
+			return
+		}
+		switch string(raw) {
+		case "1":
+			signalOld()
+			<-oldBlocked
+		case "2":
+			select {
+			case newReads <- struct{}{}:
+			default:
+			}
+			<-newBlocked
+		}
+	}
+	return oldRead, newReads, sync.OnceFunc(func() { close(oldBlocked) }), sync.OnceFunc(func() { close(newBlocked) })
+}
+
 // TestWriterReplicaFallsBackToWarmL1OnFencedL2Error protects a commit across two L2 failures.
 func TestWriterReplicaFallsBackToWarmL1OnFencedL2Error(t *testing.T) {
 	t.Parallel()
@@ -460,29 +532,29 @@ func requireLocalMutationCommitted(t *testing.T, tt *TwoTier, tc localMutationCa
 	}
 }
 
-// localMutationSnapshot reads the commit without letting a misplaced barrier block the test goroutine.
+// localMutationSnapshot checks exclusive availability before reading the commit.
 func localMutationSnapshot(t *testing.T, tt *TwoTier, tc localMutationCase, release func()) (uint64, bool) {
 	t.Helper()
-	if !waitForLocalMutationReadLock(&tt.mutation) {
+	if !waitForLocalMutationLock(&tt.mutation) {
 		release()
 		t.Fatalf("local %s held mutation while queued on the fill barrier", tc.name)
 	}
-	defer tt.mutation.RUnlock()
+	defer tt.mutation.Unlock()
 	if tc.prefix {
 		return tt.epoch, tt.prefixPending.active
 	}
 	return tt.epoch, tt.l2Pending[l2StripeIndex("n:z")].active
 }
 
-// waitForLocalMutationReadLock bounds attempts to observe the queued writer's commit.
-func waitForLocalMutationReadLock(mutation *sync.RWMutex) bool {
+// waitForLocalMutationLock detects either lock mode held across the queued fill barrier.
+func waitForLocalMutationLock(mutation *sync.RWMutex) bool {
 	const interval = time.Millisecond
 	ticks := time.NewTicker(interval)
 	defer ticks.Stop()
 	deadline := time.NewTimer(l2LockTimeout)
 	defer deadline.Stop()
 	for range int(l2LockTimeout / interval) {
-		if mutation.TryRLock() {
+		if mutation.TryLock() {
 			return true
 		}
 		select {
