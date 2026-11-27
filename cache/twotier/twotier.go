@@ -82,8 +82,17 @@ type l2 interface {
 type Loader[V any] func(ctx context.Context) (V, error)
 
 type flightKey struct {
-	key   string
-	epoch uint64
+	key    string
+	epoch  uint64
+	fenced bool
+}
+
+const l2StripeCount = 64
+
+// pendingWrite fits in a fixed array without allocation because stripe locks admit one key writer per stripe.
+type pendingWrite struct {
+	key           string
+	active, dirty bool
 }
 
 // TwoTier is the untyped two-tier cache. It is created by the fx module and
@@ -93,11 +102,17 @@ type flightKey struct {
 type TwoTier struct {
 	l1               *memory.Cache
 	l2               l2
+	l1Only           bool
 	logger           *slog.Logger
 	l1TTL            time.Duration
 	l2TTL            time.Duration
+	l2Order          [l2StripeCount]sync.Mutex
+	l2Prefix         sync.RWMutex
+	l2FillGate       sync.RWMutex
 	mutation         sync.RWMutex
 	epoch            uint64
+	l2Pending        [l2StripeCount]pendingWrite
+	prefixPending    pendingWrite // The exclusive prefix gate admits one prefix delete at a time.
 	group            *singleflight.Group[flightKey, []byte]
 	origin           string
 	broadcaster      Broadcaster
@@ -127,6 +142,11 @@ func (t *Typed[V]) key(k string) string {
 // tier that has it wins and back-fills the faster tiers it skipped. Concurrent
 // Gets for the same key share a single loader invocation.
 //
+// Each Get fenced by a pending shared-L2 write reads L2 on its own. A decodable
+// hit wins. An L2 error uses the warm L1 snapshot when present. An L2 miss,
+// corrupt value, or error with no warm entry falls through to the loader.
+// Fenced Gets share loader calls for the same key and epoch and write neither tier.
+//
 // On a disabled (nil) cache, Get calls loader directly and caches nothing.
 func (t *Typed[V]) Get(ctx context.Context, k string, loader Loader[V]) (V, error) {
 	if t.tt == nil {
@@ -134,41 +154,88 @@ func (t *Typed[V]) Get(ctx context.Context, k string, loader Loader[V]) (V, erro
 	}
 	key := t.key(k)
 
-	epoch, cached, ok := t.l1Snapshot(key)
-	if ok {
-		return cached, nil
+	snapshot := t.l1Snapshot(key)
+	if snapshot.fenced {
+		return t.getFenced(ctx, key, snapshot, loader)
+	}
+	if snapshot.ok {
+		return snapshot.cached, nil
 	}
 
-	flight := flightKey{key: key, epoch: epoch}
+	flight := flightKey{key: key, epoch: snapshot.epoch}
 	raw, _, err := t.tt.group.Do(ctx, flight, func(ctx context.Context) ([]byte, error) {
-		return t.load(ctx, key, epoch, loader)
+		return t.load(ctx, key, snapshot.epoch, loader)
 	})
 	if err != nil {
 		var zero V
 		return zero, fmt.Errorf("cache/twotier: get %q: %w", key, err)
 	}
 
-	var v V
-	if uerr := json.Unmarshal(raw, &v); uerr != nil {
-		var zero V
-		return zero, fmt.Errorf("cache/twotier: decode loaded value: %w", uerr)
+	v, err := decodeLoadedValue[V](raw)
+	if err != nil {
+		return v, err
 	}
-	t.setL1IfCurrent(key, v, epoch)
+	t.setL1IfCurrent(key, v, snapshot.epoch)
 	return v, nil
 }
 
-// l1Snapshot reads one generation and its typed L1 value atomically against
-// Set, Delete, and prefix invalidation.
-func (t *Typed[V]) l1Snapshot(key string) (uint64, V, bool) {
+type l1ReadSnapshot[V any] struct {
+	cached V
+	epoch  uint64
+	ok     bool
+	fenced bool
+}
+
+// l1Snapshot captures the epoch, pending fence, and typed L1 entry together so a fenced Get can read L2 independently and use the warm entry on error.
+func (t *Typed[V]) l1Snapshot(key string) l1ReadSnapshot[V] {
 	t.tt.mutation.RLock()
 	defer t.tt.mutation.RUnlock()
-	raw, ok := t.tt.l1.GetIfPresent(key)
-	if !ok {
-		var zero V
-		return t.tt.epoch, zero, false
+	snapshot := l1ReadSnapshot[V]{epoch: t.tt.epoch, fenced: !t.tt.l1Only && t.tt.fillFenced(key)}
+	if raw, ok := t.tt.l1.GetIfPresent(key); ok {
+		snapshot.cached, snapshot.ok = raw.(V)
 	}
-	v, ok := raw.(V)
-	return t.tt.epoch, v, ok
+	return snapshot
+}
+
+// getFenced reads L2 outside singleflight so a pending write can be observed ahead of an older flight.
+func (t *Typed[V]) getFenced(ctx context.Context, key string, snapshot l1ReadSnapshot[V], loader Loader[V]) (V, error) {
+	raw, ok, err := t.tt.l2.Get(ctx, key)
+	if err != nil {
+		t.tt.logger.WarnContext(ctx, "cache/twotier: fenced L2 get failed", slog.String("key", key), slog.Any("error", err))
+		if snapshot.ok {
+			return snapshot.cached, nil
+		}
+	} else if ok {
+		var cached V
+		if decodeErr := json.Unmarshal(raw, &cached); decodeErr == nil {
+			return cached, nil
+		}
+		t.tt.logger.WarnContext(ctx, "cache/twotier: corrupt fenced L2 value, falling through", slog.String("key", key))
+	}
+	return t.loadFenced(ctx, key, snapshot.epoch, loader)
+}
+
+// loadFenced shares origin work without letting a fenced Get back-fill either tier.
+func (t *Typed[V]) loadFenced(ctx context.Context, key string, epoch uint64, loader Loader[V]) (V, error) {
+	flight := flightKey{key: key, epoch: epoch, fenced: true}
+	raw, _, err := t.tt.group.Do(ctx, flight, func(ctx context.Context) ([]byte, error) {
+		return encodeLoadedValue(ctx, loader)
+	})
+	if err != nil {
+		var zero V
+		return zero, fmt.Errorf("cache/twotier: get %q: %w", key, err)
+	}
+	return decodeLoadedValue[V](raw)
+}
+
+// decodeLoadedValue restores the typed value returned by a shared flight.
+func decodeLoadedValue[V any](raw []byte) (V, error) {
+	var value V
+	if err := json.Unmarshal(raw, &value); err != nil {
+		var zero V
+		return zero, fmt.Errorf("cache/twotier: decode loaded value: %w", err)
+	}
+	return value, nil
 }
 
 func (t *Typed[V]) setL1(key string, value V) {
@@ -178,12 +245,26 @@ func (t *Typed[V]) setL1(key string, value V) {
 	}
 }
 
+// setL1IfCurrent evicts a shared-L2 fenced key like an L1 TTL or capacity eviction at that instant, even after a newer L1 commit or if the pending write fails.
+// After either eviction, each separate Get flight reads L2 until L1 refills. A covering pending write evicts again. Without a fence, a changed epoch skips the install.
+// With no covering pending write and the epoch unchanged since the Get's miss, an L2 hit can fill L1 and a loader after L2 expiry can fill both tiers, even with a value older than the last successful Set.
 func (t *Typed[V]) setL1IfCurrent(key string, value V, epoch uint64) {
 	t.tt.mutation.Lock()
 	defer t.tt.mutation.Unlock()
+	if !t.tt.l1Only && t.tt.fillFenced(key) {
+		t.tt.l1.Invalidate(key)
+		return
+	}
 	if t.tt.epoch == epoch {
 		t.setL1(key, value)
 	}
+}
+
+// fillFenced reports whether a pending write covers the key while the caller holds mutation.
+func (t *TwoTier) fillFenced(key string) bool {
+	pending := t.l2Pending[l2StripeIndex(key)]
+	prefix := t.prefixPending
+	return (pending.active && pending.key == key) || (prefix.active && strings.HasPrefix(key, prefix.key))
 }
 
 // load runs inside singleflight: it checks L2, then falls back to the loader,
@@ -205,13 +286,9 @@ func (t *Typed[V]) load(ctx context.Context, key string, epoch uint64, loader Lo
 		}
 	}
 
-	v, err := loader(ctx)
+	raw, err := encodeLoadedValue(ctx, loader)
 	if err != nil {
-		return nil, fmt.Errorf("loader: %w", err)
-	}
-	raw, err := json.Marshal(v)
-	if err != nil {
-		return nil, fmt.Errorf("cache/twotier: encode loaded value: %w", err)
+		return nil, err
 	}
 	if serr := t.tt.setL2IfCurrent(ctx, key, raw, epoch); serr != nil {
 		t.tt.logger.WarnContext(ctx, "cache/twotier: L2 set failed", slog.Any("error", serr))
@@ -219,10 +296,93 @@ func (t *Typed[V]) load(ctx context.Context, key string, epoch uint64, loader Lo
 	return raw, nil
 }
 
-func (t *TwoTier) setL2IfCurrent(ctx context.Context, key string, raw []byte, epoch uint64) error {
+// encodeLoadedValue carries the loader result between typed callers in a flight.
+func encodeLoadedValue[V any](ctx context.Context, loader Loader[V]) ([]byte, error) {
+	value, err := loader(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("loader: %w", err)
+	}
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return nil, fmt.Errorf("cache/twotier: encode loaded value: %w", err)
+	}
+	return raw, nil
+}
+
+// l2StripeIndex uses FNV-1a over the composed key to select a stripe without allocating.
+func l2StripeIndex(key string) int {
+	const offset64 uint64 = 14695981039346656037
+	const prime64 uint64 = 1099511628211
+	hash := offset64
+	for i := range len(key) {
+		hash ^= uint64(key[i])
+		hash *= prime64
+	}
+	return int(hash % l2StripeCount)
+}
+
+// lockL2Key keeps each key's L2 writes ordered with same-key writes and prefix deletes.
+func (t *TwoTier) lockL2Key(stripe int) func() {
+	t.l2Prefix.RLock()
+	lock := &t.l2Order[stripe]
+	lock.Lock()
+	return func() {
+		lock.Unlock()
+		t.l2Prefix.RUnlock()
+	}
+}
+
+// lockL2Fill keeps peer notices behind the epoch check and L2 write of a fill or repair.
+func (t *TwoTier) lockL2Fill() func() {
+	t.l2FillGate.RLock()
+	return t.l2FillGate.RUnlock
+}
+
+// waitForL2Fills drains L2 fills and repairs that passed their epoch check before the local commit.
+func (t *TwoTier) waitForL2Fills() {
+	t.l2FillGate.Lock()
+	defer t.l2FillGate.Unlock()
+}
+
+// lockInvalidationFill makes key and prefix notices wait for in-flight L2 fills and repairs across all stripes.
+func (t *TwoTier) lockInvalidationFill(inv Invalidation) func() {
+	switch inv.Kind {
+	case InvalidationKey, InvalidationPrefix:
+		t.l2FillGate.Lock()
+		return t.l2FillGate.Unlock
+	default:
+		return func() {}
+	}
+}
+
+// beginPendingWrite fences L1 fills without holding mutation during L2 I/O.
+func (t *TwoTier) beginPendingWrite(pending *pendingWrite, key string) {
 	t.mutation.Lock()
-	defer t.mutation.Unlock()
-	if t.epoch != epoch {
+	*pending = pendingWrite{key: key, active: true}
+	t.mutation.Unlock()
+}
+
+// clearPendingWrite removes the fence when an L2 panic interrupts the commit.
+func (t *TwoTier) clearPendingWrite(pending *pendingWrite) {
+	t.mutation.Lock()
+	*pending = pendingWrite{}
+	t.mutation.Unlock()
+}
+
+// isCurrentEpoch checks the fence without holding mutation during L2 I/O.
+func (t *TwoTier) isCurrentEpoch(epoch uint64) bool {
+	t.mutation.RLock()
+	defer t.mutation.RUnlock()
+	return t.epoch == epoch
+}
+
+// setL2IfCurrent fences loader fills superseded before they acquire the write locks.
+// The local write barrier orders this fill before a successful local write returns, and peers can see the L2 change while the barrier waits.
+func (t *TwoTier) setL2IfCurrent(ctx context.Context, key string, raw []byte, epoch uint64) error {
+	stripe := l2StripeIndex(key)
+	defer t.lockL2Key(stripe)()
+	defer t.lockL2Fill()()
+	if !t.isCurrentEpoch(epoch) {
 		return nil
 	}
 	if err := t.l2.Set(ctx, key, raw, t.l2TTL); err != nil {
@@ -231,10 +391,12 @@ func (t *TwoTier) setL2IfCurrent(ctx context.Context, key string, raw []byte, ep
 	return nil
 }
 
+// deleteL2IfCurrent prevents corruption repair from deleting a superseding write.
 func (t *TwoTier) deleteL2IfCurrent(ctx context.Context, key string, epoch uint64) error {
-	t.mutation.Lock()
-	defer t.mutation.Unlock()
-	if t.epoch != epoch {
+	stripe := l2StripeIndex(key)
+	defer t.lockL2Key(stripe)()
+	defer t.lockL2Fill()()
+	if !t.isCurrentEpoch(epoch) {
 		return nil
 	}
 	if err := t.l2.Del(ctx, key); err != nil {
@@ -243,9 +405,11 @@ func (t *TwoTier) deleteL2IfCurrent(ctx context.Context, key string, epoch uint6
 	return nil
 }
 
-// Set writes v to both tiers (write-through) and tells peers to evict k. On a
-// disabled cache it is a no-op. An error wrapping [ErrBroadcast] means both
-// local tiers hold v but peers were not told.
+// Set writes v to L2 and tells peers to evict k. An L1-only cache always
+// publishes v to L1. With shared L2, Set publishes v to L1 unless a peer notice
+// for k or a prefix covering k arrives during the write. A disabled cache is a
+// no-op. An error wrapping [ErrBroadcast] means the local write succeeded but
+// peers were not told. After committing, Set waits for older L2 fills and repairs before broadcasting.
 func (t *Typed[V]) Set(ctx context.Context, k string, v V) error {
 	if t.tt == nil {
 		return nil
@@ -258,23 +422,45 @@ func (t *Typed[V]) Set(ctx context.Context, k string, v V) error {
 	if err := t.setBoth(ctx, key, raw, v); err != nil {
 		return err
 	}
+	t.tt.waitForL2Fills()
 	return t.tt.broadcast(ctx, InvalidationKey, key)
 }
 
+// setBoth advances the epoch and updates L1 only after L2 accepts the write.
 func (t *Typed[V]) setBoth(ctx context.Context, key string, raw []byte, value V) error {
+	stripe := l2StripeIndex(key)
+	unlock := t.tt.lockL2Key(stripe)
+	defer unlock()
+	pending := &t.tt.l2Pending[stripe]
+	committed := false
+	t.tt.beginPendingWrite(pending, key)
+	defer func() {
+		if !committed {
+			t.tt.clearPendingWrite(pending)
+		}
+	}()
+	err := t.tt.l2.Set(ctx, key, raw, t.tt.l2TTL)
 	t.tt.mutation.Lock()
 	defer t.tt.mutation.Unlock()
-	if serr := t.tt.l2.Set(ctx, key, raw, t.tt.l2TTL); serr != nil {
-		return fmt.Errorf("cache/twotier: L2 set: %w", serr)
+	dirty := pending.dirty
+	*pending = pendingWrite{}
+	committed = true
+	if err != nil {
+		return fmt.Errorf("cache/twotier: L2 set: %w", err)
 	}
 	t.tt.epoch++
-	t.setL1(key, value)
+	// L1-only caches have no newer L2 value to read after a peer notice.
+	if t.tt.l1Only || !dirty {
+		t.setL1(key, value)
+	} else {
+		t.tt.l1.Invalidate(key)
+	}
 	return nil
 }
 
 // Delete removes k from both tiers and tells peers to evict it. On a disabled
 // cache it is a no-op. An error wrapping [ErrBroadcast] means k is gone
-// locally but peers were not told.
+// locally but peers were not told. After committing, Delete waits for older L2 fills and repairs before broadcasting.
 func (t *Typed[V]) Delete(ctx context.Context, k string) error {
 	if t.tt == nil {
 		return nil
@@ -283,14 +469,30 @@ func (t *Typed[V]) Delete(ctx context.Context, k string) error {
 	if err := t.tt.deleteBoth(ctx, key); err != nil {
 		return err
 	}
+	t.tt.waitForL2Fills()
 	return t.tt.broadcast(ctx, InvalidationKey, key)
 }
 
+// deleteBoth fences fills during L2 deletion and evicts L1 on success. A fenced fill can evict L1 during the write via [Typed.setL1IfCurrent].
 func (t *TwoTier) deleteBoth(ctx context.Context, key string) error {
+	stripe := l2StripeIndex(key)
+	unlock := t.lockL2Key(stripe)
+	defer unlock()
+	pending := &t.l2Pending[stripe]
+	committed := false
+	t.beginPendingWrite(pending, key)
+	defer func() {
+		if !committed {
+			t.clearPendingWrite(pending)
+		}
+	}()
+	err := t.l2.Del(ctx, key)
 	t.mutation.Lock()
 	defer t.mutation.Unlock()
-	if derr := t.l2.Del(ctx, key); derr != nil {
-		return fmt.Errorf("cache/twotier: L2 delete: %w", derr)
+	*pending = pendingWrite{}
+	committed = true
+	if err != nil {
+		return fmt.Errorf("cache/twotier: L2 delete: %w", err)
 	}
 	t.epoch++
 	t.l1.Invalidate(key)
@@ -320,6 +522,7 @@ func (t *Typed[V]) InvalidatePrefix(ctx context.Context, prefix string) error {
 // matching keys are Invalidated individually and forgotten from singleflight.
 // L2 prefix eviction is delegated to the [l2] adapter. Peers are told to
 // evict the prefix; an error wrapping [ErrBroadcast] means they were not.
+// After committing, InvalidatePrefix waits for older L2 fills and repairs before broadcasting.
 func (t *TwoTier) InvalidatePrefix(ctx context.Context, prefix string) error {
 	if t == nil {
 		return nil
@@ -327,14 +530,32 @@ func (t *TwoTier) InvalidatePrefix(ctx context.Context, prefix string) error {
 	if err := t.invalidatePrefixBoth(ctx, prefix); err != nil {
 		return err
 	}
+	t.waitForL2Fills()
 	return t.broadcast(ctx, InvalidationPrefix, prefix)
 }
 
+// invalidatePrefixBoth fences matching fills during L2 deletion and evicts matching L1 entries on success. A fenced fill can evict its key during the write via [Typed.setL1IfCurrent].
 func (t *TwoTier) invalidatePrefixBoth(ctx context.Context, prefix string) error {
+	// A refused prefix delete must not fence fills.
+	if prefix == "" {
+		return fmt.Errorf("cache/twotier: L2 invalidate prefix %q: %w", prefix, errEmptyPrefix)
+	}
+	t.l2Prefix.Lock()
+	defer t.l2Prefix.Unlock()
+	committed := false
+	t.beginPendingWrite(&t.prefixPending, prefix)
+	defer func() {
+		if !committed {
+			t.clearPendingWrite(&t.prefixPending)
+		}
+	}()
+	err := t.l2.DelPrefix(ctx, prefix)
 	t.mutation.Lock()
 	defer t.mutation.Unlock()
-	if derr := t.l2.DelPrefix(ctx, prefix); derr != nil {
-		return fmt.Errorf("cache/twotier: L2 invalidate prefix %q: %w", prefix, derr)
+	t.prefixPending = pendingWrite{}
+	committed = true
+	if err != nil {
+		return fmt.Errorf("cache/twotier: L2 invalidate prefix %q: %w", prefix, err)
 	}
 	t.epoch++
 	t.evictL1Prefix(prefix)
@@ -383,14 +604,25 @@ func (t *TwoTier) applyInvalidation(inv Invalidation) {
 	if inv.Origin == t.origin {
 		return
 	}
+	defer t.lockInvalidationFill(inv)()
 	t.mutation.Lock()
 	defer t.mutation.Unlock()
 	switch inv.Kind {
 	case InvalidationKey:
 		t.epoch++
+		pending := &t.l2Pending[l2StripeIndex(inv.Key)]
+		if pending.active && pending.key == inv.Key {
+			pending.dirty = true
+		}
 		t.l1.Invalidate(inv.Key)
 	case InvalidationPrefix:
 		t.epoch++
+		for i := range l2StripeCount {
+			pending := &t.l2Pending[i]
+			if pending.active && strings.HasPrefix(pending.key, inv.Key) {
+				pending.dirty = true
+			}
+		}
 		t.evictL1Prefix(inv.Key)
 	default:
 		t.logger.Warn("cache/twotier: ignore unknown invalidation kind", slog.String("kind", string(inv.Kind)))

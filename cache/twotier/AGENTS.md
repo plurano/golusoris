@@ -54,6 +54,22 @@ func (s *UserService) Load(ctx context.Context, id string) (*User, error) {
 | `Typed.InvalidatePrefix(ctx, prefix)` | Bulk-evicts every key under the view + `prefix` from both tiers (`""` clears the whole view) |
 | `(*TwoTier).InvalidatePrefix(ctx, prefix)` | Same, but takes an already-composed key prefix (no view prefix added) |
 
+## Locking
+
+- `mutation` covers epoch, `l2Pending`, `prefixPending`, and L1.
+- L2 key writes hold shared `l2Prefix` gate + key stripe. L2 prefix deletes hold gate exclusively. L2 reads take neither lock.
+- Loader fill or repair L2 write -> shared `l2FillGate` through epoch check and write.
+- Lock order: `l2Prefix` -> key stripe -> fill gate -> `mutation`.
+- Peer notice (key, prefix, empty prefix) -> exclusive fill gate -> waits for every in-flight loader fill or repair L2 write on this instance, as at base. Successful local Set, Delete, prefix delete -> after commit, before broadcast: exclusive fill gate, released at once -> returns after every fill or repair L2 call that passed its epoch check before commit, as at base.
+- Slow fill L2 write -> delays every peer notice. Fill gate wait has no deadline. L2 call uses Get context. Local write latency includes slowest in-flight fill L2 call; queued barrier blocks new fills (writer preference).
+- Pending Set or Delete fences its key. Pending prefix delete fences keys under its prefix. Shared-L2 fenced Get -> one independent L2 read. Decodable L2 hit -> return it. L2 error + warm L1 snapshot -> return L1 value. Cold L2 error, L2 miss, or corrupt value -> loader. Same key + epoch -> fenced Gets share loader call. Fenced Get writes neither tier.
+- Shared-L2 fill reaching L1 under fence -> evict its key. L1-only fill -> check epoch only. L1-only Set always publishes to L1. Shared-L2 Set publishes unless a peer notice for its key or a covering prefix arrives during its L2 write.
+- Shared-L2 fenced fill -> same key state as L1 TTL or capacity eviction at that instant, even after newer L1 commit. Pending Set, Delete, or prefix delete success or failure -> eviction holds.
+  After either eviction, unfenced Get flights -> read L2 until next L1 install.
+  Older fill reaches L1 under covering pending write -> evict L1 again. No covering pending write, epoch moved since Get miss -> skip install.
+  No covering pending write + epoch unchanged since Get miss -> L2 hit can fill L1, loader after L2 expiry can fill both tiers, even if value older than last successful Set.
+- Empty prefix -> refused before fence; no L1 eviction.
+
 ## Prefix invalidation
 
 `InvalidatePrefix` composes prefix exactly like `Get`/`Set`/`Delete`
@@ -72,7 +88,10 @@ func (s *UserService) Load(ctx context.Context, id string) (*User, error) {
 
 - Each mutation sends one `Invalidation{Origin, Kind: key|prefix, Key}` — never per-key fan-out
   for a prefix. Receiver drops own origin, bumps epoch (fences in-flight loads), evicts L1 only;
-  L2 already holds sender's write. Notices run synchronously in bus subscriber goroutine.
+  L2 already holds sender's write.
+- Fill write -> notice completion -> next peer write ordering requires synchronous notice delivery.
+- Asynchronous bus -> single-peer-write limit (#1609).
+- Local write barrier limit (#1609, review r14-r17 F1): Set / Delete / prefix delete publishes to L2 before barrier, returns after older fills. Peer reads new L2 value while barrier queued -> peer Delete of filled key can leave older fill value in L2. Failed local write -> returns without barrier, same end state. Older value lasts until next key write or L2 TTL.
 - Broadcast bounded by `invalidation.timeout`. Failure -> `Set` / `Delete` / `InvalidatePrefix`
   return error wrapping `ErrBroadcast` (+ cause); local change stays.
 - Delivery at most once: lost, malformed or pre-subscription notice leaves peer L1 stale
@@ -85,8 +104,8 @@ func (s *UserService) Load(ctx context.Context, id string) (*User, error) {
 
 L1 stores live Go value; L2 stores its JSON encoding (Redis is byte
 store, and JSON keeps cache language-agnostic across replicas). Store
-JSON-round-trippable values only. Invalid L2 JSON is deleted and repaired
-through the origin loader.
+JSON-round-trippable values only. Unfenced Gets delete corrupt L2 values
+and repair through the origin loader.
 
 ## Disabled / nil-passthrough mode
 
@@ -105,8 +124,8 @@ cache.twotier.invalidation.topic = golusoris.cache.twotier.invalidate
 cache.twotier.invalidation.timeout = 2s
 ```
 
-Negative TTLs, unknown `l2`, missing Redis client or bus fail module construction. Failed explicit Set/Delete leaves L1
-unchanged. Successful mutation fences older in-flight loader cache writes.
+Negative TTLs, unknown `l2`, missing Redis client or bus fail module construction. Failed explicit Set/Delete L2 write -> keep L1 entries except fenced-fill evictions.
+Fenced-fill evictions during failed write -> same key state and read-through as L1 TTL or capacity eviction. Successful mutation fences older in-flight loader cache writes.
 
 ## Don't
 
@@ -114,7 +133,7 @@ unchanged. Successful mutation fences older in-flight loader cache writes.
  interface; stub it (see `twotier_test.go`) and use `memory.NewForTest` for L1.
  Cross-replica Redis behaviour lives in `integration_test.go`.
 - Don't rely on invalidation for correctness beyond `l1_ttl` — notices can be lost.
-- Don't treat L2 outage as fatal — `Get` logs and falls through to  loader; only `Set`/`Delete` surface L2 errors (caller chose to write).
+- Don't treat L2 outage as fatal — `Get` logs and uses the applicable fallback; only `Set`/`Delete` surface L2 errors (caller chose to write).
 - Don't store values that don't JSON-round-trip — L2 holds JSON, not  live object.
 - Don't cache by floating-point keys — keys are plain strings; format floats
  canonically before keying.
